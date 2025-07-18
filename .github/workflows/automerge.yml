@@ -1,0 +1,26 @@
+name: Automerge
+
+on: 
+  pull_request:
+    branches: [master]
+    types: [closed]
+jobs:
+  automerge:
+    if: github.event.pull_request.merged == true
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure Git
+      run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com' 
+    - name: Automerge
+      run: |
+          git fetch --unshallow
+          git checkout develop
+          git pull
+          git merge --no-ff master -m "Automerge master back to develop"
+          git push
