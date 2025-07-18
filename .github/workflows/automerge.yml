@@ -1,5 +1,4 @@
-permissions:
-  contents: write
+
 name: Automerge
 
 on: 
@@ -10,6 +9,8 @@ jobs:
   automerge:
     if: github.event.pull_request.merged == true
     timeout-minutes: 2
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
