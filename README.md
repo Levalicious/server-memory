@@ -125,6 +125,63 @@ Example:
     - Relations between requested entities
   - Silently skips non-existent nodes
 
+- **get_neighbors**
+  - Get neighboring entities connected to a specific entity within a given depth
+  - Input: `entityName` (string), `depth` (number, default: 1)
+  - Returns entities connected within specified depth
+
+- **find_path**
+  - Find a path between two entities in the knowledge graph
+  - Input: `fromEntity` (string), `toEntity` (string), `maxDepth` (number, default: 5)
+  - Returns path between entities if one exists
+
+- **get_entities_by_type**
+  - Get all entities of a specific type
+  - Input: `entityType` (string)
+  - Returns all entities matching the specified type
+
+- **get_entity_types**
+  - Get all unique entity types in the knowledge graph
+  - No input required
+  - Returns list of all entity types
+
+- **get_relation_types**
+  - Get all unique relation types in the knowledge graph
+  - No input required
+  - Returns list of all relation types
+
+- **get_stats**
+  - Get statistics about the knowledge graph
+  - No input required
+  - Returns entity count, relation count, entity types count, relation types count
+
+- **get_orphaned_entities**
+  - Get entities that have no relations
+  - No input required
+  - Returns entities with no connections
+
+- **validate_graph**
+  - Validate the knowledge graph and return missing entities referenced in relations
+  - No input required
+  - Returns list of missing entities
+
+- **evaluate_bcl**
+  - Evaluate a Binary Combinatory Logic (BCL) program
+  - Input: `program` (string), `maxSteps` (number, default: 1000000)
+  - BCL syntax: T:=00|01|1TT where 00=K, 01=S, 1=application
+  - Returns evaluation result with halt status
+
+- **add_bcl_term**
+  - Add a BCL term to the constructor, maintaining valid syntax
+  - Input: `term` (string)
+  - Valid values: '1' or 'App' (application), '00' or 'K' (K combinator), '01' or 'S' (S combinator)
+  - Returns completion status
+
+- **clear_bcl_term**
+  - Clear the current BCL term being constructed and reset the constructor state
+  - No input required
+  - Resets BCL constructor
+
 # Usage with Claude Desktop
 
 ### Setup
@@ -186,9 +243,7 @@ The server can be configured using the following environment variables:
 
 For quick installation, use one of the one-click installation buttons below:
 
-[![Install with NPX in VS Code](https://img.shields.io/badge/VS_Code-NPM-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=memory&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40modelcontextprotocol%2Fserver-memory%22%5D%7D) [![Install with NPX in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-NPM-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=memory&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40modelcontextprotocol%2Fserver-memory%22%5D%7D&quality=insiders)
-
-[![Install with Docker in VS Code](https://img.shields.io/badge/VS_Code-Docker-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=memory&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-i%22%2C%22-v%22%2C%22claude-memory%3A%2Fapp%2Fdist%22%2C%22--rm%22%2C%22mcp%2Fmemory%22%5D%7D) [![Install with Docker in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Docker-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=memory&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-i%22%2C%22-v%22%2C%22claude-memory%3A%2Fapp%2Fdist%22%2C%22--rm%22%2C%22mcp%2Fmemory%22%5D%7D&quality=insiders)
+[![Install with NPX in VS Code](https://img.shields.io/badge/VS_Code-NPM-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=memory&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40levalicious%2Fserver-memory%22%5D%7D) [![Install with NPX in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-NPM-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=memory&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40levalicious%2Fserver-memory%22%5D%7D&quality=insiders)
 
 For manual installation, add the following JSON block to your User Settings (JSON) file in VS Code. You can do this by pressing `Ctrl + Shift + P` and typing `Preferences: Open Settings (JSON)`.
 
