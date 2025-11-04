@@ -479,7 +479,7 @@ const server = new Server({
       mimeType: "image/svg+xml",
       sizes: ["any"]
   }],
-  version: "0.0.0",
+  version: "0.0.4",
 },    {
     capabilities: {
       tools: {},
