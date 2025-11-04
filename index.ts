@@ -40,6 +40,9 @@ interface KnowledgeGraph {
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 class KnowledgeGraphManager {
+  bclCtr: number = 0;
+  bclTerm: string = "";
+
   private async loadGraph(): Promise<KnowledgeGraph> {
     try {
       const data = await fs.readFile(MEMORY_FILE_PATH, "utf-8");
@@ -324,148 +327,144 @@ class KnowledgeGraphManager {
   }
 
   // BCL (Binary Combinatory Logic) evaluator
-  async evaluateBCL(program: string, maxSteps: number): Promise<{ result: string; info: string; halted: boolean }> {
-    let current = program;
+  async evaluateBCL(program: string, maxSteps: number): Promise<{ result: string; info: string; halted: boolean, errored: boolean }> {
     let stepCount = 0;
-    
-    // Find and apply one reduction rule to the leftmost applicable position
-    const applyOneRule = (term: string): { newTerm: string; applied: boolean; rule: string } => {
-      // Scan left-to-right for rule applications
-      for (let pos = 0; pos <= term.length - 6; pos++) { // minimum pattern "1100xy" needs at least 6 chars
-        
-        // Rule 1: 1100xy → x
-        if (pos <= term.length - 6 && term.substring(pos, pos + 4) === '1100') {
-          let parsePos = pos + 4;
-          
-          // Parse x
-          const xResult = this.parseBCLTerm(term, parsePos);
-          if (xResult.success) {
-            parsePos = xResult.nextPos;
-            
-            // Parse y
-            const yResult = this.parseBCLTerm(term, parsePos);
-            if (yResult.success) {
-              // Apply Rule 1: 1100xy → x
-              const before = term.substring(0, pos);
-              const after = term.substring(yResult.nextPos);
-              const newTerm = before + xResult.term + after;
-              return {
-                newTerm,
-                applied: true,
-                rule: `Rule 1: 1100${xResult.term}${yResult.term} → ${xResult.term}`
-              };
-            }
-          }
-        }
-        
-        // Rule 2: 11101xyz → 11xz1yz (need minimum 8 chars)
-        if (pos <= term.length - 8 && term.substring(pos, pos + 5) === '11101') {
-          let parsePos = pos + 5;
-          
-          // Parse x
-          const xResult = this.parseBCLTerm(term, parsePos);
-          if (xResult.success) {
-            parsePos = xResult.nextPos;
-            
-            // Parse y
-            const yResult = this.parseBCLTerm(term, parsePos);
-            if (yResult.success) {
-              parsePos = yResult.nextPos;
-              
-              // Parse z
-              const zResult = this.parseBCLTerm(term, parsePos);
-              if (zResult.success) {
-                // Apply Rule 2: 11101xyz → 11xz1yz
-                const x = xResult.term;
-                const y = yResult.term;
-                const z = zResult.term;
-                const before = term.substring(0, pos);
-                const after = term.substring(zResult.nextPos);
-                const replacement = `11${x}${z}1${y}${z}`;
-                const newTerm = before + replacement + after;
-                return {
-                  newTerm,
-                  applied: true,
-                  rule: `Rule 2: 11101${x}${y}${z} → 11${x}${z}1${y}${z}`
-                };
-              }
-            }
-          }
-        }
-      }
-      
-      return { newTerm: term, applied: false, rule: '' };
-    };
-    
-    // Validate input is a well-formed BCL term
-    const validation = this.parseBCLTerm(current, 0);
-    if (!validation.success || validation.nextPos !== current.length) {
-      return {
-        result: current,
-        info: `Error: Invalid BCL term - parse failed at position ${validation.nextPos}`,
-        halted: false
-      };
-    }
-    
-    let max_size = current.length;
+    let max_size = program.length;
+
+    let mode: number = 0;
+    let ctr: number = 1;
+    let t0: string = program;
+    let t1: string = '';
+    let t2: string = '';
+    let t3: string = '';
+    let t4: string = '';
+
     while (stepCount < maxSteps) {
-      const result = applyOneRule(current);
-      
-      if (!result.applied) {
-        // Normal form reached - no more reductions possible
-        break;
+      if (t0.length == 0) break;
+      let b = t0[0]; t0 = t0.slice(1);
+      if (mode === 0) {
+        t1 += b;
+        let size = t1.length + t0.length;
+        if (size > max_size) max_size = size;
+        if (t1.slice(-4) === '1100') {
+          mode = 1;
+          t1 = t1.slice(0, -4);
+        } else if (t1.slice(-5) === '11101') {
+          mode = 3;
+          t1 = t1.slice(0, -5);
+        }
+      } else if (mode === 1) {
+        t2 += b;
+        if (b == '1') {
+          ctr += 1;
+        } else if (b == '0') {
+          ctr -= 1;
+          t2 += t0[0]; t0 = t0.slice(1);
+        }
+        if (ctr === 0) {
+          mode = 2;
+          ctr = 1;
+        }
+      } else if (mode === 2) {
+        if (b == '1') {
+          ctr += 1;
+        } else if (b == '0') {
+          ctr -= 1;
+          t0 = t0.slice(1);
+        }
+        if (ctr === 0) {
+          t0 = t2 + t0;
+          t2 = '';
+          mode = 0;
+          ctr = 1;
+          stepCount += 1;
+        }
+      } else if (mode === 3) {
+        t2 += b;
+        if (b == '1') {
+          ctr += 1;
+        } else if (b == '0') {
+          ctr -= 1;
+          t2 += t0[0]; t0 = t0.slice(1);
+        }
+        if (ctr === 0) {
+          mode = 4;
+          ctr = 1;
+        }
+      } else if (mode === 4) {
+        t3 += b;
+        if (b == '1') {
+          ctr += 1;
+        } else if (b == '0') {
+          ctr -= 1;
+          t3 += t0[0]; t0 = t0.slice(1);
+        }
+        if (ctr === 0) {
+          mode = 5;
+          ctr = 1;
+        }
+      } else if (mode === 5) {
+        t4 += b;
+        if (b == '1') {
+          ctr += 1;
+        } else if (b == '0') {
+          ctr -= 1;
+          t4 += t0[0]; t0 = t0.slice(1);
+        }
+        if (ctr === 0) {
+          t0 = '11' + t2 + t4 + '1' + t3 + t4 + t0;
+          t2 = '';
+          t3 = '';
+          t4 = '';
+          mode = 0;
+          ctr = 1;
+          stepCount += 1;
+        }
       }
-      
-      current = result.newTerm;
-      if (current.length > max_size) {
-        max_size = current.length;
-      }
-      stepCount++;
     }
     
     const halted = stepCount < maxSteps;
     return {
-      result: current,
+      result: t1,
       info: `${stepCount} steps, max size ${max_size}`,
-      halted
+      halted,
+      errored: halted && mode != 0,
     };
   }
 
-  // Helper function to parse a single BCL term from a given position
-  private parseBCLTerm(input: string, startPos: number): { success: boolean; term: string; nextPos: number } {
-    if (startPos >= input.length) {
-      return { success: false, term: '', nextPos: startPos };
+  async addBCLTerm(term: string): Promise<string> {
+    const termset = ["1", "00", "01"];
+    if (!term || term.trim() === "") {
+      throw new Error("BCL term cannot be empty");
     }
-    
-    // Check for 00 (K combinator)
-    if (startPos + 1 < input.length && input.substring(startPos, startPos + 2) === '00') {
-      return { success: true, term: '00', nextPos: startPos + 2 };
+    // Term can be 1, 00, 01, or K, S, App (application)
+    const validTerms = ["1", "App", "00", "K", "01", "S"];
+    if (!validTerms.includes(term)) {
+      throw new Error(`Invalid BCL term: ${term}\nExpected one of: ${validTerms.join(", ")}`);
     }
-    
-    // Check for 01 (S combinator) 
-    if (startPos + 1 < input.length && input.substring(startPos, startPos + 2) === '01') {
-      return { success: true, term: '01', nextPos: startPos + 2 };
+    let processedTerm = 0;
+    if (term === "00" || term === "K") processedTerm = 1;
+    else if (term === "01" || term === "S") processedTerm = 2;
+    this.bclTerm += termset[processedTerm];
+    if (processedTerm === 0) {
+      if (this.bclCtr === 0) this.bclCtr += 1;
+      this.bclCtr += 1;
+    } else {
+      this.bclCtr -= 1;
     }
-    
-    // Check for 1 (application)
-    if (input[startPos] === '1') {
-      // Parse first subterm
-      const leftResult = this.parseBCLTerm(input, startPos + 1);
-      if (!leftResult.success) {
-        return leftResult;
-      }
-      
-      // Parse second subterm
-      const rightResult = this.parseBCLTerm(input, leftResult.nextPos);
-      if (!rightResult.success) {
-        return rightResult;
-      }
-      
-      const term = '1' + leftResult.term + rightResult.term;
-      return { success: true, term, nextPos: rightResult.nextPos };
+    if (this.bclCtr <= 0) {
+      const constructedProgram = this.bclTerm;
+      this.bclCtr = 0;
+      this.bclTerm = "";
+      return `Constructed Program: ${constructedProgram}`;
+    } else {
+      return `Need ${this.bclCtr} more term(s) to complete the program.`;
     }
-    
-    return { success: false, term: '', nextPos: startPos };
+  }
+
+  async clearBCLTerm(): Promise<void> {
+    this.bclCtr = 0;
+    this.bclTerm = "";
   }
 }
 
@@ -758,6 +757,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["program"],
         },
       },
+      {
+        name: "add_bcl_term",
+        description: "Add a BCL term to the constructor, maintaining valid syntax. Returns completion status.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            term: { 
+              type: "string", 
+              description: "BCL term to add. Valid values: '1' or 'App' (application), '00' or 'K' (K combinator), '01' or 'S' (S combinator)" 
+            },
+          },
+          required: ["term"],
+        },
+      },
+      {
+        name: "clear_bcl_term",
+        description: "Clear the current BCL term being constructed and reset the constructor state",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
     ],
   };
 });
@@ -811,6 +832,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.validateGraph(), null, 2) }] };
     case "evaluate_bcl":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.evaluateBCL(args.program as string, args.maxSteps as number), null, 2) }] };
+    case "add_bcl_term":
+      return { content: [{ type: "text", text: await knowledgeGraphManager.addBCLTerm(args.term as string) }] };
+    case "clear_bcl_term":
+      await knowledgeGraphManager.clearBCLTerm();
+      return { content: [{ type: "text", text: "BCL term constructor cleared successfully" }] };
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
