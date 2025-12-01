@@ -71,6 +71,19 @@ class KnowledgeGraphManager {
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
     const graph = await this.loadGraph();
+    
+    // Validate observation limits
+    for (const entity of entities) {
+      if (entity.observations.length > 2) {
+        throw new Error(`Entity "${entity.name}" has ${entity.observations.length} observations. Maximum allowed is 2.`);
+      }
+      for (const obs of entity.observations) {
+        if (obs.length > 140) {
+          throw new Error(`Observation in entity "${entity.name}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+        }
+      }
+    }
+    
     const newEntities = entities.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
     graph.entities.push(...newEntities);
     await this.saveGraph(graph);
@@ -96,7 +109,21 @@ class KnowledgeGraphManager {
       if (!entity) {
         throw new Error(`Entity with name ${o.entityName} not found`);
       }
+      
+      // Validate observation character limits
+      for (const obs of o.contents) {
+        if (obs.length > 140) {
+          throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+        }
+      }
+      
       const newObservations = o.contents.filter(content => !entity.observations.includes(content));
+      
+      // Validate total observation count
+      if (entity.observations.length + newObservations.length > 2) {
+        throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${entity.observations.length}).`);
+      }
+      
       entity.observations.push(...newObservations);
       return { entityName: o.entityName, addedObservations: newObservations };
     });
@@ -132,19 +159,22 @@ class KnowledgeGraphManager {
     await this.saveGraph(graph);
   }
 
-  async readGraph(): Promise<KnowledgeGraph> {
-    return this.loadGraph();
-  }
-
-  // Very basic search function
+  // Regex-based search function
   async searchNodes(query: string): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     
+    let regex: RegExp;
+    try {
+      regex = new RegExp(query, 'i'); // case-insensitive
+    } catch (e) {
+      throw new Error(`Invalid regex pattern: ${query}`);
+    }
+    
     // Filter entities
     const filteredEntities = graph.entities.filter(e => 
-      e.name.toLowerCase().includes(query.toLowerCase()) ||
-      e.entityType.toLowerCase().includes(query.toLowerCase()) ||
-      e.observations.some(o => o.toLowerCase().includes(query.toLowerCase()))
+      regex.test(e.name) ||
+      regex.test(e.entityType) ||
+      e.observations.some(o => regex.test(o))
     );
   
     // Create a Set of filtered entity names for quick lookup
@@ -205,19 +235,23 @@ class KnowledgeGraphManager {
     return filteredGraph;
   }
 
-  async getNeighbors(entityName: string, depth: number = 1): Promise<KnowledgeGraph> {
+  async getNeighbors(entityName: string, depth: number = 1, withEntities: boolean = false): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     const visited = new Set<string>();
     const resultEntities = new Map<string, Entity>();
-    const resultRelations: Relation[] = [];
+    const resultRelations = new Map<string, Relation>(); // Deduplicate relations
+    
+    const relationKey = (r: Relation) => `${r.from}|${r.relationType}|${r.to}`;
     
     const traverse = (currentName: string, currentDepth: number) => {
       if (currentDepth > depth || visited.has(currentName)) return;
       visited.add(currentName);
       
-      const entity = graph.entities.find(e => e.name === currentName);
-      if (entity) {
-        resultEntities.set(currentName, entity);
+      if (withEntities) {
+        const entity = graph.entities.find(e => e.name === currentName);
+        if (entity) {
+          resultEntities.set(currentName, entity);
+        }
       }
       
       // Find all relations involving this entity
@@ -225,7 +259,7 @@ class KnowledgeGraphManager {
         r.from === currentName || r.to === currentName
       );
       
-      resultRelations.push(...connectedRelations);
+      connectedRelations.forEach(r => resultRelations.set(relationKey(r), r));
       
       if (currentDepth < depth) {
         // Traverse to connected entities
@@ -240,7 +274,7 @@ class KnowledgeGraphManager {
     
     return {
       entities: Array.from(resultEntities.values()),
-      relations: resultRelations
+      relations: Array.from(resultRelations.values())
     };
   }
 
@@ -309,11 +343,13 @@ class KnowledgeGraphManager {
     return graph.entities.filter(e => !connectedEntityNames.has(e.name));
   }
 
-  async validateGraph(): Promise<string[]> {
+  async validateGraph(): Promise<{ missingEntities: string[]; observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] }> {
     const graph = await this.loadGraph();
     const entityNames = new Set(graph.entities.map(e => e.name));
     const missingEntities = new Set<string>();
+    const observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] = [];
     
+    // Check for missing entities in relations
     graph.relations.forEach(r => {
       if (!entityNames.has(r.from)) {
         missingEntities.add(r.from);
@@ -323,7 +359,28 @@ class KnowledgeGraphManager {
       }
     });
     
-    return Array.from(missingEntities);
+    // Check for observation limit violations
+    graph.entities.forEach(e => {
+      const oversizedObservations: number[] = [];
+      e.observations.forEach((obs, idx) => {
+        if (obs.length > 140) {
+          oversizedObservations.push(idx);
+        }
+      });
+      
+      if (e.observations.length > 2 || oversizedObservations.length > 0) {
+        observationViolations.push({
+          entity: e.name,
+          count: e.observations.length,
+          oversizedObservations
+        });
+      }
+    });
+    
+    return {
+      missingEntities: Array.from(missingEntities),
+      observationViolations
+    };
   }
 
   // BCL (Binary Combinatory Logic) evaluator
@@ -505,8 +562,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                   entityType: { type: "string", description: "The type of the entity" },
                   observations: { 
                     type: "array", 
-                    items: { type: "string" },
-                    description: "An array of observation contents associated with the entity"
+                    items: { type: "string", maxLength: 140 },
+                    maxItems: 2,
+                    description: "Observations associated with the entity. MAX 2 observations, each MAX 140 characters."
                   },
                 },
                 required: ["name", "entityType", "observations"],
@@ -540,7 +598,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "add_observations",
-        description: "Add new observations to existing entities in the knowledge graph",
+        description: "Add new observations to existing entities in the knowledge graph. Entities are limited to 2 total observations.",
         inputSchema: {
           type: "object",
           properties: {
@@ -552,8 +610,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                   entityName: { type: "string", description: "The name of the entity to add the observations to" },
                   contents: { 
                     type: "array", 
-                    items: { type: "string" },
-                    description: "An array of observation contents to add"
+                    items: { type: "string", maxLength: 140 },
+                    description: "Observations to add. Each MAX 140 characters. Entity total MAX 2 observations."
                   },
                 },
                 required: ["entityName", "contents"],
@@ -627,20 +685,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "read_graph",
-        description: "Read the entire knowledge graph",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-      {
         name: "search_nodes",
-        description: "Search for nodes in the knowledge graph based on a query",
+        description: "Search for nodes in the knowledge graph using a regex pattern",
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "The search query to match against entity names, types, and observation content" },
+            query: { type: "string", description: "Regex pattern to match against entity names, types, and observations. Use | for alternatives (e.g., 'Taranis|wheel'). Special regex characters must be escaped for literal matching." },
           },
           required: ["query"],
         },
@@ -682,7 +732,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             entityName: { type: "string", description: "The name of the entity to find neighbors for" },
-            depth: { type: "number", description: "Maximum depth to traverse (default: 1)", default: 1 },
+            depth: { type: "number", description: "Maximum depth to traverse (default: 0)", default: 0 },
+            withEntities: { type: "boolean", description: "If true, include full entity data. Default returns only relations for lightweight structure exploration.", default: false },
           },
           required: ["entityName"],
         },
@@ -745,7 +796,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "validate_graph",
-        description: "Validate the knowledge graph and return a list of missing entities referenced in relations",
+        description: "Validate the knowledge graph. Returns missing entities referenced in relations and observation limit violations (>2 observations or >140 chars).",
         inputSchema: {
           type: "object",
           properties: {},
@@ -812,8 +863,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "delete_relations":
       await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
-    case "read_graph":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.readGraph(), null, 2) }] };
     case "search_nodes":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.searchNodes(args.query as string), null, 2) }] };
     case "open_nodes_filtered":
@@ -821,7 +870,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "open_nodes":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.openNodes(args.names as string[]), null, 2) }] };
     case "get_neighbors":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number), null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number, args.withEntities as boolean), null, 2) }] };
     case "find_path":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number), null, 2) }] };
     case "get_entities_by_type":
