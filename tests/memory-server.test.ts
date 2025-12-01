@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
-import { createServer, Entity, Relation, KnowledgeGraph } from '../index.js';
+import { createServer, Entity, Relation, KnowledgeGraph } from '../server.js';
 import { createTestClient, callTool } from './test-utils.js';
 
 describe('MCP Memory Server E2E Tests', () => {
