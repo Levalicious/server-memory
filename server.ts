@@ -9,6 +9,7 @@ import {
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import lockfile from 'proper-lockfile';
 
 // Define memory file path using environment variable with fallback
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
@@ -48,6 +49,21 @@ export class KnowledgeGraphManager {
     this.memoryFilePath = memoryFilePath;
   }
 
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    // Ensure file exists for locking
+    try {
+      await fs.access(this.memoryFilePath);
+    } catch {
+      await fs.writeFile(this.memoryFilePath, "");
+    }
+    const release = await lockfile.lock(this.memoryFilePath, { retries: { retries: 5, minTimeout: 100 } });
+    try {
+      return await fn();
+    } finally {
+      await release();
+    }
+  }
+
   private async loadGraph(): Promise<KnowledgeGraph> {
     try {
       const data = await fs.readFile(this.memoryFilePath, "utf-8");
@@ -71,97 +87,110 @@ export class KnowledgeGraphManager {
       ...graph.entities.map(e => JSON.stringify({ type: "entity", ...e })),
       ...graph.relations.map(r => JSON.stringify({ type: "relation", ...r })),
     ];
-    await fs.writeFile(this.memoryFilePath, lines.join("\n"));
+    const content = lines.join("\n") + (lines.length > 0 ? "\n" : "");
+    await fs.writeFile(this.memoryFilePath, content);
   }
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
-    const graph = await this.loadGraph();
-    
-    // Validate observation limits
-    for (const entity of entities) {
-      if (entity.observations.length > 2) {
-        throw new Error(`Entity "${entity.name}" has ${entity.observations.length} observations. Maximum allowed is 2.`);
-      }
-      for (const obs of entity.observations) {
-        if (obs.length > 140) {
-          throw new Error(`Observation in entity "${entity.name}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+    return this.withLock(async () => {
+      const graph = await this.loadGraph();
+      
+      // Validate observation limits
+      for (const entity of entities) {
+        if (entity.observations.length > 2) {
+          throw new Error(`Entity "${entity.name}" has ${entity.observations.length} observations. Maximum allowed is 2.`);
+        }
+        for (const obs of entity.observations) {
+          if (obs.length > 140) {
+            throw new Error(`Observation in entity "${entity.name}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+          }
         }
       }
-    }
-    
-    const newEntities = entities.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
-    graph.entities.push(...newEntities);
-    await this.saveGraph(graph);
-    return newEntities;
+      
+      const newEntities = entities.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
+      graph.entities.push(...newEntities);
+      await this.saveGraph(graph);
+      return newEntities;
+    });
   }
 
   async createRelations(relations: Relation[]): Promise<Relation[]> {
-    const graph = await this.loadGraph();
-    const newRelations = relations.filter(r => !graph.relations.some(existingRelation => 
-      existingRelation.from === r.from && 
-      existingRelation.to === r.to && 
-      existingRelation.relationType === r.relationType
-    ));
-    graph.relations.push(...newRelations);
-    await this.saveGraph(graph);
-    return newRelations;
+    return this.withLock(async () => {
+      const graph = await this.loadGraph();
+      const newRelations = relations.filter(r => !graph.relations.some(existingRelation => 
+        existingRelation.from === r.from && 
+        existingRelation.to === r.to && 
+        existingRelation.relationType === r.relationType
+      ));
+      graph.relations.push(...newRelations);
+      await this.saveGraph(graph);
+      return newRelations;
+    });
   }
 
   async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
-    const graph = await this.loadGraph();
-    const results = observations.map(o => {
-      const entity = graph.entities.find(e => e.name === o.entityName);
-      if (!entity) {
-        throw new Error(`Entity with name ${o.entityName} not found`);
-      }
-      
-      // Validate observation character limits
-      for (const obs of o.contents) {
-        if (obs.length > 140) {
-          throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+    return this.withLock(async () => {
+      const graph = await this.loadGraph();
+      const results = observations.map(o => {
+        const entity = graph.entities.find(e => e.name === o.entityName);
+        if (!entity) {
+          throw new Error(`Entity with name ${o.entityName} not found`);
         }
-      }
-      
-      const newObservations = o.contents.filter(content => !entity.observations.includes(content));
-      
-      // Validate total observation count
-      if (entity.observations.length + newObservations.length > 2) {
-        throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${entity.observations.length}).`);
-      }
-      
-      entity.observations.push(...newObservations);
-      return { entityName: o.entityName, addedObservations: newObservations };
+        
+        // Validate observation character limits
+        for (const obs of o.contents) {
+          if (obs.length > 140) {
+            throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+          }
+        }
+        
+        const newObservations = o.contents.filter(content => !entity.observations.includes(content));
+        
+        // Validate total observation count
+        if (entity.observations.length + newObservations.length > 2) {
+          throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${entity.observations.length}).`);
+        }
+        
+        entity.observations.push(...newObservations);
+        return { entityName: o.entityName, addedObservations: newObservations };
+      });
+      await this.saveGraph(graph);
+      return results;
     });
-    await this.saveGraph(graph);
-    return results;
   }
 
   async deleteEntities(entityNames: string[]): Promise<void> {
-    const graph = await this.loadGraph();
-    graph.entities = graph.entities.filter(e => !entityNames.includes(e.name));
-    graph.relations = graph.relations.filter(r => !entityNames.includes(r.from) && !entityNames.includes(r.to));
-    await this.saveGraph(graph);
+    return this.withLock(async () => {
+      const graph = await this.loadGraph();
+      graph.entities = graph.entities.filter(e => !entityNames.includes(e.name));
+      graph.relations = graph.relations.filter(r => !entityNames.includes(r.from) && !entityNames.includes(r.to));
+      await this.saveGraph(graph);
+    });
   }
 
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
-    const graph = await this.loadGraph();
-    deletions.forEach(d => {
-      const entity = graph.entities.find(e => e.name === d.entityName);
-      if (entity) {
-        entity.observations = entity.observations.filter(o => !d.observations.includes(o));
-      }
+    return this.withLock(async () => {
+      const graph = await this.loadGraph();
+      deletions.forEach(d => {
+        const entity = graph.entities.find(e => e.name === d.entityName);
+        if (entity) {
+          entity.observations = entity.observations.filter(o => !d.observations.includes(o));
+        }
+      });
+      await this.saveGraph(graph);
     });
-    await this.saveGraph(graph);
   }
 
   async deleteRelations(relations: Relation[]): Promise<void> {
-    const graph = await this.loadGraph();
-    graph.relations = graph.relations.filter(r => !relations.some(delRelation => 
-      r.from === delRelation.from && 
-      r.to === delRelation.to && 
-      r.relationType === delRelation.relationType
-    ));
-    await this.saveGraph(graph);
+    return this.withLock(async () => {
+      const graph = await this.loadGraph();
+      graph.relations = graph.relations.filter(r => !relations.some(delRelation => 
+        r.from === delRelation.from && 
+        r.to === delRelation.to && 
+        r.relationType === delRelation.relationType
+      ));
+      await this.saveGraph(graph);
+    });
   }
 
   // Regex-based search function
