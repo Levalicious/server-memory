@@ -14,38 +14,43 @@ import { fileURLToPath } from 'url';
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
 
 // If MEMORY_FILE_PATH is just a filename, put it in the same directory as the script
-const MEMORY_FILE_PATH = process.env.MEMORY_FILE_PATH
+const DEFAULT_MEMORY_FILE_PATH = process.env.MEMORY_FILE_PATH
   ? path.isAbsolute(process.env.MEMORY_FILE_PATH)
     ? process.env.MEMORY_FILE_PATH
     : path.join(path.dirname(fileURLToPath(import.meta.url)), process.env.MEMORY_FILE_PATH)
   : defaultMemoryPath;
 
 // We are storing our memory using entities, relations, and observations in a graph structure
-interface Entity {
+export interface Entity {
   name: string;
   entityType: string;
   observations: string[];
 }
 
-interface Relation {
+export interface Relation {
   from: string;
   to: string;
   relationType: string;
 }
 
-interface KnowledgeGraph {
+export interface KnowledgeGraph {
   entities: Entity[];
   relations: Relation[];
 }
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
-class KnowledgeGraphManager {
+export class KnowledgeGraphManager {
   bclCtr: number = 0;
   bclTerm: string = "";
+  private memoryFilePath: string;
+
+  constructor(memoryFilePath: string = DEFAULT_MEMORY_FILE_PATH) {
+    this.memoryFilePath = memoryFilePath;
+  }
 
   private async loadGraph(): Promise<KnowledgeGraph> {
     try {
-      const data = await fs.readFile(MEMORY_FILE_PATH, "utf-8");
+      const data = await fs.readFile(this.memoryFilePath, "utf-8");
       const lines = data.split("\n").filter(line => line.trim() !== "");
       return lines.reduce((graph: KnowledgeGraph, line) => {
         const item = JSON.parse(line);
@@ -54,7 +59,7 @@ class KnowledgeGraphManager {
         return graph;
       }, { entities: [], relations: [] });
     } catch (error) {
-      if (error instanceof Error && 'code' in error && (error as any).code === "ENOENT") {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
         return { entities: [], relations: [] };
       }
       throw error;
@@ -66,7 +71,7 @@ class KnowledgeGraphManager {
       ...graph.entities.map(e => JSON.stringify({ type: "entity", ...e })),
       ...graph.relations.map(r => JSON.stringify({ type: "relation", ...r })),
     ];
-    await fs.writeFile(MEMORY_FILE_PATH, lines.join("\n"));
+    await fs.writeFile(this.memoryFilePath, lines.join("\n"));
   }
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
@@ -525,24 +530,27 @@ class KnowledgeGraphManager {
   }
 }
 
-const knowledgeGraphManager = new KnowledgeGraphManager();
+/**
+ * Creates a configured MCP server instance with all tools registered.
+ * @param memoryFilePath Optional path to the memory file (defaults to MEMORY_FILE_PATH env var or memory.json)
+ */
+export function createServer(memoryFilePath?: string): Server {
+  const knowledgeGraphManager = new KnowledgeGraphManager(memoryFilePath);
 
-
-// The server instance and tools exposed to Claude
-const server = new Server({
-  name: "memory-server",
-  icons: [
-    { src: "data:image/svg+xml;base64,PHN2ZyBmaWxsPSJjdXJyZW50Q29sb3IiIGZpbGwtcnVsZT0iZXZlbm9kZCIgaGVpZ2h0PSIxZW0iIHN0eWxlPSJmbGV4Om5vbmU7bGluZS1oZWlnaHQ6MSIgdmlld0JveD0iMCAwIDI0IDI0IiB3aWR0aD0iMWVtIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjx0aXRsZT5Nb2RlbENvbnRleHRQcm90b2NvbDwvdGl0bGU+PHBhdGggZD0iTTIwLjEgNS41MlYxLjVoLS4xOGMtMy4zNi4xNS02LjE1IDIuMzEtNy44MyA0LjAybC0uMDkuMDktLjA5LS4wOUMxMC4yIDMuODEgNy40NCAxLjY1IDQuMDggMS41SDMuOXY0LjAySDB2Ni45M2MwIDEuNjguMDYgMy4zNi4xOCA0Ljc0YTUuNTcgNS41NyAwIDAgMCA1LjE5IDUuMWMyLjEzLjEyIDQuMzguMjEgNi42My4yMXM0LjUtLjA5IDYuNjMtLjI0YTUuNTcgNS41NyAwIDAgMCA1LjE5LTUuMWMuMTItMS4zOC4xOC0zLjA2LjE4LTQuNzR2LTYuOXptMCA2LjkzYzAgMS41OS0uMDYgMy4xNS0uMTggNC40MS0uMDkuODEtLjc1IDEuNDctMS41NiAxLjVhOTAgOTAgMCAwIDEtMTIuNzIgMGMtLjgxLS4wMy0xLjUtLjY5LTEuNTYtMS41LS4xMi0xLjI2LS4xOC0yLjg1LS4xOC00LjQxVjUuNTJjMi44Mi4xMiA1LjY0IDMuMTUgNi40OCA0LjMyTDEyIDEyLjA5bDEuNjItMi4yNWMuODQtMS4yIDMuNjYtNC4yIDYuNDgtNC4zMnoiLz48L3N2Zz4=",
-      mimeType: "image/svg+xml",
-      sizes: ["any"]
-    }
-  ],
-  version: "0.0.4",
-},    {
+  const server = new Server({
+    name: "memory-server",
+    icons: [
+      { src: "data:image/svg+xml;base64,PHN2ZyBmaWxsPSJjdXJyZW50Q29sb3IiIGZpbGwtcnVsZT0iZXZlbm9kZCIgaGVpZ2h0PSIxZW0iIHN0eWxlPSJmbGV4Om5vbmU7bGluZS1oZWlnaHQ6MSIgdmlld0JveD0iMCAwIDI0IDI0IiB3aWR0aD0iMWVtIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjx0aXRsZT5Nb2RlbENvbnRleHRQcm90b2NvbDwvdGl0bGU+PHBhdGggZD0iTTIwLjEgNS41MlYxLjVoLS4xOGMtMy4zNi4xNS02LjE1IDIuMzEtNy44MyA0LjAybC0uMDkuMDktLjA5LS4wOUMxMC4yIDMuODEgNy40NCAxLjY1IDQuMDggMS41SDMuOXY0LjAySDB2Ni45M2MwIDEuNjguMDYgMy4zNi4xOCA0Ljc0YTUuNTcgNS41NyAwIDAgMCA1LjE5IDUuMWMyLjEzLjEyIDQuMzguMjEgNi42My4yMXM0LjUtLjA5IDYuNjMtLjI0YTUuNTcgNS41NyAwIDAgMCA1LjE5LTUuMWMuMTItMS4zOC4xOC0zLjA2LjE4LTQuNzR2LTYuOXptMCA2LjkzYzAgMS41OS0uMDYgMy4xNS0uMTggNC40MS0uMDkuODEtLjc1IDEuNDctMS41NiAxLjVhOTAgOTAgMCAwIDEtMTIuNzIgMGMtLjgxLS4wMy0xLjUtLjY5LTEuNTYtMS41LS4xMi0xLjI2LS4xOC0yLjg1LS4xOC00LjQxVjUuNTJjMi44Mi4xMiA1LjY0IDMuMTUgNi40OCA0LjMyTDEyIDEyLjA5bDEuNjItMi4yNWMuODQtMS4yIDMuNjYtNC4yIDYuNDgtNC4zMnoiLz48L3N2Zz4=",
+        mimeType: "image/svg+xml",
+        sizes: ["any"]
+      }
+    ],
+    version: "0.0.4",
+  }, {
     capabilities: {
       tools: {},
     },
-  },);
+  });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -897,13 +905,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Knowledge Graph MCP Server running on stdio");
+  return server;
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
-});
+// Main entry point - only runs when executed directly, not when imported
+const isMainModule = process.argv[1] && (
+  process.argv[1].endsWith('index.js') || 
+  process.argv[1].endsWith('index.ts')
+);
+
+if (isMainModule) {
+  const server = createServer();
+  const transport = new StdioServerTransport();
+  server.connect(transport).then(() => {
+    console.error("Knowledge Graph MCP Server running on stdio");
+  }).catch((error) => {
+    console.error("Fatal error:", error);
+    process.exit(1);
+  });
+}
