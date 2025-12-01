@@ -1,6 +1,6 @@
 {
   "name": "@levalicious/server-memory",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "MCP server for enabling memory for Claude through a knowledge graph",
   "license": "MIT",
   "author": "Levalicious",
@@ -19,7 +19,7 @@
     "watch": "tsc --watch"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.21.0"
+    "@modelcontextprotocol/sdk": "1.22.0"
   },
   "devDependencies": {
     "@types/node": "^24",
