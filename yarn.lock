@@ -2,10 +2,10 @@
 # yarn lockfile v1
 
 
-"@modelcontextprotocol/sdk@1.21.0":
-  version "1.21.0"
-  resolved "https://registry.yarnpkg.com/@modelcontextprotocol/sdk/-/sdk-1.21.0.tgz#a4574443c02a8ce57e7ecbce823c6eaf04041927"
-  integrity sha512-YFBsXJMFCyI1zP98u7gezMFKX4lgu/XpoZJk7ufI6UlFKXLj2hAMUuRlQX/nrmIPOmhRrG6tw2OQ2ZA/ZlXYpQ==
+"@modelcontextprotocol/sdk@1.22.0":
+  version "1.22.0"
+  resolved "https://registry.yarnpkg.com/@modelcontextprotocol/sdk/-/sdk-1.22.0.tgz#b982143dfd36ef096b311d8ffadb2f91aabbbb1d"
+  integrity sha512-VUpl106XVTCpDmTBil2ehgJZjhyLY2QZikzF8NvTXtLRF1CvO5iEE2UNZdVIUer35vFOwMKYeUGbjJtvPWan3g==
   dependencies:
     ajv "^8.17.1"
     ajv-formats "^3.0.1"
