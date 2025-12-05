@@ -1,6 +1,20 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Entity, Relation, MAX_CHARS } from "../server.js";
+
+export { MAX_CHARS };
+
+export interface PaginatedResult<T> {
+  items: T[];
+  nextCursor: number | null;
+  totalCount: number;
+}
+
+export interface PaginatedGraph {
+  entities: PaginatedResult<Entity>;
+  relations: PaginatedResult<Relation>;
+}
 
 export async function createTestClient(server: Server): Promise<{
   client: Client;
@@ -27,6 +41,17 @@ export async function createTestClient(server: Server): Promise<{
   };
 }
 
+// Read operations that should be paginated
+const PAGINATED_TOOLS = new Set([
+  'search_nodes',
+  'open_nodes',
+  'open_nodes_filtered',
+  'get_neighbors',
+  'find_path',
+  'get_entities_by_type',
+  'get_orphaned_entities',
+]);
+
 export async function callTool(
   client: Client,
   name: string,
@@ -41,6 +66,10 @@ export async function callTool(
   
   const first = content[0];
   if (first.type === 'text' && first.text) {
+    // Only enforce char limit on paginated read operations
+    if (PAGINATED_TOOLS.has(name) && first.text.length > MAX_CHARS) {
+      throw new Error(`Response exceeds ${MAX_CHARS} char limit: got ${first.text.length} chars`);
+    }
     try {
       return JSON.parse(first.text);
     } catch {
