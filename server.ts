@@ -26,17 +26,121 @@ export interface Entity {
   name: string;
   entityType: string;
   observations: string[];
+  mtime?: number;        // General modification time (any change)
+  obsMtime?: number;     // Observation-specific modification time
 }
 
 export interface Relation {
   from: string;
   to: string;
   relationType: string;
+  mtime?: number;
 }
 
 export interface KnowledgeGraph {
   entities: Entity[];
   relations: Relation[];
+}
+
+export interface PaginatedResult<T> {
+  items: T[];
+  nextCursor: number | null;
+  totalCount: number;
+}
+
+export const MAX_CHARS = 512;
+
+function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
+  const result: T[] = [];
+  let i = cursor;
+  
+  // Calculate overhead for wrapper: {"items":[],"nextCursor":null,"totalCount":123}
+  const wrapperTemplate = { items: [] as T[], nextCursor: null as number | null, totalCount: items.length };
+  let overhead = JSON.stringify(wrapperTemplate).length;
+  let charCount = overhead;
+  
+  while (i < items.length) {
+    const itemJson = JSON.stringify(items[i]);
+    const addedChars = itemJson.length + (result.length > 0 ? 1 : 0); // +1 for comma
+    
+    if (charCount + addedChars > maxChars) {
+      break;
+    }
+    
+    result.push(items[i]);
+    charCount += addedChars;
+    i++;
+  }
+  
+  // Update nextCursor - recalculate if we stopped early (cursor digits may differ from null)
+  const nextCursor = i < items.length ? i : null;
+  
+  return {
+    items: result,
+    nextCursor,
+    totalCount: items.length
+  };
+}
+
+function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relationCursor: number = 0): { entities: PaginatedResult<Entity>; relations: PaginatedResult<Relation> } {
+  // Build incrementally, measuring actual serialized size
+  const entityCount = graph.entities.length;
+  const relationCount = graph.relations.length;
+  
+  // Start with empty result to measure base overhead
+  const emptyResult = {
+    entities: { items: [] as Entity[], nextCursor: null as number | null, totalCount: entityCount },
+    relations: { items: [] as Relation[], nextCursor: null as number | null, totalCount: relationCount }
+  };
+  let currentSize = JSON.stringify(emptyResult).length;
+  
+  const resultEntities: Entity[] = [];
+  const resultRelations: Relation[] = [];
+  let entityIdx = entityCursor;
+  let relationIdx = relationCursor;
+  
+  // Add entities until we hit the limit
+  while (entityIdx < graph.entities.length) {
+    const entity = graph.entities[entityIdx];
+    const entityJson = JSON.stringify(entity);
+    const addedChars = entityJson.length + (resultEntities.length > 0 ? 1 : 0);
+    
+    if (currentSize + addedChars > MAX_CHARS) {
+      break;
+    }
+    
+    resultEntities.push(entity);
+    currentSize += addedChars;
+    entityIdx++;
+  }
+  
+  // Add relations with remaining space
+  while (relationIdx < graph.relations.length) {
+    const relation = graph.relations[relationIdx];
+    const relationJson = JSON.stringify(relation);
+    const addedChars = relationJson.length + (resultRelations.length > 0 ? 1 : 0);
+    
+    if (currentSize + addedChars > MAX_CHARS) {
+      break;
+    }
+    
+    resultRelations.push(relation);
+    currentSize += addedChars;
+    relationIdx++;
+  }
+  
+  return {
+    entities: {
+      items: resultEntities,
+      nextCursor: entityIdx < graph.entities.length ? entityIdx : null,
+      totalCount: entityCount
+    },
+    relations: {
+      items: resultRelations,
+      nextCursor: relationIdx < graph.relations.length ? relationIdx : null,
+      totalCount: relationCount
+    }
+  };
 }
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
@@ -107,7 +211,10 @@ export class KnowledgeGraphManager {
         }
       }
       
-      const newEntities = entities.filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name));
+      const now = Date.now();
+      const newEntities = entities
+        .filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name))
+        .map(e => ({ ...e, mtime: now, obsMtime: e.observations.length > 0 ? now : undefined }));
       graph.entities.push(...newEntities);
       await this.saveGraph(graph);
       return newEntities;
@@ -117,11 +224,23 @@ export class KnowledgeGraphManager {
   async createRelations(relations: Relation[]): Promise<Relation[]> {
     return this.withLock(async () => {
       const graph = await this.loadGraph();
-      const newRelations = relations.filter(r => !graph.relations.some(existingRelation => 
-        existingRelation.from === r.from && 
-        existingRelation.to === r.to && 
-        existingRelation.relationType === r.relationType
-      ));
+      const now = Date.now();
+      
+      // Update mtime on 'from' entities when relations are added
+      const fromEntityNames = new Set(relations.map(r => r.from));
+      graph.entities.forEach(e => {
+        if (fromEntityNames.has(e.name)) {
+          e.mtime = now;
+        }
+      });
+      
+      const newRelations = relations
+        .filter(r => !graph.relations.some(existingRelation => 
+          existingRelation.from === r.from && 
+          existingRelation.to === r.to && 
+          existingRelation.relationType === r.relationType
+        ))
+        .map(r => ({ ...r, mtime: now }));
       graph.relations.push(...newRelations);
       await this.saveGraph(graph);
       return newRelations;
@@ -152,6 +271,11 @@ export class KnowledgeGraphManager {
         }
         
         entity.observations.push(...newObservations);
+        if (newObservations.length > 0) {
+          const now = Date.now();
+          entity.mtime = now;
+          entity.obsMtime = now;
+        }
         return { entityName: o.entityName, addedObservations: newObservations };
       });
       await this.saveGraph(graph);
@@ -171,10 +295,16 @@ export class KnowledgeGraphManager {
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
     return this.withLock(async () => {
       const graph = await this.loadGraph();
+      const now = Date.now();
       deletions.forEach(d => {
         const entity = graph.entities.find(e => e.name === d.entityName);
         if (entity) {
+          const originalLen = entity.observations.length;
           entity.observations = entity.observations.filter(o => !d.observations.includes(o));
+          if (entity.observations.length !== originalLen) {
+            entity.mtime = now;
+            entity.obsMtime = now;
+          }
         }
       });
       await this.saveGraph(graph);
@@ -557,6 +687,53 @@ export class KnowledgeGraphManager {
     this.bclCtr = 0;
     this.bclTerm = "";
   }
+
+  async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string }> {
+    return this.withLock(async () => {
+      const graph = await this.loadGraph();
+      
+      // Validate observations
+      if (observations.length > 2) {
+        throw new Error(`Thought has ${observations.length} observations. Maximum allowed is 2.`);
+      }
+      for (const obs of observations) {
+        if (obs.length > 140) {
+          throw new Error(`Observation exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+        }
+      }
+      
+      // Generate new context ID
+      const now = Date.now();
+      const ctxId = `thought_${now}_${Math.random().toString(36).substring(2, 8)}`;
+      
+      // Create thought entity
+      const thoughtEntity: Entity = {
+        name: ctxId,
+        entityType: "Thought",
+        observations,
+        mtime: now,
+        obsMtime: observations.length > 0 ? now : undefined,
+      };
+      graph.entities.push(thoughtEntity);
+      
+      // Link to previous thought if it exists
+      if (previousCtxId) {
+        const prevEntity = graph.entities.find(e => e.name === previousCtxId);
+        if (prevEntity) {
+          // Update mtime on previous entity since we're adding a relation from it
+          prevEntity.mtime = now;
+          // Bidirectional chain: previous -> new (follows) and new -> previous (preceded_by)
+          graph.relations.push(
+            { from: previousCtxId, to: ctxId, relationType: "follows", mtime: now },
+            { from: ctxId, to: previousCtxId, relationType: "preceded_by", mtime: now }
+          );
+        }
+      }
+      
+      await this.saveGraph(graph);
+      return { ctxId };
+    });
+  }
 }
 
 /**
@@ -723,18 +900,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_nodes",
-        description: "Search for nodes in the knowledge graph using a regex pattern",
+        description: "Search for nodes in the knowledge graph using a regex pattern. Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Regex pattern to match against entity names, types, and observations. Use | for alternatives (e.g., 'Taranis|wheel'). Special regex characters must be escaped for literal matching." },
+            query: { type: "string", description: "Regex pattern to match against entity names, types, and observations." },
+            entityCursor: { type: "number", description: "Cursor for entity pagination (from previous response's nextCursor)" },
+            relationCursor: { type: "number", description: "Cursor for relation pagination" },
           },
           required: ["query"],
         },
       },
       {
         name: "open_nodes_filtered",
-        description: "Open specific nodes in the knowledge graph by their names, filtering relations to only those between the opened nodes",
+        description: "Open specific nodes in the knowledge graph by their names, filtering relations to only those between the opened nodes. Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
           properties: {
@@ -743,13 +922,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: "string" },
               description: "An array of entity names to retrieve",
             },
+            entityCursor: { type: "number", description: "Cursor for entity pagination" },
+            relationCursor: { type: "number", description: "Cursor for relation pagination" },
           },
           required: ["names"],
         },
       },
       {
         name: "open_nodes",
-        description: "Open specific nodes in the knowledge graph by their names",
+        description: "Open specific nodes in the knowledge graph by their names. Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
           properties: {
@@ -758,43 +939,49 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: "string" },
               description: "An array of entity names to retrieve",
             },
+            entityCursor: { type: "number", description: "Cursor for entity pagination" },
+            relationCursor: { type: "number", description: "Cursor for relation pagination" },
           },
           required: ["names"],
         },
       },
       {
         name: "get_neighbors",
-        description: "Get neighboring entities connected to a specific entity within a given depth",
+        description: "Get neighboring entities connected to a specific entity within a given depth. Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
           properties: {
             entityName: { type: "string", description: "The name of the entity to find neighbors for" },
             depth: { type: "number", description: "Maximum depth to traverse (default: 0)", default: 0 },
             withEntities: { type: "boolean", description: "If true, include full entity data. Default returns only relations for lightweight structure exploration.", default: false },
+            entityCursor: { type: "number", description: "Cursor for entity pagination" },
+            relationCursor: { type: "number", description: "Cursor for relation pagination" },
           },
           required: ["entityName"],
         },
       },
       {
         name: "find_path",
-        description: "Find a path between two entities in the knowledge graph",
+        description: "Find a path between two entities in the knowledge graph. Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
           properties: {
             fromEntity: { type: "string", description: "The name of the starting entity" },
             toEntity: { type: "string", description: "The name of the target entity" },
             maxDepth: { type: "number", description: "Maximum depth to search (default: 5)", default: 5 },
+            cursor: { type: "number", description: "Cursor for pagination" },
           },
           required: ["fromEntity", "toEntity"],
         },
       },
       {
         name: "get_entities_by_type",
-        description: "Get all entities of a specific type",
+        description: "Get all entities of a specific type. Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
           properties: {
             entityType: { type: "string", description: "The type of entities to retrieve" },
+            cursor: { type: "number", description: "Cursor for pagination" },
           },
           required: ["entityType"],
         },
@@ -825,10 +1012,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_orphaned_entities",
-        description: "Get entities that have no relations (orphaned entities)",
+        description: "Get entities that have no relations (orphaned entities). Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            cursor: { type: "number", description: "Cursor for pagination" },
+          },
         },
       },
       {
@@ -873,6 +1062,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {},
         },
       },
+      {
+        name: "sequentialthinking",
+        description: `Record a thought in the knowledge graph. Creates a Thought entity with observations and links it to the previous thought if provided. Returns the new thought's context ID for chaining.
+
+Use this to build chains of reasoning that persist in the graph. Each thought can have up to 2 observations (max 140 chars each).`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            previousCtxId: { 
+              type: "string", 
+              description: "Context ID of the previous thought to chain from. Omit for first thought in a chain." 
+            },
+            observations: { 
+              type: "array", 
+              items: { type: "string", maxLength: 140 },
+              maxItems: 2,
+              description: "Observations for this thought (max 2, each max 140 chars)" 
+            },
+          },
+          required: ["observations"],
+        },
+      },
     ],
   };
 });
@@ -900,26 +1111,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "delete_relations":
       await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
-    case "search_nodes":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.searchNodes(args.query as string), null, 2) }] };
-    case "open_nodes_filtered":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.openNodesFiltered(args.names as string[]), null, 2) }] };
-    case "open_nodes":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.openNodes(args.names as string[]), null, 2) }] };
-    case "get_neighbors":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number, args.withEntities as boolean), null, 2) }] };
-    case "find_path":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number), null, 2) }] };
-    case "get_entities_by_type":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getEntitiesByType(args.entityType as string), null, 2) }] };
+    case "search_nodes": {
+      const graph = await knowledgeGraphManager.searchNodes(args.query as string);
+      return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+    }
+    case "open_nodes_filtered": {
+      const graph = await knowledgeGraphManager.openNodesFiltered(args.names as string[]);
+      return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+    }
+    case "open_nodes": {
+      const graph = await knowledgeGraphManager.openNodes(args.names as string[]);
+      return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+    }
+    case "get_neighbors": {
+      const graph = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number, args.withEntities as boolean);
+      return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+    }
+    case "find_path": {
+      const path = await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number);
+      return { content: [{ type: "text", text: JSON.stringify(paginateItems(path, args.cursor as number ?? 0)) }] };
+    }
+    case "get_entities_by_type": {
+      const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string);
+      return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
+    }
     case "get_entity_types":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getEntityTypes(), null, 2) }] };
     case "get_relation_types":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getRelationTypes(), null, 2) }] };
     case "get_stats":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
-    case "get_orphaned_entities":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getOrphanedEntities(), null, 2) }] };
+    case "get_orphaned_entities": {
+      const entities = await knowledgeGraphManager.getOrphanedEntities();
+      return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
+    }
     case "validate_graph":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.validateGraph(), null, 2) }] };
     case "evaluate_bcl":
@@ -929,6 +1154,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "clear_bcl_term":
       await knowledgeGraphManager.clearBCLTerm();
       return { content: [{ type: "text", text: "BCL term constructor cleared successfully" }] };
+    case "sequentialthinking": {
+      const result = await knowledgeGraphManager.addThought(
+        args.observations as string[],
+        args.previousCtxId as string | undefined
+      );
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    }
     default:
       throw new Error(`Unknown tool: ${name}`);
   }

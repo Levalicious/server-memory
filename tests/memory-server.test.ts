@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { createServer, Entity, Relation, KnowledgeGraph } from '../server.js';
-import { createTestClient, callTool } from './test-utils.js';
+import { createTestClient, callTool, PaginatedGraph, PaginatedResult } from './test-utils.js';
 
 describe('MCP Memory Server E2E Tests', () => {
   let testDir: string;
@@ -158,8 +158,8 @@ describe('MCP Memory Server E2E Tests', () => {
         deletions: [{ entityName: 'TestEntity', observations: ['Delete'] }]
       });
 
-      const result = await callTool(client, 'open_nodes', { names: ['TestEntity'] }) as KnowledgeGraph;
-      expect(result.entities[0].observations).toEqual(['Keep']);
+      const result = await callTool(client, 'open_nodes', { names: ['TestEntity'] }) as PaginatedGraph;
+      expect(result.entities.items[0].observations).toEqual(['Keep']);
     });
   });
 
@@ -233,30 +233,50 @@ describe('MCP Memory Server E2E Tests', () => {
     });
 
     it('should search by regex pattern', async () => {
-      const result = await callTool(client, 'search_nodes', {
-        query: 'Script'
-      }) as KnowledgeGraph;
+      // Accumulate all entities across pagination
+      const allEntities: Entity[] = [];
+      let entityCursor: number | null = 0;
 
-      expect(result.entities).toHaveLength(2);
-      expect(result.entities.map(e => e.name)).toContain('JavaScript');
-      expect(result.entities.map(e => e.name)).toContain('TypeScript');
+      while (entityCursor !== null) {
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Script',
+          entityCursor
+        }) as PaginatedGraph;
+
+        allEntities.push(...result.entities.items);
+        entityCursor = result.entities.nextCursor;
+      }
+
+      expect(allEntities).toHaveLength(2);
+      expect(allEntities.map(e => e.name)).toContain('JavaScript');
+      expect(allEntities.map(e => e.name)).toContain('TypeScript');
     });
 
     it('should search with alternation', async () => {
-      const result = await callTool(client, 'search_nodes', {
-        query: 'JavaScript|Python'
-      }) as KnowledgeGraph;
+      // Accumulate all entities across pagination
+      const allEntities: Entity[] = [];
+      let entityCursor: number | null = 0;
 
-      expect(result.entities).toHaveLength(2);
+      while (entityCursor !== null) {
+        const result = await callTool(client, 'search_nodes', {
+          query: 'JavaScript|Python',
+          entityCursor
+        }) as PaginatedGraph;
+
+        allEntities.push(...result.entities.items);
+        entityCursor = result.entities.nextCursor;
+      }
+
+      expect(allEntities).toHaveLength(2);
     });
 
     it('should search in observations', async () => {
       const result = await callTool(client, 'search_nodes', {
         query: 'Static'
-      }) as KnowledgeGraph;
+      }) as PaginatedGraph;
 
-      expect(result.entities).toHaveLength(1);
-      expect(result.entities[0].name).toBe('TypeScript');
+      expect(result.entities.items).toHaveLength(1);
+      expect(result.entities.items[0].name).toBe('TypeScript');
     });
 
     it('should reject invalid regex', async () => {
@@ -286,21 +306,21 @@ describe('MCP Memory Server E2E Tests', () => {
     it('should open nodes by name', async () => {
       const result = await callTool(client, 'open_nodes', {
         names: ['A', 'B']
-      }) as KnowledgeGraph;
+      }) as PaginatedGraph;
 
-      expect(result.entities).toHaveLength(2);
+      expect(result.entities.items).toHaveLength(2);
       // open_nodes returns all relations where 'from' is in the requested set
       // A->B and A->C both have from='A' which is in the set
-      expect(result.relations).toHaveLength(2);
+      expect(result.relations.items).toHaveLength(2);
     });
 
     it('should open nodes filtered (only internal relations)', async () => {
       const result = await callTool(client, 'open_nodes_filtered', {
         names: ['B', 'C']
-      }) as KnowledgeGraph;
+      }) as PaginatedGraph;
 
-      expect(result.entities).toHaveLength(2);
-      expect(result.relations).toHaveLength(0); // No relations between B and C
+      expect(result.entities.items).toHaveLength(2);
+      expect(result.relations.items).toHaveLength(0); // No relations between B and C
     });
   });
 
@@ -327,33 +347,68 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'get_neighbors', {
         entityName: 'Root',
         depth: 0
-      }) as KnowledgeGraph;
+      }) as PaginatedGraph;
 
-      expect(result.entities).toHaveLength(0); // withEntities defaults to false
-      expect(result.relations).toHaveLength(2); // Root's direct relations
+      expect(result.entities.items).toHaveLength(0); // withEntities defaults to false
+      expect(result.relations.items).toHaveLength(2); // Root's direct relations
     });
 
     it('should get neighbors with entities when requested', async () => {
-      const result = await callTool(client, 'get_neighbors', {
-        entityName: 'Root',
-        depth: 1,
-        withEntities: true
-      }) as KnowledgeGraph;
+      // Accumulate all entities across pagination
+      const allEntities: Entity[] = [];
+      let entityCursor: number | null = 0;
 
-      expect(result.entities.map(e => e.name)).toContain('Root');
-      expect(result.entities.map(e => e.name)).toContain('Child1');
-      expect(result.entities.map(e => e.name)).toContain('Child2');
+      while (entityCursor !== null) {
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Root',
+          depth: 1,
+          withEntities: true,
+          entityCursor
+        }) as PaginatedGraph;
+
+        allEntities.push(...result.entities.items);
+        entityCursor = result.entities.nextCursor;
+      }
+
+      expect(allEntities).toHaveLength(3);
+      expect(allEntities.map(e => e.name)).toContain('Root');
+      expect(allEntities.map(e => e.name)).toContain('Child1');
+      expect(allEntities.map(e => e.name)).toContain('Child2');
     });
 
     it('should traverse to specified depth', async () => {
-      const result = await callTool(client, 'get_neighbors', {
-        entityName: 'Root',
-        depth: 2,
-        withEntities: true
-      }) as KnowledgeGraph;
+      // Collect all entities and relations using pagination
+      const allEntities: Entity[] = [];
+      const allRelations: Relation[] = [];
+      let entityCursor: number | null = 0;
+      let relationCursor: number | null = 0;
 
-      expect(result.entities).toHaveLength(4); // All nodes
-      expect(result.relations).toHaveLength(3); // All relations
+      // Paginate through all results
+      while (entityCursor !== null || relationCursor !== null) {
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Root',
+          depth: 2,
+          withEntities: true,
+          // Pass large cursor to skip when done, 0 to fetch
+          entityCursor: entityCursor !== null ? entityCursor : 999999,
+          relationCursor: relationCursor !== null ? relationCursor : 999999
+        }) as PaginatedGraph;
+
+        // Collect entities if we still need them
+        if (entityCursor !== null) {
+          allEntities.push(...result.entities.items);
+          entityCursor = result.entities.nextCursor;
+        }
+
+        // Collect relations if we still need them
+        if (relationCursor !== null) {
+          allRelations.push(...result.relations.items);
+          relationCursor = result.relations.nextCursor;
+        }
+      }
+
+      expect(allEntities).toHaveLength(4); // All nodes
+      expect(allRelations).toHaveLength(3); // All relations
     });
 
     it('should deduplicate relations in traversal', async () => {
@@ -365,10 +420,10 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'get_neighbors', {
         entityName: 'Root',
         depth: 1
-      }) as KnowledgeGraph;
+      }) as PaginatedGraph;
 
       // Each unique relation should appear only once
-      const relationKeys = result.relations.map(r => `${r.from}|${r.relationType}|${r.to}`);
+      const relationKeys = result.relations.items.map(r => `${r.from}|${r.relationType}|${r.to}`);
       const uniqueKeys = [...new Set(relationKeys)];
       expect(relationKeys.length).toBe(uniqueKeys.length);
     });
@@ -377,11 +432,11 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'find_path', {
         fromEntity: 'Root',
         toEntity: 'Grandchild'
-      }) as Relation[];
+      }) as PaginatedResult<Relation>;
 
-      expect(result).toHaveLength(2);
-      expect(result[0].from).toBe('Root');
-      expect(result[1].to).toBe('Grandchild');
+      expect(result.items).toHaveLength(2);
+      expect(result.items[0].from).toBe('Root');
+      expect(result.items[1].to).toBe('Grandchild');
     });
 
     it('should return empty path when no path exists', async () => {
@@ -392,9 +447,9 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'find_path', {
         fromEntity: 'Root',
         toEntity: 'Isolated'
-      }) as Relation[];
+      }) as PaginatedResult<Relation>;
 
-      expect(result).toHaveLength(0);
+      expect(result.items).toHaveLength(0);
     });
   });
 
@@ -418,10 +473,10 @@ describe('MCP Memory Server E2E Tests', () => {
     it('should get entities by type', async () => {
       const result = await callTool(client, 'get_entities_by_type', {
         entityType: 'Person'
-      }) as Entity[];
+      }) as PaginatedResult<Entity>;
 
-      expect(result).toHaveLength(2);
-      expect(result.every(e => e.entityType === 'Person')).toBe(true);
+      expect(result.items).toHaveLength(2);
+      expect(result.items.every(e => e.entityType === 'Person')).toBe(true);
     });
 
     it('should get all entity types', async () => {
@@ -477,10 +532,10 @@ describe('MCP Memory Server E2E Tests', () => {
         relations: [{ from: 'Connected1', to: 'Connected2', relationType: 'links' }]
       });
 
-      const result = await callTool(client, 'get_orphaned_entities', {}) as Entity[];
+      const result = await callTool(client, 'get_orphaned_entities', {}) as PaginatedResult<Entity>;
 
-      expect(result).toHaveLength(1);
-      expect(result[0].name).toBe('Orphan');
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].name).toBe('Orphan');
     });
 
     it('should validate graph and report violations', async () => {
@@ -536,6 +591,79 @@ describe('MCP Memory Server E2E Tests', () => {
       await expect(
         callTool(client, 'add_bcl_term', { term: 'invalid' })
       ).rejects.toThrow(/Invalid BCL term/);
+    });
+  });
+
+  describe('Sequential Thinking', () => {
+    it('should create a thought and return ctxId', async () => {
+      const result = await callTool(client, 'sequentialthinking', {
+        observations: ['First thought observation']
+      }) as { ctxId: string };
+
+      expect(result.ctxId).toMatch(/^thought_\d+_[a-z0-9]+$/);
+    });
+
+    it('should chain thoughts with relations', async () => {
+      // Create first thought
+      const first = await callTool(client, 'sequentialthinking', {
+        observations: ['Starting point']
+      }) as { ctxId: string };
+
+      // Create second thought chained to first
+      const second = await callTool(client, 'sequentialthinking', {
+        previousCtxId: first.ctxId,
+        observations: ['Following up']
+      }) as { ctxId: string };
+
+      // Verify the chain via relations
+      const neighbors = await callTool(client, 'get_neighbors', {
+        entityName: first.ctxId,
+        depth: 1
+      }) as PaginatedGraph;
+
+      // Should have 'follows' relation from first to second
+      expect(neighbors.relations.items.some(r => 
+        r.from === first.ctxId && r.to === second.ctxId && r.relationType === 'follows'
+      )).toBe(true);
+    });
+
+    it('should ignore invalid previousCtxId gracefully', async () => {
+      const result = await callTool(client, 'sequentialthinking', {
+        previousCtxId: 'nonexistent_thought',
+        observations: ['Orphaned thought']
+      }) as { ctxId: string };
+
+      expect(result.ctxId).toMatch(/^thought_\d+_[a-z0-9]+$/);
+
+      // Verify no relations were created
+      const neighbors = await callTool(client, 'get_neighbors', {
+        entityName: result.ctxId,
+        depth: 1
+      }) as PaginatedGraph;
+
+      expect(neighbors.relations.totalCount).toBe(0);
+    });
+
+    it('should enforce observation limits on thoughts', async () => {
+      await expect(
+        callTool(client, 'sequentialthinking', {
+          observations: ['One', 'Two', 'Three']
+        })
+      ).rejects.toThrow(/Maximum allowed is 2/);
+    });
+
+    it('should set mtime and obsMtime on thought entities', async () => {
+      const result = await callTool(client, 'sequentialthinking', {
+        observations: ['Timed thought']
+      }) as { ctxId: string };
+
+      const graph = await callTool(client, 'open_nodes', {
+        names: [result.ctxId]
+      }) as PaginatedGraph;
+
+      const thought = graph.entities.items[0];
+      expect(thought.mtime).toBeDefined();
+      expect(thought.obsMtime).toBeDefined();
     });
   });
 });
