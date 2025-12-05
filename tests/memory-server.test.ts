@@ -538,6 +538,35 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(result.items[0].name).toBe('Orphan');
     });
 
+    it('should find entities not connected to Self in strict mode', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'Self', entityType: 'Agent', observations: [] },
+          { name: 'ConnectedToSelf', entityType: 'Node', observations: [] },
+          { name: 'IndirectlyConnected', entityType: 'Node', observations: [] },
+          { name: 'Island1', entityType: 'Node', observations: [] },
+          { name: 'Island2', entityType: 'Node', observations: [] }
+        ]
+      });
+      await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'Self', to: 'ConnectedToSelf', relationType: 'knows' },
+          { from: 'ConnectedToSelf', to: 'IndirectlyConnected', relationType: 'links' },
+          { from: 'Island1', to: 'Island2', relationType: 'links' }  // Connected to each other but not to Self
+        ]
+      });
+
+      // Non-strict: Island1 and Island2 are connected, so not orphaned
+      const nonStrict = await callTool(client, 'get_orphaned_entities', {}) as PaginatedResult<Entity>;
+      expect(nonStrict.items).toHaveLength(0);
+
+      // Strict: Island1 and Island2 are not connected to Self
+      const strict = await callTool(client, 'get_orphaned_entities', { strict: true }) as PaginatedResult<Entity>;
+      expect(strict.items).toHaveLength(2);
+      const names = strict.items.map(e => e.name).sort();
+      expect(names).toEqual(['Island1', 'Island2']);
+    });
+
     it('should validate graph and report violations', async () => {
       // Directly write invalid data to test validation
       const invalidData = [
@@ -600,7 +629,7 @@ describe('MCP Memory Server E2E Tests', () => {
         observations: ['First thought observation']
       }) as { ctxId: string };
 
-      expect(result.ctxId).toMatch(/^thought_\d+_[a-z0-9]+$/);
+      expect(result.ctxId).toMatch(/^[0-9a-f]{24}$/);
     });
 
     it('should chain thoughts with relations', async () => {
@@ -633,7 +662,7 @@ describe('MCP Memory Server E2E Tests', () => {
         observations: ['Orphaned thought']
       }) as { ctxId: string };
 
-      expect(result.ctxId).toMatch(/^thought_\d+_[a-z0-9]+$/);
+      expect(result.ctxId).toMatch(/^[0-9a-f]{24}$/);
 
       // Verify no relations were created
       const neighbors = await callTool(client, 'get_neighbors', {
