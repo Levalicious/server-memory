@@ -7,6 +7,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { promises as fs } from 'fs';
+import { randomBytes } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import lockfile from 'proper-lockfile';
@@ -495,16 +496,49 @@ export class KnowledgeGraphManager {
     };
   }
 
-  async getOrphanedEntities(): Promise<Entity[]> {
+  async getOrphanedEntities(strict: boolean = false): Promise<Entity[]> {
     const graph = await this.loadGraph();
-    const connectedEntityNames = new Set<string>();
     
+    if (!strict) {
+      // Simple mode: entities with no relations at all
+      const connectedEntityNames = new Set<string>();
+      graph.relations.forEach(r => {
+        connectedEntityNames.add(r.from);
+        connectedEntityNames.add(r.to);
+      });
+      return graph.entities.filter(e => !connectedEntityNames.has(e.name));
+    }
+    
+    // Strict mode: entities not connected to "Self" (directly or indirectly)
+    // Build adjacency list (bidirectional)
+    const neighbors = new Map<string, Set<string>>();
+    graph.entities.forEach(e => neighbors.set(e.name, new Set()));
     graph.relations.forEach(r => {
-      connectedEntityNames.add(r.from);
-      connectedEntityNames.add(r.to);
+      neighbors.get(r.from)?.add(r.to);
+      neighbors.get(r.to)?.add(r.from);
     });
     
-    return graph.entities.filter(e => !connectedEntityNames.has(e.name));
+    // BFS from Self to find all connected entities
+    const connectedToSelf = new Set<string>();
+    const queue: string[] = ['Self'];
+    
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (connectedToSelf.has(current)) continue;
+      connectedToSelf.add(current);
+      
+      const currentNeighbors = neighbors.get(current);
+      if (currentNeighbors) {
+        for (const neighbor of currentNeighbors) {
+          if (!connectedToSelf.has(neighbor)) {
+            queue.push(neighbor);
+          }
+        }
+      }
+    }
+    
+    // Return entities not connected to Self (excluding Self itself if it exists)
+    return graph.entities.filter(e => !connectedToSelf.has(e.name));
   }
 
   async validateGraph(): Promise<{ missingEntities: string[]; observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] }> {
@@ -702,9 +736,9 @@ export class KnowledgeGraphManager {
         }
       }
       
-      // Generate new context ID
+      // Generate new context ID (24-char hex)
       const now = Date.now();
-      const ctxId = `thought_${now}_${Math.random().toString(36).substring(2, 8)}`;
+      const ctxId = randomBytes(12).toString('hex');
       
       // Create thought entity
       const thoughtEntity: Entity = {
@@ -1012,10 +1046,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_orphaned_entities",
-        description: "Get entities that have no relations (orphaned entities). Results are paginated (max 512 chars).",
+        description: "Get entities that have no relations (orphaned entities). In strict mode, returns entities not connected to 'Self' entity. Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
           properties: {
+            strict: { type: "boolean", description: "If true, returns entities not connected to 'Self' (directly or indirectly). Default: false" },
             cursor: { type: "number", description: "Cursor for pagination" },
           },
         },
@@ -1142,7 +1177,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "get_stats":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
     case "get_orphaned_entities": {
-      const entities = await knowledgeGraphManager.getOrphanedEntities();
+      const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false);
       return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
     }
     case "validate_graph":
