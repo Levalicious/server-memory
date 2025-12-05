@@ -48,7 +48,7 @@ export interface PaginatedResult<T> {
   totalCount: number;
 }
 
-export const MAX_CHARS = 512;
+export const MAX_CHARS = 2048;
 
 function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
   const result: T[] = [];
