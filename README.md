@@ -8,33 +8,37 @@ A basic implementation of persistent memory using a local knowledge graph. This 
 Entities are the primary nodes in the knowledge graph. Each entity has:
 - A unique name (identifier)
 - An entity type (e.g., "person", "organization", "event")
-- A list of observations
+- A list of observations (max 2, each max 140 characters)
+- Modification timestamps (`mtime` for any change, `obsMtime` for observation changes)
 
 Example:
 ```json
 {
   "name": "John_Smith",
   "entityType": "person",
-  "observations": ["Speaks fluent Spanish"]
+  "observations": ["Speaks fluent Spanish"],
+  "mtime": 1733423456789,
+  "obsMtime": 1733423456789
 }
 ```
 
 ### Relations
-Relations define directed connections between entities. They are always stored in active voice and describe how entities interact or relate to each other.
+Relations define directed connections between entities. They are always stored in active voice and describe how entities interact or relate to each other. Each relation has a modification timestamp (`mtime`).
 
 Example:
 ```json
 {
   "from": "John_Smith",
   "to": "Anthropic",
-  "relationType": "works_at"
+  "relationType": "works_at",
+  "mtime": 1733423456789
 }
 ```
 ### Observations
 Observations are discrete pieces of information about an entity. They are:
 
-- Stored as strings
-- Attached to specific entities
+- Stored as strings (max 140 characters each)
+- Attached to specific entities (max 2 per entity)
 - Can be added or removed independently
 - Should be atomic (one fact per observation)
 
@@ -44,8 +48,7 @@ Example:
   "entityName": "John_Smith",
   "observations": [
     "Speaks fluent Spanish",
-    "Graduated in 2019",
-    "Prefers morning meetings"
+    "Graduated in 2019"
   ]
 }
 ```
@@ -59,7 +62,7 @@ Example:
     - Each object contains:
       - `name` (string): Entity identifier
       - `entityType` (string): Type classification
-      - `observations` (string[]): Associated observations
+      - `observations` (string[]): Associated observations (max 2, each max 140 chars)
   - Ignores entities with existing names
 
 - **create_relations**
@@ -76,9 +79,9 @@ Example:
   - Input: `observations` (array of objects)
     - Each object contains:
       - `entityName` (string): Target entity
-      - `contents` (string[]): New observations to add
+      - `contents` (string[]): New observations to add (each max 140 chars)
   - Returns added observations per entity
-  - Fails if entity doesn't exist
+  - Fails if entity doesn't exist or would exceed 2 observations
 
 - **delete_entities**
   - Remove entities and their relations
@@ -103,42 +106,45 @@ Example:
       - `relationType` (string): Relationship type
   - Silent operation if relation doesn't exist
 
-- **read_graph**
-  - Read the entire knowledge graph
-  - No input required
-  - Returns complete graph structure with all entities and relations
-
 - **search_nodes**
-  - Search for nodes based on query
-  - Input: `query` (string)
+  - Search for nodes using a regex pattern
+  - Input: `query` (string), `entityCursor` (number, optional), `relationCursor` (number, optional)
   - Searches across:
     - Entity names
     - Entity types
     - Observation content
-  - Returns matching entities and their relations
+  - Returns matching entities and their relations (paginated)
+
+- **open_nodes_filtered**
+  - Retrieve specific nodes by name with filtered relations
+  - Input: `names` (string[]), `entityCursor` (number, optional), `relationCursor` (number, optional)
+  - Returns:
+    - Requested entities
+    - Only relations where both endpoints are in the requested set
+  - Silently skips non-existent nodes (paginated)
 
 - **open_nodes**
   - Retrieve specific nodes by name
-  - Input: `names` (string[])
+  - Input: `names` (string[]), `entityCursor` (number, optional), `relationCursor` (number, optional)
   - Returns:
     - Requested entities
-    - Relations between requested entities
-  - Silently skips non-existent nodes
+    - Relations originating from requested entities
+  - Silently skips non-existent nodes (paginated)
 
 - **get_neighbors**
   - Get neighboring entities connected to a specific entity within a given depth
-  - Input: `entityName` (string), `depth` (number, default: 1)
-  - Returns entities connected within specified depth
+  - Input: `entityName` (string), `depth` (number, default: 0), `withEntities` (boolean, default: false), `entityCursor` (number, optional), `relationCursor` (number, optional)
+  - Returns relations (and optionally entities) connected within specified depth (paginated)
 
 - **find_path**
   - Find a path between two entities in the knowledge graph
-  - Input: `fromEntity` (string), `toEntity` (string), `maxDepth` (number, default: 5)
-  - Returns path between entities if one exists
+  - Input: `fromEntity` (string), `toEntity` (string), `maxDepth` (number, default: 5), `cursor` (number, optional)
+  - Returns path between entities if one exists (paginated)
 
 - **get_entities_by_type**
   - Get all entities of a specific type
-  - Input: `entityType` (string)
-  - Returns all entities matching the specified type
+  - Input: `entityType` (string), `cursor` (number, optional)
+  - Returns all entities matching the specified type (paginated)
 
 - **get_entity_types**
   - Get all unique entity types in the knowledge graph
@@ -156,14 +162,15 @@ Example:
   - Returns entity count, relation count, entity types count, relation types count
 
 - **get_orphaned_entities**
-  - Get entities that have no relations
-  - No input required
-  - Returns entities with no connections
+  - Get entities that have no relations (orphaned entities)
+  - Input: `strict` (boolean, default: false), `cursor` (number, optional)
+  - In strict mode, returns entities not connected to 'Self' entity (directly or indirectly)
+  - Returns entities with no connections (paginated)
 
 - **validate_graph**
-  - Validate the knowledge graph and return missing entities referenced in relations
+  - Validate the knowledge graph
   - No input required
-  - Returns list of missing entities
+  - Returns missing entities referenced in relations and observation limit violations
 
 - **evaluate_bcl**
   - Evaluate a Binary Combinatory Logic (BCL) program
@@ -181,6 +188,12 @@ Example:
   - Clear the current BCL term being constructed and reset the constructor state
   - No input required
   - Resets BCL constructor
+
+- **sequentialthinking**
+  - Record a thought in the knowledge graph
+  - Input: `observations` (string[], max 2, each max 140 chars), `previousCtxId` (string, optional)
+  - Creates a Thought entity and links it to the previous thought if provided
+  - Returns the new thought's context ID for chaining
 
 # Usage with Claude Desktop
 
