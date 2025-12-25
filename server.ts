@@ -49,6 +49,65 @@ export interface PaginatedResult<T> {
   totalCount: number;
 }
 
+export type EntitySortField = "mtime" | "obsMtime" | "name";
+export type SortDirection = "asc" | "desc";
+
+export interface Neighbor {
+  name: string;
+  mtime?: number;
+  obsMtime?: number;
+}
+
+/**
+ * Sort entities by the specified field and direction.
+ * Returns a new array (does not mutate input).
+ * If sortBy is undefined, returns the original array (no sorting - preserves insertion order).
+ */
+function sortEntities(
+  entities: Entity[],
+  sortBy?: EntitySortField,
+  sortDir?: SortDirection
+): Entity[] {
+  if (!sortBy) return entities; // No sorting - preserve current behavior
+
+  const dir = sortDir ?? (sortBy === "name" ? "asc" : "desc");
+  const mult = dir === "asc" ? 1 : -1;
+
+  return [...entities].sort((a, b) => {
+    if (sortBy === "name") {
+      return mult * a.name.localeCompare(b.name);
+    }
+    // For timestamps, treat undefined as 0 (oldest)
+    const aVal = a[sortBy] ?? 0;
+    const bVal = b[sortBy] ?? 0;
+    return mult * (aVal - bVal);
+  });
+}
+
+/**
+ * Sort neighbors by the specified field and direction.
+ * If sortBy is undefined, returns the original array (no sorting).
+ */
+function sortNeighbors(
+  neighbors: Neighbor[],
+  sortBy?: EntitySortField,
+  sortDir?: SortDirection
+): Neighbor[] {
+  if (!sortBy) return neighbors;
+
+  const dir = sortDir ?? (sortBy === "name" ? "asc" : "desc");
+  const mult = dir === "asc" ? 1 : -1;
+
+  return [...neighbors].sort((a, b) => {
+    if (sortBy === "name") {
+      return mult * a.name.localeCompare(b.name);
+    }
+    const aVal = a[sortBy] ?? 0;
+    const bVal = b[sortBy] ?? 0;
+    return mult * (aVal - bVal);
+  });
+}
+
 export const MAX_CHARS = 2048;
 
 function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
@@ -325,7 +384,7 @@ export class KnowledgeGraphManager {
   }
 
   // Regex-based search function
-  async searchNodes(query: string): Promise<KnowledgeGraph> {
+  async searchNodes(query: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     
     let regex: RegExp;
@@ -351,7 +410,7 @@ export class KnowledgeGraphManager {
     );
   
     const filteredGraph: KnowledgeGraph = {
-      entities: filteredEntities,
+      entities: sortEntities(filteredEntities, sortBy, sortDir),
       relations: filteredRelations,
     };
   
@@ -400,31 +459,30 @@ export class KnowledgeGraphManager {
     return filteredGraph;
   }
 
-  async getNeighbors(entityName: string, depth: number = 1, withEntities: boolean = false): Promise<KnowledgeGraph> {
+  async getNeighbors(
+    entityName: string, 
+    depth: number = 1, 
+    sortBy?: EntitySortField, 
+    sortDir?: SortDirection
+  ): Promise<Neighbor[]> {
     const graph = await this.loadGraph();
     const visited = new Set<string>();
-    const resultEntities = new Map<string, Entity>();
-    const resultRelations = new Map<string, Relation>(); // Deduplicate relations
-    
-    const relationKey = (r: Relation) => `${r.from}|${r.relationType}|${r.to}`;
+    const neighborNames = new Set<string>();
     
     const traverse = (currentName: string, currentDepth: number) => {
       if (currentDepth > depth || visited.has(currentName)) return;
       visited.add(currentName);
-      
-      if (withEntities) {
-        const entity = graph.entities.find(e => e.name === currentName);
-        if (entity) {
-          resultEntities.set(currentName, entity);
-        }
-      }
       
       // Find all relations involving this entity
       const connectedRelations = graph.relations.filter(r => 
         r.from === currentName || r.to === currentName
       );
       
-      connectedRelations.forEach(r => resultRelations.set(relationKey(r), r));
+      // Collect neighbor names
+      connectedRelations.forEach(r => {
+        const neighborName = r.from === currentName ? r.to : r.from;
+        neighborNames.add(neighborName);
+      });
       
       if (currentDepth < depth) {
         // Traverse to connected entities
@@ -437,10 +495,21 @@ export class KnowledgeGraphManager {
     
     traverse(entityName, 0);
     
-    return {
-      entities: Array.from(resultEntities.values()),
-      relations: Array.from(resultRelations.values())
-    };
+    // Remove the starting entity from neighbors (it's not its own neighbor)
+    neighborNames.delete(entityName);
+    
+    // Build neighbor objects with timestamps
+    const entityMap = new Map(graph.entities.map(e => [e.name, e]));
+    const neighbors: Neighbor[] = Array.from(neighborNames).map(name => {
+      const entity = entityMap.get(name);
+      return {
+        name,
+        mtime: entity?.mtime,
+        obsMtime: entity?.obsMtime,
+      };
+    });
+    
+    return sortNeighbors(neighbors, sortBy, sortDir);
   }
 
   async findPath(fromEntity: string, toEntity: string, maxDepth: number = 5): Promise<Relation[]> {
@@ -466,9 +535,10 @@ export class KnowledgeGraphManager {
     return dfs(fromEntity, toEntity, [], 0) || [];
   }
 
-  async getEntitiesByType(entityType: string): Promise<Entity[]> {
+  async getEntitiesByType(entityType: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
     const graph = await this.loadGraph();
-    return graph.entities.filter(e => e.entityType === entityType);
+    const filtered = graph.entities.filter(e => e.entityType === entityType);
+    return sortEntities(filtered, sortBy, sortDir);
   }
 
   async getEntityTypes(): Promise<string[]> {
@@ -496,7 +566,7 @@ export class KnowledgeGraphManager {
     };
   }
 
-  async getOrphanedEntities(strict: boolean = false): Promise<Entity[]> {
+  async getOrphanedEntities(strict: boolean = false, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
     const graph = await this.loadGraph();
     
     if (!strict) {
@@ -506,7 +576,8 @@ export class KnowledgeGraphManager {
         connectedEntityNames.add(r.from);
         connectedEntityNames.add(r.to);
       });
-      return graph.entities.filter(e => !connectedEntityNames.has(e.name));
+      const orphans = graph.entities.filter(e => !connectedEntityNames.has(e.name));
+      return sortEntities(orphans, sortBy, sortDir);
     }
     
     // Strict mode: entities not connected to "Self" (directly or indirectly)
@@ -538,7 +609,8 @@ export class KnowledgeGraphManager {
     }
     
     // Return entities not connected to Self (excluding Self itself if it exists)
-    return graph.entities.filter(e => !connectedToSelf.has(e.name));
+    const orphans = graph.entities.filter(e => !connectedToSelf.has(e.name));
+    return sortEntities(orphans, sortBy, sortDir);
   }
 
   async validateGraph(): Promise<{ missingEntities: string[]; observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] }> {
@@ -939,6 +1011,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             query: { type: "string", description: "Regex pattern to match against entity names, types, and observations." },
+            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for entities. Omit for insertion order." },
+            sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             entityCursor: { type: "number", description: "Cursor for entity pagination (from previous response's nextCursor)" },
             relationCursor: { type: "number", description: "Cursor for relation pagination" },
           },
@@ -981,15 +1055,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_neighbors",
-        description: "Get neighboring entities connected to a specific entity within a given depth. Results are paginated (max 512 chars).",
+        description: "Get names of neighboring entities connected to a specific entity within a given depth. Returns neighbor names with timestamps for sorting. Use open_nodes to get full entity data. Results are paginated (max 512 chars).",
         inputSchema: {
           type: "object",
           properties: {
             entityName: { type: "string", description: "The name of the entity to find neighbors for" },
-            depth: { type: "number", description: "Maximum depth to traverse (default: 0)", default: 0 },
-            withEntities: { type: "boolean", description: "If true, include full entity data. Default returns only relations for lightweight structure exploration.", default: false },
-            entityCursor: { type: "number", description: "Cursor for entity pagination" },
-            relationCursor: { type: "number", description: "Cursor for relation pagination" },
+            depth: { type: "number", description: "Maximum depth to traverse (default: 1)", default: 1 },
+            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for neighbors. Omit for arbitrary order." },
+            sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
+            cursor: { type: "number", description: "Cursor for pagination" },
           },
           required: ["entityName"],
         },
@@ -1015,6 +1089,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             entityType: { type: "string", description: "The type of entities to retrieve" },
+            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for entities. Omit for insertion order." },
+            sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             cursor: { type: "number", description: "Cursor for pagination" },
           },
           required: ["entityType"],
@@ -1051,6 +1127,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             strict: { type: "boolean", description: "If true, returns entities not connected to 'Self' (directly or indirectly). Default: false" },
+            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for entities. Omit for insertion order." },
+            sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             cursor: { type: "number", description: "Cursor for pagination" },
           },
         },
@@ -1147,7 +1225,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
     case "search_nodes": {
-      const graph = await knowledgeGraphManager.searchNodes(args.query as string);
+      const graph = await knowledgeGraphManager.searchNodes(args.query as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
       return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
     }
     case "open_nodes_filtered": {
@@ -1159,15 +1237,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
     }
     case "get_neighbors": {
-      const graph = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number, args.withEntities as boolean);
-      return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+      const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 1, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
+      return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
     }
     case "find_path": {
       const path = await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number);
       return { content: [{ type: "text", text: JSON.stringify(paginateItems(path, args.cursor as number ?? 0)) }] };
     }
     case "get_entities_by_type": {
-      const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string);
+      const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
       return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
     }
     case "get_entity_types":
@@ -1177,7 +1255,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "get_stats":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
     case "get_orphaned_entities": {
-      const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false);
+      const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
       return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
     }
     case "validate_graph":

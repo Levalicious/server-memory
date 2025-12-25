@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
-import { createServer, Entity, Relation, KnowledgeGraph } from '../server.js';
+import { createServer, Entity, Relation, KnowledgeGraph, Neighbor } from '../server.js';
 import { createTestClient, callTool, PaginatedGraph, PaginatedResult } from './test-utils.js';
 
 describe('MCP Memory Server E2E Tests', () => {
@@ -343,75 +343,49 @@ describe('MCP Memory Server E2E Tests', () => {
       });
     });
 
-    it('should get neighbors at depth 0 (relations only by default)', async () => {
+    it('should get immediate neighbors at depth 0', async () => {
       const result = await callTool(client, 'get_neighbors', {
         entityName: 'Root',
         depth: 0
-      }) as PaginatedGraph;
+      }) as PaginatedResult<Neighbor>;
 
-      expect(result.entities.items).toHaveLength(0); // withEntities defaults to false
-      expect(result.relations.items).toHaveLength(2); // Root's direct relations
+      // depth 0 returns immediate neighbors only
+      expect(result.items).toHaveLength(2);
+      const names = result.items.map(n => n.name);
+      expect(names).toContain('Child1');
+      expect(names).toContain('Child2');
     });
 
-    it('should get neighbors with entities when requested', async () => {
-      // Accumulate all entities across pagination
-      const allEntities: Entity[] = [];
-      let entityCursor: number | null = 0;
+    it('should get neighbors at depth 1 (includes neighbors of neighbors)', async () => {
+      const result = await callTool(client, 'get_neighbors', {
+        entityName: 'Root',
+        depth: 1
+      }) as PaginatedResult<Neighbor>;
 
-      while (entityCursor !== null) {
-        const result = await callTool(client, 'get_neighbors', {
-          entityName: 'Root',
-          depth: 1,
-          withEntities: true,
-          entityCursor
-        }) as PaginatedGraph;
-
-        allEntities.push(...result.entities.items);
-        entityCursor = result.entities.nextCursor;
-      }
-
-      expect(allEntities).toHaveLength(3);
-      expect(allEntities.map(e => e.name)).toContain('Root');
-      expect(allEntities.map(e => e.name)).toContain('Child1');
-      expect(allEntities.map(e => e.name)).toContain('Child2');
+      // depth 1: Child1, Child2 (immediate) + Grandchild (neighbor of Child1)
+      expect(result.items).toHaveLength(3);
+      const names = result.items.map(n => n.name);
+      expect(names).toContain('Child1');
+      expect(names).toContain('Child2');
+      expect(names).toContain('Grandchild');
     });
 
     it('should traverse to specified depth', async () => {
-      // Collect all entities and relations using pagination
-      const allEntities: Entity[] = [];
-      const allRelations: Relation[] = [];
-      let entityCursor: number | null = 0;
-      let relationCursor: number | null = 0;
+      const result = await callTool(client, 'get_neighbors', {
+        entityName: 'Root',
+        depth: 2
+      }) as PaginatedResult<Neighbor>;
 
-      // Paginate through all results
-      while (entityCursor !== null || relationCursor !== null) {
-        const result = await callTool(client, 'get_neighbors', {
-          entityName: 'Root',
-          depth: 2,
-          withEntities: true,
-          // Pass large cursor to skip when done, 0 to fetch
-          entityCursor: entityCursor !== null ? entityCursor : 999999,
-          relationCursor: relationCursor !== null ? relationCursor : 999999
-        }) as PaginatedGraph;
-
-        // Collect entities if we still need them
-        if (entityCursor !== null) {
-          allEntities.push(...result.entities.items);
-          entityCursor = result.entities.nextCursor;
-        }
-
-        // Collect relations if we still need them
-        if (relationCursor !== null) {
-          allRelations.push(...result.relations.items);
-          relationCursor = result.relations.nextCursor;
-        }
-      }
-
-      expect(allEntities).toHaveLength(4); // All nodes
-      expect(allRelations).toHaveLength(3); // All relations
+      // At depth 2 from Root: same as depth 1 since graph is small
+      // Child1, Child2, Grandchild (Root is excluded as starting point)
+      expect(result.items).toHaveLength(3);
+      const names = result.items.map(n => n.name);
+      expect(names).toContain('Child1');
+      expect(names).toContain('Child2');
+      expect(names).toContain('Grandchild');
     });
 
-    it('should deduplicate relations in traversal', async () => {
+    it('should deduplicate neighbors in traversal', async () => {
       // Add a bidirectional relation
       await callTool(client, 'create_relations', {
         relations: [{ from: 'Child2', to: 'Root', relationType: 'child_of' }]
@@ -420,12 +394,12 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'get_neighbors', {
         entityName: 'Root',
         depth: 1
-      }) as PaginatedGraph;
+      }) as PaginatedResult<Neighbor>;
 
-      // Each unique relation should appear only once
-      const relationKeys = result.relations.items.map(r => `${r.from}|${r.relationType}|${r.to}`);
-      const uniqueKeys = [...new Set(relationKeys)];
-      expect(relationKeys.length).toBe(uniqueKeys.length);
+      // Each neighbor should appear only once
+      const names = result.items.map(n => n.name);
+      const uniqueNames = [...new Set(names)];
+      expect(names.length).toBe(uniqueNames.length);
     });
 
     it('should find path between entities', async () => {
@@ -644,16 +618,14 @@ describe('MCP Memory Server E2E Tests', () => {
         observations: ['Following up']
       }) as { ctxId: string };
 
-      // Verify the chain via relations
+      // Verify the chain via neighbors
       const neighbors = await callTool(client, 'get_neighbors', {
         entityName: first.ctxId,
         depth: 1
-      }) as PaginatedGraph;
+      }) as PaginatedResult<Neighbor>;
 
-      // Should have 'follows' relation from first to second
-      expect(neighbors.relations.items.some(r => 
-        r.from === first.ctxId && r.to === second.ctxId && r.relationType === 'follows'
-      )).toBe(true);
+      // Second thought should be a neighbor of first
+      expect(neighbors.items.some(n => n.name === second.ctxId)).toBe(true);
     });
 
     it('should ignore invalid previousCtxId gracefully', async () => {
@@ -664,13 +636,13 @@ describe('MCP Memory Server E2E Tests', () => {
 
       expect(result.ctxId).toMatch(/^[0-9a-f]{24}$/);
 
-      // Verify no relations were created
+      // Verify no neighbors (no valid relations were created)
       const neighbors = await callTool(client, 'get_neighbors', {
         entityName: result.ctxId,
         depth: 1
-      }) as PaginatedGraph;
+      }) as PaginatedResult<Neighbor>;
 
-      expect(neighbors.relations.totalCount).toBe(0);
+      expect(neighbors.items).toHaveLength(0);
     });
 
     it('should enforce observation limits on thoughts', async () => {
@@ -693,6 +665,381 @@ describe('MCP Memory Server E2E Tests', () => {
       const thought = graph.entities.items[0];
       expect(thought.mtime).toBeDefined();
       expect(thought.obsMtime).toBeDefined();
+    });
+  });
+
+  describe('Sorting', () => {
+    // Helper to create entities with controlled timestamps
+    async function createEntitiesWithDelay(entities: Array<{ name: string; entityType: string; observations: string[] }>) {
+      for (const entity of entities) {
+        await callTool(client, 'create_entities', { entities: [entity] });
+        // Small delay to ensure distinct mtime values
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+
+    describe('search_nodes sorting', () => {
+      beforeEach(async () => {
+        // Create entities with distinct timestamps
+        await createEntitiesWithDelay([
+          { name: 'Alpha', entityType: 'Letter', observations: ['First letter'] },
+          { name: 'Beta', entityType: 'Letter', observations: ['Second letter'] },
+          { name: 'Gamma', entityType: 'Letter', observations: ['Third letter'] }
+        ]);
+      });
+
+      it('should preserve insertion order when sortBy is omitted', async () => {
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Letter'
+        }) as PaginatedGraph;
+
+        const names = result.entities.items.map(e => e.name);
+        expect(names).toEqual(['Alpha', 'Beta', 'Gamma']);
+      });
+
+      it('should sort by name ascending', async () => {
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Letter',
+          sortBy: 'name',
+          sortDir: 'asc'
+        }) as PaginatedGraph;
+
+        const names = result.entities.items.map(e => e.name);
+        expect(names).toEqual(['Alpha', 'Beta', 'Gamma']);
+      });
+
+      it('should sort by name descending', async () => {
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Letter',
+          sortBy: 'name',
+          sortDir: 'desc'
+        }) as PaginatedGraph;
+
+        const names = result.entities.items.map(e => e.name);
+        expect(names).toEqual(['Gamma', 'Beta', 'Alpha']);
+      });
+
+      it('should sort by mtime descending by default', async () => {
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Letter',
+          sortBy: 'mtime'
+        }) as PaginatedGraph;
+
+        const names = result.entities.items.map(e => e.name);
+        // Gamma was created last, so should be first when sorted desc
+        expect(names).toEqual(['Gamma', 'Beta', 'Alpha']);
+      });
+
+      it('should sort by mtime ascending when specified', async () => {
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Letter',
+          sortBy: 'mtime',
+          sortDir: 'asc'
+        }) as PaginatedGraph;
+
+        const names = result.entities.items.map(e => e.name);
+        // Alpha was created first, so should be first when sorted asc
+        expect(names).toEqual(['Alpha', 'Beta', 'Gamma']);
+      });
+
+      it('should sort by obsMtime', async () => {
+        // Update observation on Alpha to make it have most recent obsMtime
+        await callTool(client, 'delete_observations', {
+          deletions: [{ entityName: 'Alpha', observations: ['First letter'] }]
+        });
+        await callTool(client, 'add_observations', {
+          observations: [{ entityName: 'Alpha', contents: ['Updated'] }]
+        });
+
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Letter|Updated',
+          sortBy: 'obsMtime'
+        }) as PaginatedGraph;
+
+        const names = result.entities.items.map(e => e.name);
+        // Alpha should be first because its obsMtime was just updated
+        expect(names[0]).toBe('Alpha');
+      });
+    });
+
+    describe('get_entities_by_type sorting', () => {
+      beforeEach(async () => {
+        await createEntitiesWithDelay([
+          { name: 'Zebra', entityType: 'Animal', observations: ['Striped'] },
+          { name: 'Aardvark', entityType: 'Animal', observations: ['Nocturnal'] },
+          { name: 'Monkey', entityType: 'Animal', observations: ['Clever'] }
+        ]);
+      });
+
+      it('should preserve insertion order when sortBy is omitted', async () => {
+        const result = await callTool(client, 'get_entities_by_type', {
+          entityType: 'Animal'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        expect(names).toEqual(['Zebra', 'Aardvark', 'Monkey']);
+      });
+
+      it('should sort by name ascending (default for name)', async () => {
+        const result = await callTool(client, 'get_entities_by_type', {
+          entityType: 'Animal',
+          sortBy: 'name'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        expect(names).toEqual(['Aardvark', 'Monkey', 'Zebra']);
+      });
+
+      it('should sort by name descending', async () => {
+        const result = await callTool(client, 'get_entities_by_type', {
+          entityType: 'Animal',
+          sortBy: 'name',
+          sortDir: 'desc'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        expect(names).toEqual(['Zebra', 'Monkey', 'Aardvark']);
+      });
+
+      it('should sort by mtime descending (default for mtime)', async () => {
+        const result = await callTool(client, 'get_entities_by_type', {
+          entityType: 'Animal',
+          sortBy: 'mtime'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        // Monkey was created last
+        expect(names).toEqual(['Monkey', 'Aardvark', 'Zebra']);
+      });
+
+      it('should sort by mtime ascending', async () => {
+        const result = await callTool(client, 'get_entities_by_type', {
+          entityType: 'Animal',
+          sortBy: 'mtime',
+          sortDir: 'asc'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        // Zebra was created first
+        expect(names).toEqual(['Zebra', 'Aardvark', 'Monkey']);
+      });
+    });
+
+    describe('get_orphaned_entities sorting', () => {
+      beforeEach(async () => {
+        // Create orphaned entities (no relations)
+        await createEntitiesWithDelay([
+          { name: 'Orphan_Z', entityType: 'Orphan', observations: ['Alone'] },
+          { name: 'Orphan_A', entityType: 'Orphan', observations: ['Solo'] },
+          { name: 'Orphan_M', entityType: 'Orphan', observations: ['Isolated'] }
+        ]);
+      });
+
+      it('should preserve insertion order when sortBy is omitted', async () => {
+        const result = await callTool(client, 'get_orphaned_entities', {}) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        expect(names).toEqual(['Orphan_Z', 'Orphan_A', 'Orphan_M']);
+      });
+
+      it('should sort by name ascending', async () => {
+        const result = await callTool(client, 'get_orphaned_entities', {
+          sortBy: 'name'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        expect(names).toEqual(['Orphan_A', 'Orphan_M', 'Orphan_Z']);
+      });
+
+      it('should sort by name descending', async () => {
+        const result = await callTool(client, 'get_orphaned_entities', {
+          sortBy: 'name',
+          sortDir: 'desc'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        expect(names).toEqual(['Orphan_Z', 'Orphan_M', 'Orphan_A']);
+      });
+
+      it('should sort by mtime descending (default)', async () => {
+        const result = await callTool(client, 'get_orphaned_entities', {
+          sortBy: 'mtime'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        // Orphan_M was created last
+        expect(names).toEqual(['Orphan_M', 'Orphan_A', 'Orphan_Z']);
+      });
+
+      it('should work with strict mode and sorting', async () => {
+        // Create Self and connect one orphan to it
+        await callTool(client, 'create_entities', {
+          entities: [{ name: 'Self', entityType: 'Agent', observations: [] }]
+        });
+        await callTool(client, 'create_relations', {
+          relations: [{ from: 'Self', to: 'Orphan_A', relationType: 'knows' }]
+        });
+
+        const result = await callTool(client, 'get_orphaned_entities', {
+          strict: true,
+          sortBy: 'name'
+        }) as PaginatedResult<Entity>;
+
+        const names = result.items.map(e => e.name);
+        // Orphan_A is now connected to Self, so only M and Z are orphaned
+        expect(names).toEqual(['Orphan_M', 'Orphan_Z']);
+      });
+    });
+
+    describe('get_neighbors sorting', () => {
+      beforeEach(async () => {
+        // Create a hub with neighbors created at different times
+        await callTool(client, 'create_entities', {
+          entities: [{ name: 'Hub', entityType: 'Center', observations: [] }]
+        });
+        
+        await createEntitiesWithDelay([
+          { name: 'Neighbor_Z', entityType: 'Node', observations: ['First'] },
+          { name: 'Neighbor_A', entityType: 'Node', observations: ['Second'] },
+          { name: 'Neighbor_M', entityType: 'Node', observations: ['Third'] }
+        ]);
+
+        // Connect all to Hub
+        await callTool(client, 'create_relations', {
+          relations: [
+            { from: 'Hub', to: 'Neighbor_Z', relationType: 'connects' },
+            { from: 'Hub', to: 'Neighbor_A', relationType: 'connects' },
+            { from: 'Hub', to: 'Neighbor_M', relationType: 'connects' }
+          ]
+        });
+      });
+
+      it('should return unsorted neighbors when sortBy is omitted', async () => {
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Hub'
+        }) as PaginatedResult<Neighbor>;
+
+        expect(result.items).toHaveLength(3);
+        // Just verify all neighbors are present
+        const names = result.items.map(n => n.name);
+        expect(names).toContain('Neighbor_Z');
+        expect(names).toContain('Neighbor_A');
+        expect(names).toContain('Neighbor_M');
+      });
+
+      it('should sort neighbors by name ascending', async () => {
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Hub',
+          sortBy: 'name'
+        }) as PaginatedResult<Neighbor>;
+
+        const names = result.items.map(n => n.name);
+        expect(names).toEqual(['Neighbor_A', 'Neighbor_M', 'Neighbor_Z']);
+      });
+
+      it('should sort neighbors by name descending', async () => {
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Hub',
+          sortBy: 'name',
+          sortDir: 'desc'
+        }) as PaginatedResult<Neighbor>;
+
+        const names = result.items.map(n => n.name);
+        expect(names).toEqual(['Neighbor_Z', 'Neighbor_M', 'Neighbor_A']);
+      });
+
+      it('should sort neighbors by mtime descending (default)', async () => {
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Hub',
+          sortBy: 'mtime'
+        }) as PaginatedResult<Neighbor>;
+
+        const names = result.items.map(n => n.name);
+        // Neighbor_M was created last
+        expect(names).toEqual(['Neighbor_M', 'Neighbor_A', 'Neighbor_Z']);
+      });
+
+      it('should sort neighbors by mtime ascending', async () => {
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Hub',
+          sortBy: 'mtime',
+          sortDir: 'asc'
+        }) as PaginatedResult<Neighbor>;
+
+        const names = result.items.map(n => n.name);
+        // Neighbor_Z was created first
+        expect(names).toEqual(['Neighbor_Z', 'Neighbor_A', 'Neighbor_M']);
+      });
+
+      it('should include mtime and obsMtime in neighbor objects', async () => {
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Hub',
+          sortBy: 'name'
+        }) as PaginatedResult<Neighbor>;
+
+        // Each neighbor should have timestamp fields
+        for (const neighbor of result.items) {
+          expect(neighbor.mtime).toBeDefined();
+          expect(neighbor.obsMtime).toBeDefined();
+          expect(typeof neighbor.mtime).toBe('number');
+          expect(typeof neighbor.obsMtime).toBe('number');
+        }
+      });
+
+      it('should sort by obsMtime after observation update', async () => {
+        // Update observation on Neighbor_Z to make it have most recent obsMtime
+        await callTool(client, 'delete_observations', {
+          deletions: [{ entityName: 'Neighbor_Z', observations: ['First'] }]
+        });
+        await callTool(client, 'add_observations', {
+          observations: [{ entityName: 'Neighbor_Z', contents: ['Updated recently'] }]
+        });
+
+        const result = await callTool(client, 'get_neighbors', {
+          entityName: 'Hub',
+          sortBy: 'obsMtime'
+        }) as PaginatedResult<Neighbor>;
+
+        const names = result.items.map(n => n.name);
+        // Neighbor_Z should be first because its obsMtime was just updated
+        expect(names[0]).toBe('Neighbor_Z');
+      });
+    });
+
+    describe('sorting with pagination', () => {
+      it('should maintain sort order across paginated results', async () => {
+        // Create many entities to force pagination
+        const entities = [];
+        for (let i = 0; i < 20; i++) {
+          entities.push({
+            name: `Entity_${String(i).padStart(2, '0')}`,
+            entityType: 'Numbered',
+            observations: [`Number ${i}`]
+          });
+        }
+        await callTool(client, 'create_entities', { entities });
+
+        // Fetch all pages sorted by name descending
+        const allEntities: Entity[] = [];
+        let entityCursor: number | null = 0;
+
+        while (entityCursor !== null) {
+          const result = await callTool(client, 'search_nodes', {
+            query: 'Numbered',
+            sortBy: 'name',
+            sortDir: 'desc',
+            entityCursor
+          }) as PaginatedGraph;
+
+          allEntities.push(...result.entities.items);
+          entityCursor = result.entities.nextCursor;
+        }
+
+        // Verify all entities are in descending order
+        const names = allEntities.map(e => e.name);
+        const sortedNames = [...names].sort().reverse();
+        expect(names).toEqual(sortedNames);
+      });
     });
   });
 });
