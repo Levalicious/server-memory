@@ -108,11 +108,12 @@ Example:
 
 - **search_nodes**
   - Search for nodes using a regex pattern
-  - Input: `query` (string), `entityCursor` (number, optional), `relationCursor` (number, optional)
-  - Searches across:
-    - Entity names
-    - Entity types
-    - Observation content
+  - Input: 
+    - `query` (string): Regex pattern to search
+    - `sortBy` (string, optional): Sort field ("mtime", "obsMtime", or "name")
+    - `sortDir` (string, optional): Sort direction ("asc" or "desc")
+    - `entityCursor` (number, optional), `relationCursor` (number, optional)
+  - Searches across entity names, types, and observation content
   - Returns matching entities and their relations (paginated)
 
 - **open_nodes_filtered**
@@ -132,9 +133,15 @@ Example:
   - Silently skips non-existent nodes (paginated)
 
 - **get_neighbors**
-  - Get neighboring entities connected to a specific entity within a given depth
-  - Input: `entityName` (string), `depth` (number, default: 0), `withEntities` (boolean, default: false), `entityCursor` (number, optional), `relationCursor` (number, optional)
-  - Returns relations (and optionally entities) connected within specified depth (paginated)
+  - Get names of neighboring entities connected to a specific entity within a given depth
+  - Input: 
+    - `entityName` (string): The entity to find neighbors for
+    - `depth` (number, default: 1): Maximum traversal depth
+    - `sortBy` (string, optional): Sort field ("mtime", "obsMtime", or "name")
+    - `sortDir` (string, optional): Sort direction ("asc" or "desc")
+    - `cursor` (number, optional): Pagination cursor
+  - Returns neighbor names with timestamps (paginated)
+  - Use `open_nodes` to get full entity data for neighbors
 
 - **find_path**
   - Find a path between two entities in the knowledge graph
@@ -143,7 +150,11 @@ Example:
 
 - **get_entities_by_type**
   - Get all entities of a specific type
-  - Input: `entityType` (string), `cursor` (number, optional)
+  - Input: 
+    - `entityType` (string): Type to filter by
+    - `sortBy` (string, optional): Sort field ("mtime", "obsMtime", or "name")
+    - `sortDir` (string, optional): Sort direction ("asc" or "desc")
+    - `cursor` (number, optional)
   - Returns all entities matching the specified type (paginated)
 
 - **get_entity_types**
@@ -163,8 +174,11 @@ Example:
 
 - **get_orphaned_entities**
   - Get entities that have no relations (orphaned entities)
-  - Input: `strict` (boolean, default: false), `cursor` (number, optional)
-  - In strict mode, returns entities not connected to 'Self' entity (directly or indirectly)
+  - Input: 
+    - `strict` (boolean, default: false): If true, returns entities not connected to 'Self' entity
+    - `sortBy` (string, optional): Sort field ("mtime", "obsMtime", or "name")
+    - `sortDir` (string, optional): Sort direction ("asc" or "desc")
+    - `cursor` (number, optional)
   - Returns entities with no connections (paginated)
 
 - **validate_graph**
@@ -172,22 +186,22 @@ Example:
   - No input required
   - Returns missing entities referenced in relations and observation limit violations
 
-- **evaluate_bcl**
-  - Evaluate a Binary Combinatory Logic (BCL) program
-  - Input: `program` (string), `maxSteps` (number, default: 1000000)
-  - BCL syntax: T:=00|01|1TT where 00=K, 01=S, 1=application
-  - Returns evaluation result with halt status
+- **decode_timestamp**
+  - Decode a millisecond timestamp to human-readable UTC format
+  - Input:
+    - `timestamp` (number, optional): Millisecond timestamp to decode. If omitted, returns current time
+    - `relative` (boolean, optional): If true, include relative time (e.g., "3 days ago")
+  - Returns timestamp, ISO 8601 string, formatted UTC string, and optional relative time
+  - Useful for interpreting `mtime`/`obsMtime` values from entities
 
-- **add_bcl_term**
-  - Add a BCL term to the constructor, maintaining valid syntax
-  - Input: `term` (string)
-  - Valid values: '1' or 'App' (application), '00' or 'K' (K combinator), '01' or 'S' (S combinator)
-  - Returns completion status
-
-- **clear_bcl_term**
-  - Clear the current BCL term being constructed and reset the constructor state
-  - No input required
-  - Resets BCL constructor
+- **random_walk**
+  - Perform a random walk from a starting entity, following random relations
+  - Input:
+    - `start` (string): Name of the entity to start the walk from
+    - `depth` (number, default: 3): Number of hops to take
+    - `seed` (string, optional): Seed for reproducible walks
+  - Returns the terminal entity name and the path taken
+  - Useful for serendipitous exploration of the knowledge graph
 
 - **sequentialthinking**
   - Record a thought in the knowledge graph
