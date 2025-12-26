@@ -1,0 +1,6 @@
+# Sync version from package.json to server.ts
+VERSION=$(node -p "require('./package.json').version")
+sed -i "s/version: \"[^\"]*\"/version: \"$VERSION\"/" server.ts
+git add server.ts
+
+npm test
