@@ -205,8 +205,6 @@ function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relation
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 export class KnowledgeGraphManager {
-  bclCtr: number = 0;
-  bclTerm: string = "";
   private memoryFilePath: string;
 
   constructor(memoryFilePath: string = DEFAULT_MEMORY_FILE_PATH) {
@@ -653,145 +651,104 @@ export class KnowledgeGraphManager {
     };
   }
 
-  // BCL (Binary Combinatory Logic) evaluator
-  async evaluateBCL(program: string, maxSteps: number): Promise<{ result: string; info: string; halted: boolean, errored: boolean }> {
-    let stepCount = 0;
-    let max_size = program.length;
-
-    let mode: number = 0;
-    let ctr: number = 1;
-    let t0: string = program;
-    let t1: string = '';
-    let t2: string = '';
-    let t3: string = '';
-    let t4: string = '';
-
-    while (stepCount < maxSteps) {
-      if (t0.length == 0) break;
-      let b = t0[0]; t0 = t0.slice(1);
-      if (mode === 0) {
-        t1 += b;
-        let size = t1.length + t0.length;
-        if (size > max_size) max_size = size;
-        if (t1.slice(-4) === '1100') {
-          mode = 1;
-          t1 = t1.slice(0, -4);
-        } else if (t1.slice(-5) === '11101') {
-          mode = 3;
-          t1 = t1.slice(0, -5);
-        }
-      } else if (mode === 1) {
-        t2 += b;
-        if (b == '1') {
-          ctr += 1;
-        } else if (b == '0') {
-          ctr -= 1;
-          t2 += t0[0]; t0 = t0.slice(1);
-        }
-        if (ctr === 0) {
-          mode = 2;
-          ctr = 1;
-        }
-      } else if (mode === 2) {
-        if (b == '1') {
-          ctr += 1;
-        } else if (b == '0') {
-          ctr -= 1;
-          t0 = t0.slice(1);
-        }
-        if (ctr === 0) {
-          t0 = t2 + t0;
-          t2 = '';
-          mode = 0;
-          ctr = 1;
-          stepCount += 1;
-        }
-      } else if (mode === 3) {
-        t2 += b;
-        if (b == '1') {
-          ctr += 1;
-        } else if (b == '0') {
-          ctr -= 1;
-          t2 += t0[0]; t0 = t0.slice(1);
-        }
-        if (ctr === 0) {
-          mode = 4;
-          ctr = 1;
-        }
-      } else if (mode === 4) {
-        t3 += b;
-        if (b == '1') {
-          ctr += 1;
-        } else if (b == '0') {
-          ctr -= 1;
-          t3 += t0[0]; t0 = t0.slice(1);
-        }
-        if (ctr === 0) {
-          mode = 5;
-          ctr = 1;
-        }
-      } else if (mode === 5) {
-        t4 += b;
-        if (b == '1') {
-          ctr += 1;
-        } else if (b == '0') {
-          ctr -= 1;
-          t4 += t0[0]; t0 = t0.slice(1);
-        }
-        if (ctr === 0) {
-          t0 = '11' + t2 + t4 + '1' + t3 + t4 + t0;
-          t2 = '';
-          t3 = '';
-          t4 = '';
-          mode = 0;
-          ctr = 1;
-          stepCount += 1;
-        }
-      }
+  async randomWalk(start: string, depth: number = 3, seed?: string): Promise<{ entity: string; path: string[] }> {
+    const graph = await this.loadGraph();
+    
+    // Verify start entity exists
+    const startEntity = graph.entities.find(e => e.name === start);
+    if (!startEntity) {
+      throw new Error(`Start entity not found: ${start}`);
     }
     
-    const halted = stepCount < maxSteps;
-    return {
-      result: t1,
-      info: `${stepCount} steps, max size ${max_size}`,
-      halted,
-      errored: halted && mode != 0,
+    // Create seeded RNG if seed provided, otherwise use crypto.randomBytes
+    let rngState = seed ? this.hashSeed(seed) : null;
+    const random = (): number => {
+      if (rngState !== null) {
+        // Simple seeded PRNG (xorshift32)
+        rngState ^= rngState << 13;
+        rngState ^= rngState >>> 17;
+        rngState ^= rngState << 5;
+        return (rngState >>> 0) / 0xFFFFFFFF;
+      } else {
+        return randomBytes(4).readUInt32BE() / 0xFFFFFFFF;
+      }
     };
+    
+    const path: string[] = [start];
+    let current = start;
+    
+    for (let i = 0; i < depth; i++) {
+      // Get unique neighbors (both directions)
+      const neighbors = new Set<string>();
+      for (const rel of graph.relations) {
+        if (rel.from === current && rel.to !== current) neighbors.add(rel.to);
+        if (rel.to === current && rel.from !== current) neighbors.add(rel.from);
+      }
+      
+      // Filter to only existing entities
+      const validNeighbors = Array.from(neighbors).filter(n => 
+        graph.entities.some(e => e.name === n)
+      );
+      
+      if (validNeighbors.length === 0) break; // Dead end
+      
+      // Pick random neighbor (uniform over entities)
+      const idx = Math.floor(random() * validNeighbors.length);
+      current = validNeighbors[idx];
+      path.push(current);
+    }
+    
+    return { entity: current, path };
   }
-
-  async addBCLTerm(term: string): Promise<string> {
-    const termset = ["1", "00", "01"];
-    if (!term || term.trim() === "") {
-      throw new Error("BCL term cannot be empty");
+  
+  private hashSeed(seed: string): number {
+    // Simple string hash to 32-bit integer
+    let hash = 0;
+    for (let i = 0; i < seed.length; i++) {
+      const char = seed.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32-bit integer
     }
-    // Term can be 1, 00, 01, or K, S, App (application)
-    const validTerms = ["1", "App", "00", "K", "01", "S"];
-    if (!validTerms.includes(term)) {
-      throw new Error(`Invalid BCL term: ${term}\nExpected one of: ${validTerms.join(", ")}`);
-    }
-    let processedTerm = 0;
-    if (term === "00" || term === "K") processedTerm = 1;
-    else if (term === "01" || term === "S") processedTerm = 2;
-    this.bclTerm += termset[processedTerm];
-    if (processedTerm === 0) {
-      if (this.bclCtr === 0) this.bclCtr += 1;
-      this.bclCtr += 1;
-    } else {
-      this.bclCtr -= 1;
-    }
-    if (this.bclCtr <= 0) {
-      const constructedProgram = this.bclTerm;
-      this.bclCtr = 0;
-      this.bclTerm = "";
-      return `Constructed Program: ${constructedProgram}`;
-    } else {
-      return `Need ${this.bclCtr} more term(s) to complete the program.`;
-    }
+    return hash || 1; // Ensure non-zero for xorshift
   }
-
-  async clearBCLTerm(): Promise<void> {
-    this.bclCtr = 0;
-    this.bclTerm = "";
+  
+  decodeTimestamp(timestamp?: number, relative: boolean = false): { timestamp: number; iso8601: string; formatted: string; relative?: string } {
+    const ts = timestamp ?? Date.now();
+    const date = new Date(ts);
+    
+    const result: { timestamp: number; iso8601: string; formatted: string; relative?: string } = {
+      timestamp: ts,
+      iso8601: date.toISOString(),
+      formatted: date.toUTCString(),
+    };
+    
+    if (relative) {
+      const now = Date.now();
+      const diffMs = now - ts;
+      const diffSec = Math.abs(diffMs) / 1000;
+      const diffMin = diffSec / 60;
+      const diffHour = diffMin / 60;
+      const diffDay = diffHour / 24;
+      
+      let relStr: string;
+      if (diffSec < 60) {
+        relStr = `${Math.floor(diffSec)} seconds`;
+      } else if (diffMin < 60) {
+        relStr = `${Math.floor(diffMin)} minutes`;
+      } else if (diffHour < 24) {
+        relStr = `${Math.floor(diffHour)} hours`;
+      } else if (diffDay < 30) {
+        relStr = `${Math.floor(diffDay)} days`;
+      } else if (diffDay < 365) {
+        relStr = `${Math.floor(diffDay / 30)} months`;
+      } else {
+        relStr = `${Math.floor(diffDay / 365)} years`;
+      }
+      
+      result.relative = diffMs >= 0 ? `${relStr} ago` : `in ${relStr}`;
+    }
+    
+    return result;
   }
 
   async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string }> {
@@ -1142,37 +1099,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "evaluate_bcl",
-        description: "Evaluate a Binary Combinatory Logic (BCL) program",
+        name: "decode_timestamp",
+        description: "Decode a millisecond timestamp to human-readable UTC format. If no timestamp provided, returns the current time. Use this to interpret mtime/obsMtime values from entities.",
         inputSchema: {
           type: "object",
           properties: {
-            program: { type: "string", description: "The BCL program as a binary string (syntax: T:=00|01|1TT) 00=K, 01=S, 1=application." },
-            maxSteps: { type: "number", description: "Maximum number of reduction steps to perform (default: 1000000)", default: 1000000 },
+            timestamp: { type: "number", description: "Millisecond timestamp to decode. If omitted, returns current time." },
+            relative: { type: "boolean", description: "If true, include relative time (e.g., '3 days ago'). Default: false" },
           },
-          required: ["program"],
         },
       },
       {
-        name: "add_bcl_term",
-        description: "Add a BCL term to the constructor, maintaining valid syntax. Returns completion status.",
+        name: "random_walk",
+        description: "Perform a random walk from a starting entity, following random relations. Returns the terminal entity name and the path taken. Useful for serendipitous exploration of the knowledge graph.",
         inputSchema: {
           type: "object",
           properties: {
-            term: { 
-              type: "string", 
-              description: "BCL term to add. Valid values: '1' or 'App' (application), '00' or 'K' (K combinator), '01' or 'S' (S combinator)" 
-            },
+            start: { type: "string", description: "Name of the entity to start the walk from." },
+            depth: { type: "number", description: "Number of steps to take. Default: 3" },
+            seed: { type: "string", description: "Optional seed for reproducible walks." },
           },
-          required: ["term"],
-        },
-      },
-      {
-        name: "clear_bcl_term",
-        description: "Clear the current BCL term being constructed and reset the constructor state",
-        inputSchema: {
-          type: "object",
-          properties: {},
+          required: ["start"],
         },
       },
       {
@@ -1260,13 +1207,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     case "validate_graph":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.validateGraph(), null, 2) }] };
-    case "evaluate_bcl":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.evaluateBCL(args.program as string, args.maxSteps as number), null, 2) }] };
-    case "add_bcl_term":
-      return { content: [{ type: "text", text: await knowledgeGraphManager.addBCLTerm(args.term as string) }] };
-    case "clear_bcl_term":
-      await knowledgeGraphManager.clearBCLTerm();
-      return { content: [{ type: "text", text: "BCL term constructor cleared successfully" }] };
+    case "decode_timestamp":
+      return { content: [{ type: "text", text: JSON.stringify(knowledgeGraphManager.decodeTimestamp(args.timestamp as number | undefined, args.relative as boolean ?? false)) }] };
+    case "random_walk": {
+      const result = await knowledgeGraphManager.randomWalk(args.start as string, args.depth as number ?? 3, args.seed as string | undefined);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    }
     case "sequentialthinking": {
       const result = await knowledgeGraphManager.addThought(
         args.observations as string[],

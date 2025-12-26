@@ -558,45 +558,6 @@ describe('MCP Memory Server E2E Tests', () => {
     });
   });
 
-  describe('BCL Evaluator', () => {
-    it('should evaluate K combinator (identity for first arg)', async () => {
-      // K = 00, evaluating K applied to two args should return first
-      // This is a simplified test - BCL semantics are complex
-      const result = await callTool(client, 'evaluate_bcl', {
-        program: '00',
-        maxSteps: 100
-      }) as { result: string; halted: boolean };
-
-      expect(result.halted).toBe(true);
-    });
-
-    it('should construct BCL terms incrementally', async () => {
-      let result = await callTool(client, 'add_bcl_term', { term: 'App' });
-      expect(result).toContain('more term');
-
-      result = await callTool(client, 'add_bcl_term', { term: 'K' });
-      expect(result).toContain('more term');
-
-      result = await callTool(client, 'add_bcl_term', { term: 'S' });
-      expect(result).toContain('Constructed Program');
-    });
-
-    it('should clear BCL constructor state', async () => {
-      await callTool(client, 'add_bcl_term', { term: 'App' });
-      await callTool(client, 'clear_bcl_term', {});
-
-      // After clearing, we should need to start fresh
-      const result = await callTool(client, 'add_bcl_term', { term: 'K' });
-      expect(result).toContain('Constructed Program');
-    });
-
-    it('should reject invalid BCL terms', async () => {
-      await expect(
-        callTool(client, 'add_bcl_term', { term: 'invalid' })
-      ).rejects.toThrow(/Invalid BCL term/);
-    });
-  });
-
   describe('Sequential Thinking', () => {
     it('should create a thought and return ctxId', async () => {
       const result = await callTool(client, 'sequentialthinking', {
@@ -665,6 +626,115 @@ describe('MCP Memory Server E2E Tests', () => {
       const thought = graph.entities.items[0];
       expect(thought.mtime).toBeDefined();
       expect(thought.obsMtime).toBeDefined();
+    });
+  });
+
+  describe('Timestamp Decoding', () => {
+    it('should decode a specific timestamp', async () => {
+      const result = await callTool(client, 'decode_timestamp', {
+        timestamp: 1735200000000  // Known timestamp
+      }) as { timestamp: number; iso8601: string; formatted: string };
+
+      expect(result.timestamp).toBe(1735200000000);
+      expect(result.iso8601).toBe('2024-12-26T08:00:00.000Z');
+      expect(result.formatted).toContain('2024');
+    });
+
+    it('should return current time when no timestamp provided', async () => {
+      const before = Date.now();
+      const result = await callTool(client, 'decode_timestamp', {}) as { timestamp: number };
+      const after = Date.now();
+
+      expect(result.timestamp).toBeGreaterThanOrEqual(before);
+      expect(result.timestamp).toBeLessThanOrEqual(after);
+    });
+
+    it('should include relative time when requested', async () => {
+      const oneHourAgo = Date.now() - 3600000;
+      const result = await callTool(client, 'decode_timestamp', {
+        timestamp: oneHourAgo,
+        relative: true
+      }) as { relative: string };
+
+      expect(result.relative).toContain('hour');
+      expect(result.relative).toContain('ago');
+    });
+
+    it('should handle future timestamps', async () => {
+      const oneHourFromNow = Date.now() + 3600000;
+      const result = await callTool(client, 'decode_timestamp', {
+        timestamp: oneHourFromNow,
+        relative: true
+      }) as { relative: string };
+
+      expect(result.relative).toContain('in');
+    });
+  });
+
+  describe('Random Walk', () => {
+    beforeEach(async () => {
+      // Create a small graph for walking
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'Center', entityType: 'Node', observations: ['Hub node'] },
+          { name: 'North', entityType: 'Node', observations: ['North node'] },
+          { name: 'South', entityType: 'Node', observations: ['South node'] },
+          { name: 'East', entityType: 'Node', observations: ['East node'] },
+          { name: 'Isolated', entityType: 'Node', observations: ['No connections'] },
+        ]
+      });
+      await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'Center', to: 'North', relationType: 'connects' },
+          { from: 'Center', to: 'South', relationType: 'connects' },
+          { from: 'Center', to: 'East', relationType: 'connects' },
+          { from: 'North', to: 'South', relationType: 'connects' },
+        ]
+      });
+    });
+
+    it('should perform a walk and return path', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 2
+      }) as { entity: string; path: string[] };
+
+      expect(result.path[0]).toBe('Center');
+      expect(result.path.length).toBeGreaterThanOrEqual(1);
+      expect(result.path.length).toBeLessThanOrEqual(3);
+      expect(result.entity).toBe(result.path[result.path.length - 1]);
+    });
+
+    it('should terminate early at dead ends', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'Isolated',
+        depth: 5
+      }) as { entity: string; path: string[] };
+
+      expect(result.path).toEqual(['Isolated']);
+      expect(result.entity).toBe('Isolated');
+    });
+
+    it('should produce reproducible walks with same seed', async () => {
+      const result1 = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 3,
+        seed: 'test-seed-123'
+      }) as { entity: string; path: string[] };
+
+      const result2 = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 3,
+        seed: 'test-seed-123'
+      }) as { entity: string; path: string[] };
+
+      expect(result1.path).toEqual(result2.path);
+    });
+
+    it('should throw on non-existent start entity', async () => {
+      await expect(
+        callTool(client, 'random_walk', { start: 'NonExistent', depth: 2 })
+      ).rejects.toThrow(/not found/);
     });
   });
 
