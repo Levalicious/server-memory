@@ -20,17 +20,24 @@ jobs:
         id: versions
         run: |
           PKG_VERSION=$(node -p "require('./package.json').version")
-          SERVER_VERSION=$(grep -oP 'version: "\K[^"]+' server.ts || echo "")
+          SERVER_VERSION=$(grep -oP 'version: "\K[^"]+' server.ts | head -1 || echo "")
           echo "pkg_version=$PKG_VERSION" >> $GITHUB_OUTPUT
           echo "server_version=$SERVER_VERSION" >> $GITHUB_OUTPUT
+          echo "Package version: $PKG_VERSION"
+          echo "Server version: $SERVER_VERSION"
 
       - name: Sync version if needed
-        if: steps.versions.outputs.pkg_version != steps.versions.outputs.server_version
         run: |
-          VERSION="${{ steps.versions.outputs.pkg_version }}"
+          VERSION=$(node -p "require('./package.json').version")
           sed -i "s/version: \"[^\"]*\"/version: \"$VERSION\"/" server.ts
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add server.ts
-          git diff --cached --quiet || (git commit -m "sync server.ts version to $VERSION" && git push)
+          
+          if git diff --cached --quiet; then
+            echo "No changes needed, versions already in sync"
+          else
+            git commit -m "chore: sync server.ts version to $VERSION"
+            git push
+          fi
