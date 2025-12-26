@@ -10,12 +10,7 @@ import { promises as fs } from 'fs';
 import { randomBytes } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createRequire } from 'module';
 import lockfile from 'proper-lockfile';
-
-// Read version from package.json
-const require = createRequire(import.meta.url);
-const { version: VERSION } = require('./package.json');
 
 // Define memory file path using environment variable with fallback
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
@@ -819,7 +814,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: VERSION,
+    version: "0.0.11",
   }, {
     capabilities: {
       tools: {},
