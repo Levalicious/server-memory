@@ -14,7 +14,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && shx chmod +x dist/*.js",
+    "build": "node-gyp rebuild && tsc && shx chmod +x dist/*.js",
+    "build:native": "node-gyp rebuild",
     "prepare": "husky && npm run build",
     "watch": "tsc --watch",
     "test": "NODE_OPTIONS='--experimental-vm-modules' jest"

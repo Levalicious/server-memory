@@ -270,10 +270,21 @@ export class KnowledgeGraphManager {
       }
       
       const now = Date.now();
-      const newEntities = entities
-        .filter(e => !graph.entities.some(existingEntity => existingEntity.name === e.name))
-        .map(e => ({ ...e, mtime: now, obsMtime: e.observations.length > 0 ? now : undefined }));
-      graph.entities.push(...newEntities);
+      const newEntities: Entity[] = [];
+      for (const e of entities) {
+        const existing = graph.entities.find(ex => ex.name === e.name);
+        if (existing) {
+          // Check for exact match — skip silently if identical
+          const sameType = existing.entityType === e.entityType;
+          const sameObs = existing.observations.length === e.observations.length &&
+            existing.observations.every((o, i) => o === e.observations[i]);
+          if (sameType && sameObs) continue; // exact match, skip
+          throw new Error(`Entity "${e.name}" already exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`);
+        }
+        const newEntity = { ...e, mtime: now, obsMtime: e.observations.length > 0 ? now : undefined };
+        graph.entities.push(newEntity);
+        newEntities.push(newEntity);
+      }
       await this.saveGraph(graph);
       return newEntities;
     });
@@ -382,7 +393,7 @@ export class KnowledgeGraphManager {
   }
 
   // Regex-based search function
-  async searchNodes(query: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<KnowledgeGraph> {
+  async searchNodes(query: string, sortBy?: EntitySortField, sortDir?: SortDirection, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     
     let regex: RegExp;
@@ -402,10 +413,12 @@ export class KnowledgeGraphManager {
     // Create a Set of filtered entity names for quick lookup
     const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
   
-    // Filter relations to only include those between filtered entities
-    const filteredRelations = graph.relations.filter(r => 
-      filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
-    );
+    // Filter relations based on direction
+    const filteredRelations = graph.relations.filter(r => {
+      if (direction === 'forward') return filteredEntityNames.has(r.from);
+      if (direction === 'backward') return filteredEntityNames.has(r.to);
+      return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to); // 'any' = both endpoints in set
+    });
   
     const filteredGraph: KnowledgeGraph = {
       entities: sortEntities(filteredEntities, sortBy, sortDir),
@@ -415,7 +428,7 @@ export class KnowledgeGraphManager {
     return filteredGraph;
   }
 
-  async openNodesFiltered(names: string[]): Promise<KnowledgeGraph> {
+  async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
     
     // Filter entities
@@ -424,30 +437,12 @@ export class KnowledgeGraphManager {
     // Create a Set of filtered entity names for quick lookup
     const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
   
-    // Filter relations to only include those between filtered entities
-    const filteredRelations = graph.relations.filter(r => 
-      filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
-    );
-  
-    const filteredGraph: KnowledgeGraph = {
-      entities: filteredEntities,
-      relations: filteredRelations,
-    };
-  
-    return filteredGraph;
-  }
-
-  async openNodes(names: string[]): Promise<KnowledgeGraph> {
-    const graph = await this.loadGraph();
-    
-    // Filter entities
-    const filteredEntities = graph.entities.filter(e => names.includes(e.name));
-  
-    // Create a Set of filtered entity names for quick lookup
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-  
-    // Filter relations to only include those between filtered entities
-    const filteredRelations = graph.relations.filter(r => filteredEntityNames.has(r.from));
+    // Filter relations based on direction
+    const filteredRelations = graph.relations.filter(r => {
+      if (direction === 'forward') return filteredEntityNames.has(r.from);
+      if (direction === 'backward') return filteredEntityNames.has(r.to);
+      return filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to); // 'any'
+    });
   
     const filteredGraph: KnowledgeGraph = {
       entities: filteredEntities,
@@ -461,7 +456,8 @@ export class KnowledgeGraphManager {
     entityName: string, 
     depth: number = 1, 
     sortBy?: EntitySortField, 
-    sortDir?: SortDirection
+    sortDir?: SortDirection,
+    direction: 'forward' | 'backward' | 'any' = 'forward'
   ): Promise<Neighbor[]> {
     const graph = await this.loadGraph();
     const visited = new Set<string>();
@@ -471,10 +467,12 @@ export class KnowledgeGraphManager {
       if (currentDepth > depth || visited.has(currentName)) return;
       visited.add(currentName);
       
-      // Find all relations involving this entity
-      const connectedRelations = graph.relations.filter(r => 
-        r.from === currentName || r.to === currentName
-      );
+      // Find relations based on direction
+      const connectedRelations = graph.relations.filter(r => {
+        if (direction === 'forward') return r.from === currentName;
+        if (direction === 'backward') return r.to === currentName;
+        return r.from === currentName || r.to === currentName; // 'any'
+      });
       
       // Collect neighbor names
       connectedRelations.forEach(r => {
@@ -510,7 +508,7 @@ export class KnowledgeGraphManager {
     return sortNeighbors(neighbors, sortBy, sortDir);
   }
 
-  async findPath(fromEntity: string, toEntity: string, maxDepth: number = 5): Promise<Relation[]> {
+  async findPath(fromEntity: string, toEntity: string, maxDepth: number = 5, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<Relation[]> {
     const graph = await this.loadGraph();
     const visited = new Set<string>();
     
@@ -520,9 +518,14 @@ export class KnowledgeGraphManager {
       
       visited.add(current);
       
-      const outgoingRelations = graph.relations.filter(r => r.from === current);
-      for (const relation of outgoingRelations) {
-        const result = dfs(relation.to, target, [...path, relation], depth + 1);
+      const relations = graph.relations.filter(r => {
+        if (direction === 'forward') return r.from === current;
+        if (direction === 'backward') return r.to === current;
+        return r.from === current || r.to === current; // 'any'
+      });
+      for (const relation of relations) {
+        const next = relation.from === current ? relation.to : relation.from;
+        const result = dfs(next, target, [...path, relation], depth + 1);
         if (result) return result;
       }
       
@@ -579,7 +582,7 @@ export class KnowledgeGraphManager {
     }
     
     // Strict mode: entities not connected to "Self" (directly or indirectly)
-    // Build adjacency list (bidirectional)
+    // Build adjacency list (bidirectional — reachability uses 'any' direction)
     const neighbors = new Map<string, Set<string>>();
     graph.entities.forEach(e => neighbors.set(e.name, new Set()));
     graph.relations.forEach(r => {
@@ -651,7 +654,7 @@ export class KnowledgeGraphManager {
     };
   }
 
-  async randomWalk(start: string, depth: number = 3, seed?: string): Promise<{ entity: string; path: string[] }> {
+  async randomWalk(start: string, depth: number = 3, seed?: string, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<{ entity: string; path: string[] }> {
     const graph = await this.loadGraph();
     
     // Verify start entity exists
@@ -678,11 +681,15 @@ export class KnowledgeGraphManager {
     let current = start;
     
     for (let i = 0; i < depth; i++) {
-      // Get unique neighbors (both directions)
+      // Get unique neighbors based on direction
       const neighbors = new Set<string>();
       for (const rel of graph.relations) {
-        if (rel.from === current && rel.to !== current) neighbors.add(rel.to);
-        if (rel.to === current && rel.from !== current) neighbors.add(rel.from);
+        if (direction === 'forward' || direction === 'any') {
+          if (rel.from === current && rel.to !== current) neighbors.add(rel.to);
+        }
+        if (direction === 'backward' || direction === 'any') {
+          if (rel.to === current && rel.from !== current) neighbors.add(rel.from);
+        }
       }
       
       // Filter to only existing entities
@@ -968,29 +975,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             query: { type: "string", description: "Regex pattern to match against entity names, types, and observations." },
+            direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction filter for returned relations. Default: forward" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             entityCursor: { type: "number", description: "Cursor for entity pagination (from previous response's nextCursor)" },
             relationCursor: { type: "number", description: "Cursor for relation pagination" },
           },
           required: ["query"],
-        },
-      },
-      {
-        name: "open_nodes_filtered",
-        description: "Open specific nodes in the knowledge graph by their names, filtering relations to only those between the opened nodes. Results are paginated (max 512 chars).",
-        inputSchema: {
-          type: "object",
-          properties: {
-            names: {
-              type: "array",
-              items: { type: "string" },
-              description: "An array of entity names to retrieve",
-            },
-            entityCursor: { type: "number", description: "Cursor for entity pagination" },
-            relationCursor: { type: "number", description: "Cursor for relation pagination" },
-          },
-          required: ["names"],
         },
       },
       {
@@ -1004,6 +995,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: "string" },
               description: "An array of entity names to retrieve",
             },
+            direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction filter for returned relations. Default: forward" },
             entityCursor: { type: "number", description: "Cursor for entity pagination" },
             relationCursor: { type: "number", description: "Cursor for relation pagination" },
           },
@@ -1018,6 +1010,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             entityName: { type: "string", description: "The name of the entity to find neighbors for" },
             depth: { type: "number", description: "Maximum depth to traverse (default: 1)", default: 1 },
+            direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for neighbors. Omit for arbitrary order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             cursor: { type: "number", description: "Cursor for pagination" },
@@ -1034,6 +1027,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             fromEntity: { type: "string", description: "The name of the starting entity" },
             toEntity: { type: "string", description: "The name of the target entity" },
             maxDepth: { type: "number", description: "Maximum depth to search (default: 5)", default: 5 },
+            direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
             cursor: { type: "number", description: "Cursor for pagination" },
           },
           required: ["fromEntity", "toEntity"],
@@ -1118,6 +1112,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             start: { type: "string", description: "Name of the entity to start the walk from." },
             depth: { type: "number", description: "Number of steps to take. Default: 3" },
             seed: { type: "string", description: "Optional seed for reproducible walks." },
+            direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
           },
           required: ["start"],
         },
@@ -1172,23 +1167,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
     case "search_nodes": {
-      const graph = await knowledgeGraphManager.searchNodes(args.query as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
-      return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
-    }
-    case "open_nodes_filtered": {
-      const graph = await knowledgeGraphManager.openNodesFiltered(args.names as string[]);
+      const graph = await knowledgeGraphManager.searchNodes(args.query as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
       return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
     }
     case "open_nodes": {
-      const graph = await knowledgeGraphManager.openNodes(args.names as string[]);
+      const graph = await knowledgeGraphManager.openNodes(args.names as string[], (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
       return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
     }
     case "get_neighbors": {
-      const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 1, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
+      const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 1, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
       return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
     }
     case "find_path": {
-      const path = await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number);
+      const path = await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
       return { content: [{ type: "text", text: JSON.stringify(paginateItems(path, args.cursor as number ?? 0)) }] };
     }
     case "get_entities_by_type": {
@@ -1210,7 +1201,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "decode_timestamp":
       return { content: [{ type: "text", text: JSON.stringify(knowledgeGraphManager.decodeTimestamp(args.timestamp as number | undefined, args.relative as boolean ?? false)) }] };
     case "random_walk": {
-      const result = await knowledgeGraphManager.randomWalk(args.start as string, args.depth as number ?? 3, args.seed as string | undefined);
+      const result = await knowledgeGraphManager.randomWalk(args.start as string, args.depth as number ?? 3, args.seed as string | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     }
     case "sequentialthinking": {

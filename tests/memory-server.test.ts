@@ -51,9 +51,10 @@ describe('MCP Memory Server E2E Tests', () => {
         entities: [{ name: 'Alice', entityType: 'Person', observations: ['First'] }]
       });
 
+      // Exact same entity should be silently skipped
       const result = await callTool(client, 'create_entities', {
         entities: [
-          { name: 'Alice', entityType: 'Person', observations: ['Second'] },
+          { name: 'Alice', entityType: 'Person', observations: ['First'] },
           { name: 'Bob', entityType: 'Person', observations: ['New'] }
         ]
       }) as Entity[];
@@ -61,6 +62,26 @@ describe('MCP Memory Server E2E Tests', () => {
       // Only Bob should be returned as new
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe('Bob');
+    });
+
+    it('should error on duplicate name with different data', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'Alice', entityType: 'Person', observations: ['First'] }]
+      });
+
+      // Same name, different type — should error
+      await expect(
+        callTool(client, 'create_entities', {
+          entities: [{ name: 'Alice', entityType: 'Organization', observations: ['First'] }]
+        })
+      ).rejects.toThrow(/already exists/);
+
+      // Same name, different observations — should error
+      await expect(
+        callTool(client, 'create_entities', {
+          entities: [{ name: 'Alice', entityType: 'Person', observations: ['Different'] }]
+        })
+      ).rejects.toThrow(/already exists/);
     });
 
     it('should reject entities with more than 2 observations', async () => {
@@ -312,15 +333,6 @@ describe('MCP Memory Server E2E Tests', () => {
       // open_nodes returns all relations where 'from' is in the requested set
       // A->B and A->C both have from='A' which is in the set
       expect(result.relations.items).toHaveLength(2);
-    });
-
-    it('should open nodes filtered (only internal relations)', async () => {
-      const result = await callTool(client, 'open_nodes_filtered', {
-        names: ['B', 'C']
-      }) as PaginatedGraph;
-
-      expect(result.entities.items).toHaveLength(2);
-      expect(result.relations.items).toHaveLength(0); // No relations between B and C
     });
   });
 
