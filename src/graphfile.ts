@@ -250,7 +250,7 @@ export class GraphFile {
 
   // --- Entity CRUD ---
 
-  createEntity(name: string, entityType: string, mtime: bigint): EntityRecord {
+  createEntity(name: string, entityType: string, mtime: bigint, obsMtime?: bigint): EntityRecord {
     const nameId = Number(this.st.intern(name));
     const typeId = Number(this.st.intern(entityType));
 
@@ -263,7 +263,7 @@ export class GraphFile {
       typeId,
       adjOffset: 0n,
       mtime,
-      obsMtime: mtime,
+      obsMtime: obsMtime ?? mtime,
       obsCount: 0,
       obs0Id: 0,
       obs1Id: 0,
@@ -275,6 +275,10 @@ export class GraphFile {
 
   readEntity(offset: bigint): EntityRecord {
     return readEntityRecord(this.mf, offset);
+  }
+
+  updateEntity(rec: EntityRecord): void {
+    writeEntityRecord(this.mf, rec);
   }
 
   deleteEntity(offset: bigint): void {
