@@ -8,9 +8,11 @@
  *   [memfile header: 32 bytes]
  *   [graph header block: first allocation]
  *     u64 node_log_offset
+ *     u64 structural_total     total structural walk visits (global counter)
+ *     u64 walker_total         total walker visits (global counter)
  *   [entity records, adj blocks, node log ...]
  *
- * EntityRecord: 48 bytes fixed
+ * EntityRecord: 64 bytes fixed
  *   u32  name_id         string table ID
  *   u32  type_id         string table ID
  *   u64  adj_offset      offset to AdjBlock (0 = no edges)
@@ -20,6 +22,8 @@
  *   u8   _pad[3]
  *   u32  obs0_id         string table ID (0 = empty)
  *   u32  obs1_id         string table ID (0 = empty)
+ *   u64  structural_visits  structural PageRank visit count
+ *   u64  walker_visits      walker PageRank visit count
  *
  * AdjBlock:
  *   u32  count
@@ -46,11 +50,11 @@ import { StringTable } from './stringtable.js';
 
 // --- Constants ---
 
-export const ENTITY_RECORD_SIZE = 48;
+export const ENTITY_RECORD_SIZE = 64;
 export const ADJ_ENTRY_SIZE = 24;      // 8 + 4 + 4 + 8, naturally aligned
 const ADJ_HEADER_SIZE = 8;             // count:u32 + capacity:u32
 const NODE_LOG_HEADER_SIZE = 8;        // count:u32 + capacity:u32
-const GRAPH_HEADER_SIZE = 8;           // node_log_offset:u64
+const GRAPH_HEADER_SIZE = 24;          // node_log_offset:u64 + structural_total:u64 + walker_total:u64
 const INITIAL_ADJ_CAPACITY = 4;
 const INITIAL_LOG_CAPACITY = 256;
 
@@ -71,13 +75,21 @@ const E_OBS_COUNT = 32;
 // 3 bytes pad at 33
 const E_OBS0_ID = 36;
 const E_OBS1_ID = 40;
-// total = 44, pad to 48
+// 4 bytes pad at 44
+const E_STRUCTURAL_VISITS = 48;  // u64: 48..55, 8-aligned
+const E_WALKER_VISITS = 56;      // u64: 56..63, 8-aligned
+// total = 64
 
 // AdjEntry field offsets (within each entry)
 const AE_TARGET_DIR = 0;
 const AE_RELTYPE_ID = 8;
 // 4 bytes pad at 12
 const AE_MTIME = 16;
+
+// Graph header field offsets
+const GH_NODE_LOG_OFFSET = 0;
+const GH_STRUCTURAL_TOTAL = 8;
+const GH_WALKER_TOTAL = 16;
 
 // --- Encoding helpers ---
 
@@ -105,6 +117,8 @@ export interface EntityRecord {
   obsCount: number;
   obs0Id: number;         // 0 = empty
   obs1Id: number;         // 0 = empty
+  structuralVisits: bigint;  // structural PageRank visit count
+  walkerVisits: bigint;      // walker PageRank visit count
 }
 
 export interface AdjEntry {
@@ -128,6 +142,8 @@ export function readEntityRecord(mf: MemoryFile, offset: bigint): EntityRecord {
     obsCount: buf.readUInt8(E_OBS_COUNT),
     obs0Id: buf.readUInt32LE(E_OBS0_ID),
     obs1Id: buf.readUInt32LE(E_OBS1_ID),
+    structuralVisits: buf.readBigUInt64LE(E_STRUCTURAL_VISITS),
+    walkerVisits: buf.readBigUInt64LE(E_WALKER_VISITS),
   };
 }
 
@@ -141,6 +157,8 @@ export function writeEntityRecord(mf: MemoryFile, rec: EntityRecord): void {
   buf.writeUInt8(rec.obsCount, E_OBS_COUNT);
   buf.writeUInt32LE(rec.obs0Id, E_OBS0_ID);
   buf.writeUInt32LE(rec.obs1Id, E_OBS1_ID);
+  buf.writeBigUInt64LE(rec.structuralVisits, E_STRUCTURAL_VISITS);
+  buf.writeBigUInt64LE(rec.walkerVisits, E_WALKER_VISITS);
   mf.write(rec.offset, buf);
 }
 
@@ -227,9 +245,11 @@ export class GraphFile {
     logHeader.writeUInt32LE(INITIAL_LOG_CAPACITY, 4);
     this.mf.write(logOffset, logHeader);
 
-    // Write graph header: node_log_offset
+    // Write graph header: node_log_offset + global PageRank counters
     const hdr = Buffer.alloc(GRAPH_HEADER_SIZE);
-    hdr.writeBigUInt64LE(logOffset, 0);
+    hdr.writeBigUInt64LE(logOffset, GH_NODE_LOG_OFFSET);
+    hdr.writeBigUInt64LE(0n, GH_STRUCTURAL_TOTAL);
+    hdr.writeBigUInt64LE(0n, GH_WALKER_TOTAL);
     this.mf.write(hdrOffset, hdr);
 
     return hdrOffset;
@@ -238,14 +258,14 @@ export class GraphFile {
   // --- Header access ---
 
   private getNodeLogOffset(): bigint {
-    const buf = this.mf.read(this.graphHeaderOffset, 8n);
-    return buf.readBigUInt64LE(0);
+    const buf = this.mf.read(this.graphHeaderOffset, BigInt(GRAPH_HEADER_SIZE));
+    return buf.readBigUInt64LE(GH_NODE_LOG_OFFSET);
   }
 
   private setNodeLogOffset(offset: bigint): void {
     const buf = Buffer.alloc(8);
     buf.writeBigUInt64LE(offset, 0);
-    this.mf.write(this.graphHeaderOffset, buf);
+    this.mf.write(this.graphHeaderOffset + BigInt(GH_NODE_LOG_OFFSET), buf);
   }
 
   // --- Entity CRUD ---
@@ -267,6 +287,8 @@ export class GraphFile {
       obsCount: 0,
       obs0Id: 0,
       obs1Id: 0,
+      structuralVisits: 0n,
+      walkerVisits: 0n,
     };
     writeEntityRecord(this.mf, rec);
     this.nodeLogAppend(offset);
@@ -548,6 +570,74 @@ export class GraphFile {
     const logOffset = this.getNodeLogOffset();
     const header = this.mf.read(logOffset, BigInt(NODE_LOG_HEADER_SIZE));
     return header.readUInt32LE(0);
+  }
+
+  // --- PageRank visit counts ---
+
+  /** Read global structural visit total */
+  getStructuralTotal(): bigint {
+    const buf = this.mf.read(this.graphHeaderOffset + BigInt(GH_STRUCTURAL_TOTAL), 8n);
+    return buf.readBigUInt64LE(0);
+  }
+
+  /** Read global walker visit total */
+  getWalkerTotal(): bigint {
+    const buf = this.mf.read(this.graphHeaderOffset + BigInt(GH_WALKER_TOTAL), 8n);
+    return buf.readBigUInt64LE(0);
+  }
+
+  /** Increment structural visit count for one entity and bump the global counter. */
+  incrementStructuralVisit(entityOffset: bigint): void {
+    // Read current entity visit count
+    const vbuf = this.mf.read(entityOffset + BigInt(E_STRUCTURAL_VISITS), 8n);
+    const current = vbuf.readBigUInt64LE(0);
+    const wbuf = Buffer.alloc(8);
+    wbuf.writeBigUInt64LE(current + 1n, 0);
+    this.mf.write(entityOffset + BigInt(E_STRUCTURAL_VISITS), wbuf);
+
+    // Bump global counter
+    const gbuf = this.mf.read(this.graphHeaderOffset + BigInt(GH_STRUCTURAL_TOTAL), 8n);
+    const total = gbuf.readBigUInt64LE(0);
+    const gwbuf = Buffer.alloc(8);
+    gwbuf.writeBigUInt64LE(total + 1n, 0);
+    this.mf.write(this.graphHeaderOffset + BigInt(GH_STRUCTURAL_TOTAL), gwbuf);
+  }
+
+  /** Increment walker visit count for one entity and bump the global counter. */
+  incrementWalkerVisit(entityOffset: bigint): void {
+    const vbuf = this.mf.read(entityOffset + BigInt(E_WALKER_VISITS), 8n);
+    const current = vbuf.readBigUInt64LE(0);
+    const wbuf = Buffer.alloc(8);
+    wbuf.writeBigUInt64LE(current + 1n, 0);
+    this.mf.write(entityOffset + BigInt(E_WALKER_VISITS), wbuf);
+
+    const gbuf = this.mf.read(this.graphHeaderOffset + BigInt(GH_WALKER_TOTAL), 8n);
+    const total = gbuf.readBigUInt64LE(0);
+    const gwbuf = Buffer.alloc(8);
+    gwbuf.writeBigUInt64LE(total + 1n, 0);
+    this.mf.write(this.graphHeaderOffset + BigInt(GH_WALKER_TOTAL), gwbuf);
+  }
+
+  /**
+   * Get the structural PageRank score for an entity.
+   * Returns structuralVisits / structuralTotal, or 0 if no visits yet.
+   */
+  getStructuralRank(entityOffset: bigint): number {
+    const total = this.getStructuralTotal();
+    if (total === 0n) return 0;
+    const rec = this.readEntity(entityOffset);
+    return Number(rec.structuralVisits) / Number(total);
+  }
+
+  /**
+   * Get the walker PageRank score for an entity.
+   * Returns walkerVisits / walkerTotal, or 0 if no visits yet.
+   */
+  getWalkerRank(entityOffset: bigint): number {
+    const total = this.getWalkerTotal();
+    if (total === 0n) return 0;
+    const rec = this.readEntity(entityOffset);
+    return Number(rec.walkerVisits) / Number(total);
   }
 
   // --- Lifecycle ---
