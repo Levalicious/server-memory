@@ -25,11 +25,8 @@ jobs:
         id: check-tests
         continue-on-error: true
         run: |
-          if yarn test --silent 2>/dev/null; then
-            echo "has-tests=true" >> $GITHUB_OUTPUT
-          else
-            echo "has-tests=false" >> $GITHUB_OUTPUT
-          fi
+          found_tests="$(jq '.scripts? | has("test")')"
+          echo "has-tests=$found_tests" >> $GITHUB_OUTPUT
       - name: Run tests
         if: steps.check-tests.outputs.has-tests == 'true'
         run: yarn test
