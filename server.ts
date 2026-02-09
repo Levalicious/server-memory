@@ -6,11 +6,12 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { promises as fs } from 'fs';
 import { randomBytes } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import lockfile from 'proper-lockfile';
+import { GraphFile, DIR_FORWARD, DIR_BACKWARD, EntityRecord, AdjEntry } from './src/graphfile.js';
+import { StringTable } from './src/stringtable.js';
+import { structuralSample } from './src/pagerank.js';
 
 // Define memory file path using environment variable with fallback
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
@@ -49,7 +50,7 @@ export interface PaginatedResult<T> {
   totalCount: number;
 }
 
-export type EntitySortField = "mtime" | "obsMtime" | "name";
+export type EntitySortField = "mtime" | "obsMtime" | "name" | "pagerank" | "llmrank";
 export type SortDirection = "asc" | "desc";
 
 export interface Neighbor {
@@ -62,11 +63,16 @@ export interface Neighbor {
  * Sort entities by the specified field and direction.
  * Returns a new array (does not mutate input).
  * If sortBy is undefined, returns the original array (no sorting - preserves insertion order).
+ *
+ * For 'pagerank' sort: uses structural rank (desc by default).
+ * For 'llmrank' sort: uses walker rank, falls back to structural rank on tie, then random.
+ * Both rank sorts require rankMaps parameter.
  */
 function sortEntities(
   entities: Entity[],
   sortBy?: EntitySortField,
-  sortDir?: SortDirection
+  sortDir?: SortDirection,
+  rankMaps?: { structural: Map<string, number>; walker: Map<string, number> }
 ): Entity[] {
   if (!sortBy) return entities; // No sorting - preserve current behavior
 
@@ -76,6 +82,27 @@ function sortEntities(
   return [...entities].sort((a, b) => {
     if (sortBy === "name") {
       return mult * a.name.localeCompare(b.name);
+    }
+    if (sortBy === "pagerank") {
+      const aRank = rankMaps?.structural.get(a.name) ?? 0;
+      const bRank = rankMaps?.structural.get(b.name) ?? 0;
+      const diff = aRank - bRank;
+      if (diff !== 0) return mult * diff;
+      return Math.random() - 0.5; // random tiebreak
+    }
+    if (sortBy === "llmrank") {
+      // Primary: walker rank
+      const aWalker = rankMaps?.walker.get(a.name) ?? 0;
+      const bWalker = rankMaps?.walker.get(b.name) ?? 0;
+      const walkerDiff = aWalker - bWalker;
+      if (walkerDiff !== 0) return mult * walkerDiff;
+      // Fallback: structural rank
+      const aStruct = rankMaps?.structural.get(a.name) ?? 0;
+      const bStruct = rankMaps?.structural.get(b.name) ?? 0;
+      const structDiff = aStruct - bStruct;
+      if (structDiff !== 0) return mult * structDiff;
+      // Final: random tiebreak
+      return Math.random() - 0.5;
     }
     // For timestamps, treat undefined as 0 (oldest)
     const aVal = a[sortBy] ?? 0;
@@ -91,7 +118,8 @@ function sortEntities(
 function sortNeighbors(
   neighbors: Neighbor[],
   sortBy?: EntitySortField,
-  sortDir?: SortDirection
+  sortDir?: SortDirection,
+  rankMaps?: { structural: Map<string, number>; walker: Map<string, number> }
 ): Neighbor[] {
   if (!sortBy) return neighbors;
 
@@ -101,6 +129,24 @@ function sortNeighbors(
   return [...neighbors].sort((a, b) => {
     if (sortBy === "name") {
       return mult * a.name.localeCompare(b.name);
+    }
+    if (sortBy === "pagerank") {
+      const aRank = rankMaps?.structural.get(a.name) ?? 0;
+      const bRank = rankMaps?.structural.get(b.name) ?? 0;
+      const diff = aRank - bRank;
+      if (diff !== 0) return mult * diff;
+      return Math.random() - 0.5;
+    }
+    if (sortBy === "llmrank") {
+      const aWalker = rankMaps?.walker.get(a.name) ?? 0;
+      const bWalker = rankMaps?.walker.get(b.name) ?? 0;
+      const walkerDiff = aWalker - bWalker;
+      if (walkerDiff !== 0) return mult * walkerDiff;
+      const aStruct = rankMaps?.structural.get(a.name) ?? 0;
+      const bStruct = rankMaps?.structural.get(b.name) ?? 0;
+      const structDiff = aStruct - bStruct;
+      if (structDiff !== 0) return mult * structDiff;
+      return Math.random() - 0.5;
     }
     const aVal = a[sortBy] ?? 0;
     const bVal = b[sortBy] ?? 0;
@@ -205,400 +251,581 @@ function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relation
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 export class KnowledgeGraphManager {
-  private memoryFilePath: string;
+  private gf: GraphFile;
+  private st: StringTable;
+  /** In-memory name→offset index, rebuilt from node log on open */
+  private nameIndex: Map<string, bigint>;
 
   constructor(memoryFilePath: string = DEFAULT_MEMORY_FILE_PATH) {
-    this.memoryFilePath = memoryFilePath;
+    // Derive binary file paths from the base path
+    const dir = path.dirname(memoryFilePath);
+    const base = path.basename(memoryFilePath, path.extname(memoryFilePath));
+    const graphPath = path.join(dir, `${base}.graph`);
+    const strPath = path.join(dir, `${base}.strings`);
+
+    this.st = new StringTable(strPath);
+    this.gf = new GraphFile(graphPath, this.st);
+    this.nameIndex = new Map();
+    this.rebuildNameIndex();
+
+    // Run initial structural sampling if graph is non-empty
+    if (this.nameIndex.size > 0) {
+      structuralSample(this.gf, 1, 0.85);
+    }
   }
 
-  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    // Ensure file exists for locking
-    try {
-      await fs.access(this.memoryFilePath);
-    } catch {
-      await fs.writeFile(this.memoryFilePath, "");
-    }
-    const release = await lockfile.lock(this.memoryFilePath, { retries: { retries: 5, minTimeout: 100 } });
-    try {
-      return await fn();
-    } finally {
-      await release();
+  /** Rebuild the in-memory name→offset index from the node log */
+  private rebuildNameIndex(): void {
+    this.nameIndex.clear();
+    const offsets = this.gf.getAllEntityOffsets();
+    for (const offset of offsets) {
+      const rec = this.gf.readEntity(offset);
+      const name = this.st.get(BigInt(rec.nameId));
+      this.nameIndex.set(name, offset);
     }
   }
 
-  private async loadGraph(): Promise<KnowledgeGraph> {
-    try {
-      const data = await fs.readFile(this.memoryFilePath, "utf-8");
-      const lines = data.split("\n").filter(line => line.trim() !== "");
-      return lines.reduce((graph: KnowledgeGraph, line) => {
-        const item = JSON.parse(line);
-        if (item.type === "entity") graph.entities.push(item as Entity);
-        if (item.type === "relation") graph.relations.push(item as Relation);
-        return graph;
-      }, { entities: [], relations: [] });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
-        return { entities: [], relations: [] };
+  /** Build rank maps from the binary store for pagerank/llmrank sorting */
+  getRankMaps(): { structural: Map<string, number>; walker: Map<string, number> } {
+    const structural = new Map<string, number>();
+    const walker = new Map<string, number>();
+    const structTotal = this.gf.getStructuralTotal();
+    const walkerTotal = this.gf.getWalkerTotal();
+
+    for (const [name, offset] of this.nameIndex) {
+      const rec = this.gf.readEntity(offset);
+      structural.set(name, structTotal > 0n ? Number(rec.structuralVisits) / Number(structTotal) : 0);
+      walker.set(name, walkerTotal > 0n ? Number(rec.walkerVisits) / Number(walkerTotal) : 0);
+    }
+
+    return { structural, walker };
+  }
+
+  /** Increment walker visit count for a list of entity names */
+  recordWalkerVisits(names: string[]): void {
+    for (const name of names) {
+      const offset = this.nameIndex.get(name);
+      if (offset !== undefined) {
+        this.gf.incrementWalkerVisit(offset);
       }
-      throw error;
     }
   }
 
-  private async saveGraph(graph: KnowledgeGraph): Promise<void> {
-    const lines = [
-      ...graph.entities.map(e => JSON.stringify({ type: "entity", ...e })),
-      ...graph.relations.map(r => JSON.stringify({ type: "relation", ...r })),
-    ];
-    const content = lines.join("\n") + (lines.length > 0 ? "\n" : "");
-    await fs.writeFile(this.memoryFilePath, content);
+  /** Re-run structural sampling (call after graph mutations) */
+  resample(): void {
+    if (this.nameIndex.size > 0) {
+      structuralSample(this.gf, 1, 0.85);
+    }
+  }
+
+  /** Convert an EntityRecord to the public Entity interface */
+  private recordToEntity(rec: EntityRecord): Entity {
+    const name = this.st.get(BigInt(rec.nameId));
+    const entityType = this.st.get(BigInt(rec.typeId));
+    const observations: string[] = [];
+    if (rec.obs0Id !== 0) observations.push(this.st.get(BigInt(rec.obs0Id)));
+    if (rec.obs1Id !== 0) observations.push(this.st.get(BigInt(rec.obs1Id)));
+
+    const entity: Entity = { name, entityType, observations };
+    const mtime = Number(rec.mtime);
+    const obsMtime = Number(rec.obsMtime);
+    if (mtime > 0) entity.mtime = mtime;
+    if (obsMtime > 0) entity.obsMtime = obsMtime;
+    return entity;
+  }
+
+  /** Get all entities as Entity objects (preserves node log order = insertion order) */
+  private getAllEntities(): Entity[] {
+    const offsets = this.gf.getAllEntityOffsets();
+    return offsets.map(o => this.recordToEntity(this.gf.readEntity(o)));
+  }
+
+  /** Get all relations by scanning adjacency lists (forward edges only to avoid duplication) */
+  private getAllRelations(): Relation[] {
+    const relations: Relation[] = [];
+    const offsets = this.gf.getAllEntityOffsets();
+    for (const offset of offsets) {
+      const rec = this.gf.readEntity(offset);
+      const fromName = this.st.get(BigInt(rec.nameId));
+      const edges = this.gf.getEdges(offset);
+      for (const edge of edges) {
+        if (edge.direction !== DIR_FORWARD) continue;
+        const targetRec = this.gf.readEntity(edge.targetOffset);
+        const toName = this.st.get(BigInt(targetRec.nameId));
+        const relationType = this.st.get(BigInt(edge.relTypeId));
+        const r: Relation = { from: fromName, to: toName, relationType };
+        const mtime = Number(edge.mtime);
+        if (mtime > 0) r.mtime = mtime;
+        relations.push(r);
+      }
+    }
+    return relations;
+  }
+
+  /** Load the full graph (entities + relations) */
+  private loadGraph(): KnowledgeGraph {
+    return {
+      entities: this.getAllEntities(),
+      relations: this.getAllRelations(),
+    };
   }
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
-    return this.withLock(async () => {
-      const graph = await this.loadGraph();
-      
-      // Validate observation limits
-      for (const entity of entities) {
-        if (entity.observations.length > 2) {
-          throw new Error(`Entity "${entity.name}" has ${entity.observations.length} observations. Maximum allowed is 2.`);
-        }
-        for (const obs of entity.observations) {
-          if (obs.length > 140) {
-            throw new Error(`Observation in entity "${entity.name}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
-          }
+    // Validate observation limits
+    for (const entity of entities) {
+      if (entity.observations.length > 2) {
+        throw new Error(`Entity "${entity.name}" has ${entity.observations.length} observations. Maximum allowed is 2.`);
+      }
+      for (const obs of entity.observations) {
+        if (obs.length > 140) {
+          throw new Error(`Observation in entity "${entity.name}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
         }
       }
-      
-      const now = Date.now();
-      const newEntities: Entity[] = [];
-      for (const e of entities) {
-        const existing = graph.entities.find(ex => ex.name === e.name);
-        if (existing) {
-          // Check for exact match — skip silently if identical
-          const sameType = existing.entityType === e.entityType;
-          const sameObs = existing.observations.length === e.observations.length &&
-            existing.observations.every((o, i) => o === e.observations[i]);
-          if (sameType && sameObs) continue; // exact match, skip
-          throw new Error(`Entity "${e.name}" already exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`);
-        }
-        const newEntity = { ...e, mtime: now, obsMtime: e.observations.length > 0 ? now : undefined };
-        graph.entities.push(newEntity);
-        newEntities.push(newEntity);
+    }
+
+    const now = BigInt(Date.now());
+    const newEntities: Entity[] = [];
+
+    for (const e of entities) {
+      const existingOffset = this.nameIndex.get(e.name);
+      if (existingOffset !== undefined) {
+        // Check for exact match — skip silently if identical
+        const existing = this.recordToEntity(this.gf.readEntity(existingOffset));
+        const sameType = existing.entityType === e.entityType;
+        const sameObs = existing.observations.length === e.observations.length &&
+          existing.observations.every((o, i) => o === e.observations[i]);
+        if (sameType && sameObs) continue; // exact match, skip
+        throw new Error(`Entity "${e.name}" already exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`);
       }
-      await this.saveGraph(graph);
-      return newEntities;
-    });
+
+      const obsMtime = e.observations.length > 0 ? now : 0n;
+      const rec = this.gf.createEntity(e.name, e.entityType, now, obsMtime);
+
+      // Add observations
+      for (const obs of e.observations) {
+        this.gf.addObservation(rec.offset, obs, now);
+      }
+
+      // Fix mtime back (addObservation clobbers it)
+      if (e.observations.length > 0) {
+        const updated = this.gf.readEntity(rec.offset);
+        updated.mtime = now;
+        updated.obsMtime = now;
+        this.gf.updateEntity(updated);
+      }
+
+      this.nameIndex.set(e.name, rec.offset);
+
+      const newEntity: Entity = {
+        ...e,
+        mtime: Number(now),
+        obsMtime: e.observations.length > 0 ? Number(now) : undefined,
+      };
+      newEntities.push(newEntity);
+    }
+
+    this.gf.sync();
+    return newEntities;
   }
 
   async createRelations(relations: Relation[]): Promise<Relation[]> {
-    return this.withLock(async () => {
-      const graph = await this.loadGraph();
-      const now = Date.now();
-      
-      // Update mtime on 'from' entities when relations are added
-      const fromEntityNames = new Set(relations.map(r => r.from));
-      graph.entities.forEach(e => {
-        if (fromEntityNames.has(e.name)) {
-          e.mtime = now;
-        }
-      });
-      
-      const newRelations = relations
-        .filter(r => !graph.relations.some(existingRelation => 
-          existingRelation.from === r.from && 
-          existingRelation.to === r.to && 
-          existingRelation.relationType === r.relationType
-        ))
-        .map(r => ({ ...r, mtime: now }));
-      graph.relations.push(...newRelations);
-      await this.saveGraph(graph);
-      return newRelations;
-    });
+    const now = BigInt(Date.now());
+    const newRelations: Relation[] = [];
+
+    // Collect 'from' entity offsets to update mtime
+    const fromOffsets = new Set<bigint>();
+
+    for (const r of relations) {
+      const fromOffset = this.nameIndex.get(r.from);
+      const toOffset = this.nameIndex.get(r.to);
+      if (fromOffset === undefined || toOffset === undefined) continue;
+
+      // Check for duplicate
+      const existingEdges = this.gf.getEdges(fromOffset);
+      const relTypeId = Number(this.st.find(r.relationType) ?? -1n);
+      const isDuplicate = existingEdges.some(e =>
+        e.direction === DIR_FORWARD &&
+        e.targetOffset === toOffset &&
+        e.relTypeId === relTypeId
+      );
+      if (isDuplicate) continue;
+
+      // Intern the relation type (needs refcount)
+      const rTypeId = Number(this.st.intern(r.relationType));
+
+      // Add forward edge on 'from' entity
+      const forwardEntry: AdjEntry = {
+        targetOffset: toOffset,
+        direction: DIR_FORWARD,
+        relTypeId: rTypeId,
+        mtime: now,
+      };
+      this.gf.addEdge(fromOffset, forwardEntry);
+
+      // Add backward edge on 'to' entity
+      // Intern again to bump refcount for the backward edge
+      const rTypeId2 = Number(this.st.intern(r.relationType));
+      const backwardEntry: AdjEntry = {
+        targetOffset: fromOffset,
+        direction: DIR_BACKWARD,
+        relTypeId: rTypeId2,
+        mtime: now,
+      };
+      this.gf.addEdge(toOffset, backwardEntry);
+
+      fromOffsets.add(fromOffset);
+      newRelations.push({ ...r, mtime: Number(now) });
+    }
+
+    // Update mtime on 'from' entities
+    for (const offset of fromOffsets) {
+      const rec = this.gf.readEntity(offset);
+      rec.mtime = now;
+      this.gf.updateEntity(rec);
+    }
+
+    this.gf.sync();
+    return newRelations;
   }
 
   async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
-    return this.withLock(async () => {
-      const graph = await this.loadGraph();
-      const results = observations.map(o => {
-        const entity = graph.entities.find(e => e.name === o.entityName);
-        if (!entity) {
-          throw new Error(`Entity with name ${o.entityName} not found`);
+    const results: { entityName: string; addedObservations: string[] }[] = [];
+
+    for (const o of observations) {
+      const offset = this.nameIndex.get(o.entityName);
+      if (offset === undefined) {
+        throw new Error(`Entity with name ${o.entityName} not found`);
+      }
+
+      // Validate observation character limits
+      for (const obs of o.contents) {
+        if (obs.length > 140) {
+          throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
         }
-        
-        // Validate observation character limits
-        for (const obs of o.contents) {
-          if (obs.length > 140) {
-            throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
-          }
-        }
-        
-        const newObservations = o.contents.filter(content => !entity.observations.includes(content));
-        
-        // Validate total observation count
-        if (entity.observations.length + newObservations.length > 2) {
-          throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${entity.observations.length}).`);
-        }
-        
-        entity.observations.push(...newObservations);
-        if (newObservations.length > 0) {
-          const now = Date.now();
-          entity.mtime = now;
-          entity.obsMtime = now;
-        }
-        return { entityName: o.entityName, addedObservations: newObservations };
-      });
-      await this.saveGraph(graph);
-      return results;
-    });
+      }
+
+      const rec = this.gf.readEntity(offset);
+      const existingObs: string[] = [];
+      if (rec.obs0Id !== 0) existingObs.push(this.st.get(BigInt(rec.obs0Id)));
+      if (rec.obs1Id !== 0) existingObs.push(this.st.get(BigInt(rec.obs1Id)));
+
+      const newObservations = o.contents.filter(content => !existingObs.includes(content));
+
+      // Validate total observation count
+      if (existingObs.length + newObservations.length > 2) {
+        throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${existingObs.length}).`);
+      }
+
+      const now = BigInt(Date.now());
+      for (const obs of newObservations) {
+        this.gf.addObservation(offset, obs, now);
+      }
+
+      results.push({ entityName: o.entityName, addedObservations: newObservations });
+    }
+
+    this.gf.sync();
+    return results;
   }
 
   async deleteEntities(entityNames: string[]): Promise<void> {
-    return this.withLock(async () => {
-      const graph = await this.loadGraph();
-      graph.entities = graph.entities.filter(e => !entityNames.includes(e.name));
-      graph.relations = graph.relations.filter(r => !entityNames.includes(r.from) && !entityNames.includes(r.to));
-      await this.saveGraph(graph);
-    });
+    for (const name of entityNames) {
+      const offset = this.nameIndex.get(name);
+      if (offset === undefined) continue;
+
+      // Remove all edges that reference this entity from OTHER entities' adj lists
+      const edges = this.gf.getEdges(offset);
+      for (const edge of edges) {
+        // Remove the reverse edge from the other entity
+        const reverseDir = edge.direction === DIR_FORWARD ? DIR_BACKWARD : DIR_FORWARD;
+        this.gf.removeEdge(edge.targetOffset, offset, edge.relTypeId, reverseDir);
+        // Release the relType string ref for the reverse edge
+        this.st.release(BigInt(edge.relTypeId));
+      }
+
+      this.gf.deleteEntity(offset);
+      this.nameIndex.delete(name);
+    }
+
+    this.gf.sync();
   }
 
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
-    return this.withLock(async () => {
-      const graph = await this.loadGraph();
-      const now = Date.now();
-      deletions.forEach(d => {
-        const entity = graph.entities.find(e => e.name === d.entityName);
-        if (entity) {
-          const originalLen = entity.observations.length;
-          entity.observations = entity.observations.filter(o => !d.observations.includes(o));
-          if (entity.observations.length !== originalLen) {
-            entity.mtime = now;
-            entity.obsMtime = now;
-          }
-        }
-      });
-      await this.saveGraph(graph);
-    });
+    const now = BigInt(Date.now());
+    for (const d of deletions) {
+      const offset = this.nameIndex.get(d.entityName);
+      if (offset === undefined) continue;
+
+      for (const obs of d.observations) {
+        this.gf.removeObservation(offset, obs, now);
+      }
+    }
+
+    this.gf.sync();
   }
 
   async deleteRelations(relations: Relation[]): Promise<void> {
-    return this.withLock(async () => {
-      const graph = await this.loadGraph();
-      graph.relations = graph.relations.filter(r => !relations.some(delRelation => 
-        r.from === delRelation.from && 
-        r.to === delRelation.to && 
-        r.relationType === delRelation.relationType
-      ));
-      await this.saveGraph(graph);
-    });
+    for (const r of relations) {
+      const fromOffset = this.nameIndex.get(r.from);
+      const toOffset = this.nameIndex.get(r.to);
+      if (fromOffset === undefined || toOffset === undefined) continue;
+
+      const relTypeId = this.st.find(r.relationType);
+      if (relTypeId === null) continue;
+
+      // Remove forward edge from 'from'
+      const removedForward = this.gf.removeEdge(fromOffset, toOffset, Number(relTypeId), DIR_FORWARD);
+      if (removedForward) this.st.release(relTypeId);
+
+      // Remove backward edge from 'to'
+      const removedBackward = this.gf.removeEdge(toOffset, fromOffset, Number(relTypeId), DIR_BACKWARD);
+      if (removedBackward) this.st.release(relTypeId);
+    }
+
+    this.gf.sync();
   }
 
   // Regex-based search function
   async searchNodes(query: string, sortBy?: EntitySortField, sortDir?: SortDirection, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
-    const graph = await this.loadGraph();
-    
     let regex: RegExp;
     try {
       regex = new RegExp(query, 'i'); // case-insensitive
     } catch (e) {
       throw new Error(`Invalid regex pattern: ${query}`);
     }
-    
+
+    const allEntities = this.getAllEntities();
+
     // Filter entities
-    const filteredEntities = graph.entities.filter(e => 
+    const filteredEntities = allEntities.filter(e =>
       regex.test(e.name) ||
       regex.test(e.entityType) ||
       e.observations.some(o => regex.test(o))
     );
-  
+
     // Create a Set of filtered entity names for quick lookup
     const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-  
-    // Filter relations based on direction
-    const filteredRelations = graph.relations.filter(r => {
+
+    // Get all relations and filter based on direction
+    const allRelations = this.getAllRelations();
+    const filteredRelations = allRelations.filter(r => {
       if (direction === 'forward') return filteredEntityNames.has(r.from);
       if (direction === 'backward') return filteredEntityNames.has(r.to);
       return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to); // 'any' = both endpoints in set
     });
-  
-    const filteredGraph: KnowledgeGraph = {
-      entities: sortEntities(filteredEntities, sortBy, sortDir),
+
+    const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+    return {
+      entities: sortEntities(filteredEntities, sortBy, sortDir, rankMaps),
       relations: filteredRelations,
     };
-  
-    return filteredGraph;
   }
 
   async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
-    const graph = await this.loadGraph();
-    
-    // Filter entities
-    const filteredEntities = graph.entities.filter(e => names.includes(e.name));
-  
-    // Create a Set of filtered entity names for quick lookup
+    const filteredEntities: Entity[] = [];
+    for (const name of names) {
+      const offset = this.nameIndex.get(name);
+      if (offset === undefined) continue;
+      filteredEntities.push(this.recordToEntity(this.gf.readEntity(offset)));
+    }
+
     const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-  
-    // Filter relations based on direction
-    const filteredRelations = graph.relations.filter(r => {
-      if (direction === 'forward') return filteredEntityNames.has(r.from);
-      if (direction === 'backward') return filteredEntityNames.has(r.to);
-      return filteredEntityNames.has(r.from) || filteredEntityNames.has(r.to); // 'any'
-    });
-  
-    const filteredGraph: KnowledgeGraph = {
-      entities: filteredEntities,
-      relations: filteredRelations,
-    };
-  
-    return filteredGraph;
+
+    // Collect relations from these entities
+    const filteredRelations: Relation[] = [];
+    for (const name of filteredEntityNames) {
+      const offset = this.nameIndex.get(name)!;
+      const edges = this.gf.getEdges(offset);
+      for (const edge of edges) {
+        if (edge.direction !== DIR_FORWARD && edge.direction !== DIR_BACKWARD) continue;
+
+        const targetRec = this.gf.readEntity(edge.targetOffset);
+        const targetName = this.st.get(BigInt(targetRec.nameId));
+        const relationType = this.st.get(BigInt(edge.relTypeId));
+        const mtime = Number(edge.mtime);
+
+        if (edge.direction === DIR_FORWARD) {
+          if (direction === 'backward') continue;
+          const r: Relation = { from: name, to: targetName, relationType };
+          if (mtime > 0) r.mtime = mtime;
+          filteredRelations.push(r);
+        } else {
+          // DIR_BACKWARD: this entity is 'to', target is 'from'
+          if (direction === 'forward') continue;
+          if (direction === 'any' && !filteredEntityNames.has(targetName)) continue;
+          const r: Relation = { from: targetName, to: name, relationType };
+          if (mtime > 0) r.mtime = mtime;
+          filteredRelations.push(r);
+        }
+      }
+    }
+
+    return { entities: filteredEntities, relations: filteredRelations };
   }
 
   async getNeighbors(
-    entityName: string, 
-    depth: number = 1, 
-    sortBy?: EntitySortField, 
+    entityName: string,
+    depth: number = 1,
+    sortBy?: EntitySortField,
     sortDir?: SortDirection,
     direction: 'forward' | 'backward' | 'any' = 'forward'
   ): Promise<Neighbor[]> {
-    const graph = await this.loadGraph();
+    const startOffset = this.nameIndex.get(entityName);
+    if (startOffset === undefined) return [];
+
     const visited = new Set<string>();
     const neighborNames = new Set<string>();
-    
+
     const traverse = (currentName: string, currentDepth: number) => {
       if (currentDepth > depth || visited.has(currentName)) return;
       visited.add(currentName);
-      
-      // Find relations based on direction
-      const connectedRelations = graph.relations.filter(r => {
-        if (direction === 'forward') return r.from === currentName;
-        if (direction === 'backward') return r.to === currentName;
-        return r.from === currentName || r.to === currentName; // 'any'
-      });
-      
-      // Collect neighbor names
-      connectedRelations.forEach(r => {
-        const neighborName = r.from === currentName ? r.to : r.from;
+
+      const offset = this.nameIndex.get(currentName);
+      if (offset === undefined) return;
+
+      const edges = this.gf.getEdges(offset);
+      for (const edge of edges) {
+        // Filter by direction
+        if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+        if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+
+        const targetRec = this.gf.readEntity(edge.targetOffset);
+        const neighborName = this.st.get(BigInt(targetRec.nameId));
         neighborNames.add(neighborName);
-      });
-      
-      if (currentDepth < depth) {
-        // Traverse to connected entities
-        connectedRelations.forEach(r => {
-          const nextEntity = r.from === currentName ? r.to : r.from;
-          traverse(nextEntity, currentDepth + 1);
-        });
+
+        if (currentDepth < depth) {
+          traverse(neighborName, currentDepth + 1);
+        }
       }
     };
-    
+
     traverse(entityName, 0);
-    
-    // Remove the starting entity from neighbors (it's not its own neighbor)
+
+    // Remove the starting entity from neighbors
     neighborNames.delete(entityName);
-    
+
     // Build neighbor objects with timestamps
-    const entityMap = new Map(graph.entities.map(e => [e.name, e]));
     const neighbors: Neighbor[] = Array.from(neighborNames).map(name => {
-      const entity = entityMap.get(name);
-      return {
-        name,
-        mtime: entity?.mtime,
-        obsMtime: entity?.obsMtime,
-      };
+      const offset = this.nameIndex.get(name);
+      if (!offset) return { name };
+      const rec = this.gf.readEntity(offset);
+      const mtime = Number(rec.mtime);
+      const obsMtime = Number(rec.obsMtime);
+      const n: Neighbor = { name };
+      if (mtime > 0) n.mtime = mtime;
+      if (obsMtime > 0) n.obsMtime = obsMtime;
+      return n;
     });
-    
-    return sortNeighbors(neighbors, sortBy, sortDir);
+
+    const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+    return sortNeighbors(neighbors, sortBy, sortDir, rankMaps);
   }
 
   async findPath(fromEntity: string, toEntity: string, maxDepth: number = 5, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<Relation[]> {
-    const graph = await this.loadGraph();
     const visited = new Set<string>();
-    
-    const dfs = (current: string, target: string, path: Relation[], depth: number): Relation[] | null => {
+
+    const dfs = (current: string, target: string, pathSoFar: Relation[], depth: number): Relation[] | null => {
       if (depth > maxDepth || visited.has(current)) return null;
-      if (current === target) return path;
-      
+      if (current === target) return pathSoFar;
+
       visited.add(current);
-      
-      const relations = graph.relations.filter(r => {
-        if (direction === 'forward') return r.from === current;
-        if (direction === 'backward') return r.to === current;
-        return r.from === current || r.to === current; // 'any'
-      });
-      for (const relation of relations) {
-        const next = relation.from === current ? relation.to : relation.from;
-        const result = dfs(next, target, [...path, relation], depth + 1);
+
+      const offset = this.nameIndex.get(current);
+      if (offset === undefined) { visited.delete(current); return null; }
+
+      const edges = this.gf.getEdges(offset);
+      for (const edge of edges) {
+        if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+        if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+
+        const targetRec = this.gf.readEntity(edge.targetOffset);
+        const nextName = this.st.get(BigInt(targetRec.nameId));
+        const relationType = this.st.get(BigInt(edge.relTypeId));
+        const mtime = Number(edge.mtime);
+
+        let rel: Relation;
+        if (edge.direction === DIR_FORWARD) {
+          rel = { from: current, to: nextName, relationType };
+        } else {
+          rel = { from: nextName, to: current, relationType };
+        }
+        if (mtime > 0) rel.mtime = mtime;
+
+        const result = dfs(nextName, target, [...pathSoFar, rel], depth + 1);
         if (result) return result;
       }
-      
+
       visited.delete(current);
       return null;
     };
-    
+
     return dfs(fromEntity, toEntity, [], 0) || [];
   }
 
   async getEntitiesByType(entityType: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
-    const graph = await this.loadGraph();
-    const filtered = graph.entities.filter(e => e.entityType === entityType);
-    return sortEntities(filtered, sortBy, sortDir);
+    const filtered = this.getAllEntities().filter(e => e.entityType === entityType);
+    const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+    return sortEntities(filtered, sortBy, sortDir, rankMaps);
   }
 
   async getEntityTypes(): Promise<string[]> {
-    const graph = await this.loadGraph();
-    const types = new Set(graph.entities.map(e => e.entityType));
+    const types = new Set(this.getAllEntities().map(e => e.entityType));
     return Array.from(types).sort();
   }
 
   async getRelationTypes(): Promise<string[]> {
-    const graph = await this.loadGraph();
-    const types = new Set(graph.relations.map(r => r.relationType));
+    const types = new Set(this.getAllRelations().map(r => r.relationType));
     return Array.from(types).sort();
   }
 
   async getStats(): Promise<{ entityCount: number; relationCount: number; entityTypes: number; relationTypes: number }> {
-    const graph = await this.loadGraph();
-    const entityTypes = new Set(graph.entities.map(e => e.entityType));
-    const relationTypes = new Set(graph.relations.map(r => r.relationType));
-    
+    const entities = this.getAllEntities();
+    const relations = this.getAllRelations();
+    const entityTypes = new Set(entities.map(e => e.entityType));
+    const relationTypes = new Set(relations.map(r => r.relationType));
+
     return {
-      entityCount: graph.entities.length,
-      relationCount: graph.relations.length,
+      entityCount: entities.length,
+      relationCount: relations.length,
       entityTypes: entityTypes.size,
-      relationTypes: relationTypes.size
+      relationTypes: relationTypes.size,
     };
   }
 
   async getOrphanedEntities(strict: boolean = false, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
-    const graph = await this.loadGraph();
-    
+    const entities = this.getAllEntities();
+
     if (!strict) {
       // Simple mode: entities with no relations at all
       const connectedEntityNames = new Set<string>();
-      graph.relations.forEach(r => {
+      const relations = this.getAllRelations();
+      relations.forEach(r => {
         connectedEntityNames.add(r.from);
         connectedEntityNames.add(r.to);
       });
-      const orphans = graph.entities.filter(e => !connectedEntityNames.has(e.name));
-      return sortEntities(orphans, sortBy, sortDir);
+      const orphans = entities.filter(e => !connectedEntityNames.has(e.name));
+      const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+      return sortEntities(orphans, sortBy, sortDir, rankMaps);
     }
-    
+
     // Strict mode: entities not connected to "Self" (directly or indirectly)
-    // Build adjacency list (bidirectional — reachability uses 'any' direction)
     const neighbors = new Map<string, Set<string>>();
-    graph.entities.forEach(e => neighbors.set(e.name, new Set()));
-    graph.relations.forEach(r => {
+    entities.forEach(e => neighbors.set(e.name, new Set()));
+    const relations = this.getAllRelations();
+    relations.forEach(r => {
       neighbors.get(r.from)?.add(r.to);
       neighbors.get(r.to)?.add(r.from);
     });
-    
-    // BFS from Self to find all connected entities
+
+    // BFS from Self
     const connectedToSelf = new Set<string>();
     const queue: string[] = ['Self'];
-    
+
     while (queue.length > 0) {
       const current = queue.shift()!;
       if (connectedToSelf.has(current)) continue;
       connectedToSelf.add(current);
-      
+
       const currentNeighbors = neighbors.get(current);
       if (currentNeighbors) {
         for (const neighbor of currentNeighbors) {
@@ -608,66 +835,54 @@ export class KnowledgeGraphManager {
         }
       }
     }
-    
-    // Return entities not connected to Self (excluding Self itself if it exists)
-    const orphans = graph.entities.filter(e => !connectedToSelf.has(e.name));
-    return sortEntities(orphans, sortBy, sortDir);
+
+    const orphans = entities.filter(e => !connectedToSelf.has(e.name));
+    const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+    return sortEntities(orphans, sortBy, sortDir, rankMaps);
   }
 
   async validateGraph(): Promise<{ missingEntities: string[]; observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] }> {
-    const graph = await this.loadGraph();
-    const entityNames = new Set(graph.entities.map(e => e.name));
+    const entities = this.getAllEntities();
+    const relations = this.getAllRelations();
+    const entityNames = new Set(entities.map(e => e.name));
     const missingEntities = new Set<string>();
     const observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] = [];
-    
+
     // Check for missing entities in relations
-    graph.relations.forEach(r => {
-      if (!entityNames.has(r.from)) {
-        missingEntities.add(r.from);
-      }
-      if (!entityNames.has(r.to)) {
-        missingEntities.add(r.to);
-      }
+    relations.forEach(r => {
+      if (!entityNames.has(r.from)) missingEntities.add(r.from);
+      if (!entityNames.has(r.to)) missingEntities.add(r.to);
     });
-    
+
     // Check for observation limit violations
-    graph.entities.forEach(e => {
+    entities.forEach(e => {
       const oversizedObservations: number[] = [];
       e.observations.forEach((obs, idx) => {
-        if (obs.length > 140) {
-          oversizedObservations.push(idx);
-        }
+        if (obs.length > 140) oversizedObservations.push(idx);
       });
-      
+
       if (e.observations.length > 2 || oversizedObservations.length > 0) {
         observationViolations.push({
           entity: e.name,
           count: e.observations.length,
-          oversizedObservations
+          oversizedObservations,
         });
       }
     });
-    
-    return {
-      missingEntities: Array.from(missingEntities),
-      observationViolations
-    };
+
+    return { missingEntities: Array.from(missingEntities), observationViolations };
   }
 
   async randomWalk(start: string, depth: number = 3, seed?: string, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<{ entity: string; path: string[] }> {
-    const graph = await this.loadGraph();
-    
-    // Verify start entity exists
-    const startEntity = graph.entities.find(e => e.name === start);
-    if (!startEntity) {
+    const startOffset = this.nameIndex.get(start);
+    if (!startOffset) {
       throw new Error(`Start entity not found: ${start}`);
     }
-    
-    // Create seeded RNG if seed provided, otherwise use crypto.randomBytes
+
+    // Create seeded RNG if seed provided
     let rngState = seed ? this.hashSeed(seed) : null;
     const random = (): number => {
       if (rngState !== null) {
-        // Simple seeded PRNG (xorshift32)
         rngState ^= rngState << 13;
         rngState ^= rngState >>> 17;
         rngState ^= rngState << 5;
@@ -676,59 +891,57 @@ export class KnowledgeGraphManager {
         return randomBytes(4).readUInt32BE() / 0xFFFFFFFF;
       }
     };
-    
-    const path: string[] = [start];
+
+    const pathNames: string[] = [start];
     let current = start;
-    
+
     for (let i = 0; i < depth; i++) {
-      // Get unique neighbors based on direction
-      const neighbors = new Set<string>();
-      for (const rel of graph.relations) {
-        if (direction === 'forward' || direction === 'any') {
-          if (rel.from === current && rel.to !== current) neighbors.add(rel.to);
-        }
-        if (direction === 'backward' || direction === 'any') {
-          if (rel.to === current && rel.from !== current) neighbors.add(rel.from);
-        }
+      const offset = this.nameIndex.get(current);
+      if (!offset) break;
+
+      const edges = this.gf.getEdges(offset);
+      const validNeighbors = new Set<string>();
+
+      for (const edge of edges) {
+        if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+        if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+
+        const targetRec = this.gf.readEntity(edge.targetOffset);
+        const neighborName = this.st.get(BigInt(targetRec.nameId));
+        if (neighborName !== current) validNeighbors.add(neighborName);
       }
-      
-      // Filter to only existing entities
-      const validNeighbors = Array.from(neighbors).filter(n => 
-        graph.entities.some(e => e.name === n)
-      );
-      
-      if (validNeighbors.length === 0) break; // Dead end
-      
-      // Pick random neighbor (uniform over entities)
-      const idx = Math.floor(random() * validNeighbors.length);
-      current = validNeighbors[idx];
-      path.push(current);
+
+      const neighborArr = Array.from(validNeighbors).filter(n => this.nameIndex.has(n));
+      if (neighborArr.length === 0) break;
+
+      const idx = Math.floor(random() * neighborArr.length);
+      current = neighborArr[idx];
+      pathNames.push(current);
     }
-    
-    return { entity: current, path };
+
+    return { entity: current, path: pathNames };
   }
-  
+
   private hashSeed(seed: string): number {
-    // Simple string hash to 32-bit integer
     let hash = 0;
     for (let i = 0; i < seed.length; i++) {
       const char = seed.charCodeAt(i);
       hash = ((hash << 5) - hash) + char;
-      hash = hash & hash; // Convert to 32-bit integer
+      hash = hash & hash;
     }
-    return hash || 1; // Ensure non-zero for xorshift
+    return hash || 1;
   }
-  
+
   decodeTimestamp(timestamp?: number, relative: boolean = false): { timestamp: number; iso8601: string; formatted: string; relative?: string } {
     const ts = timestamp ?? Date.now();
     const date = new Date(ts);
-    
+
     const result: { timestamp: number; iso8601: string; formatted: string; relative?: string } = {
       timestamp: ts,
       iso8601: date.toISOString(),
       formatted: date.toUTCString(),
     };
-    
+
     if (relative) {
       const now = Date.now();
       const diffMs = now - ts;
@@ -736,7 +949,7 @@ export class KnowledgeGraphManager {
       const diffMin = diffSec / 60;
       const diffHour = diffMin / 60;
       const diffDay = diffHour / 24;
-      
+
       let relStr: string;
       if (diffSec < 60) {
         relStr = `${Math.floor(diffSec)} seconds`;
@@ -751,58 +964,73 @@ export class KnowledgeGraphManager {
       } else {
         relStr = `${Math.floor(diffDay / 365)} years`;
       }
-      
+
       result.relative = diffMs >= 0 ? `${relStr} ago` : `in ${relStr}`;
     }
-    
+
     return result;
   }
 
   async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string }> {
-    return this.withLock(async () => {
-      const graph = await this.loadGraph();
-      
-      // Validate observations
-      if (observations.length > 2) {
-        throw new Error(`Thought has ${observations.length} observations. Maximum allowed is 2.`);
+    // Validate observations
+    if (observations.length > 2) {
+      throw new Error(`Thought has ${observations.length} observations. Maximum allowed is 2.`);
+    }
+    for (const obs of observations) {
+      if (obs.length > 140) {
+        throw new Error(`Observation exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
       }
-      for (const obs of observations) {
-        if (obs.length > 140) {
-          throw new Error(`Observation exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
-        }
+    }
+
+    const now = BigInt(Date.now());
+    const ctxId = randomBytes(12).toString('hex');
+
+    // Create thought entity
+    const obsMtime = observations.length > 0 ? now : 0n;
+    const rec = this.gf.createEntity(ctxId, 'Thought', now, obsMtime);
+    for (const obs of observations) {
+      this.gf.addObservation(rec.offset, obs, now);
+    }
+    // Fix mtime
+    if (observations.length > 0) {
+      const updated = this.gf.readEntity(rec.offset);
+      updated.mtime = now;
+      updated.obsMtime = now;
+      this.gf.updateEntity(updated);
+    }
+    this.nameIndex.set(ctxId, rec.offset);
+
+    // Link to previous thought if it exists
+    if (previousCtxId) {
+      const prevOffset = this.nameIndex.get(previousCtxId);
+      if (prevOffset !== undefined) {
+        // Update mtime on previous entity
+        const prevRec = this.gf.readEntity(prevOffset);
+        prevRec.mtime = now;
+        this.gf.updateEntity(prevRec);
+
+        // follows: previous -> new
+        const followsTypeId = Number(this.st.intern('follows'));
+        this.gf.addEdge(prevOffset, { targetOffset: rec.offset, direction: DIR_FORWARD, relTypeId: followsTypeId, mtime: now });
+        const followsTypeId2 = Number(this.st.intern('follows'));
+        this.gf.addEdge(rec.offset, { targetOffset: prevOffset, direction: DIR_BACKWARD, relTypeId: followsTypeId2, mtime: now });
+
+        // preceded_by: new -> previous
+        const precededByTypeId = Number(this.st.intern('preceded_by'));
+        this.gf.addEdge(rec.offset, { targetOffset: prevOffset, direction: DIR_FORWARD, relTypeId: precededByTypeId, mtime: now });
+        const precededByTypeId2 = Number(this.st.intern('preceded_by'));
+        this.gf.addEdge(prevOffset, { targetOffset: rec.offset, direction: DIR_BACKWARD, relTypeId: precededByTypeId2, mtime: now });
       }
-      
-      // Generate new context ID (24-char hex)
-      const now = Date.now();
-      const ctxId = randomBytes(12).toString('hex');
-      
-      // Create thought entity
-      const thoughtEntity: Entity = {
-        name: ctxId,
-        entityType: "Thought",
-        observations,
-        mtime: now,
-        obsMtime: observations.length > 0 ? now : undefined,
-      };
-      graph.entities.push(thoughtEntity);
-      
-      // Link to previous thought if it exists
-      if (previousCtxId) {
-        const prevEntity = graph.entities.find(e => e.name === previousCtxId);
-        if (prevEntity) {
-          // Update mtime on previous entity since we're adding a relation from it
-          prevEntity.mtime = now;
-          // Bidirectional chain: previous -> new (follows) and new -> previous (preceded_by)
-          graph.relations.push(
-            { from: previousCtxId, to: ctxId, relationType: "follows", mtime: now },
-            { from: ctxId, to: previousCtxId, relationType: "preceded_by", mtime: now }
-          );
-        }
-      }
-      
-      await this.saveGraph(graph);
-      return { ctxId };
-    });
+    }
+
+    this.gf.sync();
+    return { ctxId };
+  }
+
+  /** Close the underlying binary store files */
+  close(): void {
+    this.gf.close();
+    this.st.close();
   }
 }
 
@@ -821,12 +1049,17 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.11",
+    version: "0.0.12",
   }, {
     capabilities: {
       tools: {},
     },
   });
+
+  // Close binary store on server close
+  server.onclose = () => {
+    knowledgeGraphManager.close();
+  };
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -976,7 +1209,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             query: { type: "string", description: "Regex pattern to match against entity names, types, and observations." },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction filter for returned relations. Default: forward" },
-            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for entities. Omit for insertion order." },
+            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             entityCursor: { type: "number", description: "Cursor for entity pagination (from previous response's nextCursor)" },
             relationCursor: { type: "number", description: "Cursor for relation pagination" },
@@ -1011,7 +1244,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             entityName: { type: "string", description: "The name of the entity to find neighbors for" },
             depth: { type: "number", description: "Maximum depth to traverse (default: 1)", default: 1 },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
-            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for neighbors. Omit for arbitrary order." },
+            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for neighbors. Omit for arbitrary order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             cursor: { type: "number", description: "Cursor for pagination" },
           },
@@ -1040,7 +1273,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             entityType: { type: "string", description: "The type of entities to retrieve" },
-            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for entities. Omit for insertion order." },
+            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             cursor: { type: "number", description: "Cursor for pagination" },
           },
@@ -1078,7 +1311,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             strict: { type: "boolean", description: "If true, returns entities not connected to 'Self' (directly or indirectly). Default: false" },
-            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name"], description: "Sort field for entities. Omit for insertion order." },
+            sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
             cursor: { type: "number", description: "Cursor for pagination" },
           },
@@ -1151,31 +1384,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   switch (name) {
-    case "create_entities":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.createEntities(args.entities as Entity[]), null, 2) }] };
-    case "create_relations":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.createRelations(args.relations as Relation[]), null, 2) }] };
+    case "create_entities": {
+      const result = await knowledgeGraphManager.createEntities(args.entities as Entity[]);
+      knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+    case "create_relations": {
+      const result = await knowledgeGraphManager.createRelations(args.relations as Relation[]);
+      knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
     case "add_observations":
       return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[]), null, 2) }] };
     case "delete_entities":
       await knowledgeGraphManager.deleteEntities(args.entityNames as string[]);
+      knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
       return { content: [{ type: "text", text: "Entities deleted successfully" }] };
     case "delete_observations":
       await knowledgeGraphManager.deleteObservations(args.deletions as { entityName: string; observations: string[] }[]);
       return { content: [{ type: "text", text: "Observations deleted successfully" }] };
     case "delete_relations":
       await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
+      knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
     case "search_nodes": {
       const graph = await knowledgeGraphManager.searchNodes(args.query as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+      // Record walker visits for entities that will be returned to the LLM
+      knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
       return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
     }
     case "open_nodes": {
       const graph = await knowledgeGraphManager.openNodes(args.names as string[], (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+      // Record walker visits for opened nodes
+      knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
       return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
     }
     case "get_neighbors": {
       const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 1, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+      // Record walker visits for returned neighbors
+      knowledgeGraphManager.recordWalkerVisits(neighbors.map(n => n.name));
       return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
     }
     case "find_path": {

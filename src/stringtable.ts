@@ -244,6 +244,31 @@ export class StringTable {
   }
 
   /**
+   * Look up a string without interning or bumping refcount.
+   * Returns the ID (offset) if found, or null if not present.
+   */
+  find(str: string): bigint | null {
+    const data = Buffer.from(str, 'utf-8');
+    const hash = fnv1a(data);
+    const bucketCount = this.getBucketCount();
+    let bucket = hash % bucketCount;
+
+    for (let i = 0; i < bucketCount; i++) {
+      const slotIdx = (bucket + i) % bucketCount;
+      const entryOffset = this.getBucket(slotIdx);
+
+      if (entryOffset === 0n) return null; // Empty slot — not found
+
+      const entry = this.readEntry(entryOffset);
+      if (entry.hash === hash && entry.len === data.length && entry.data.equals(data)) {
+        return entryOffset;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Decrement refcount. If it reaches 0, free the entry and remove from hash index.
    */
   release(id: bigint): void {

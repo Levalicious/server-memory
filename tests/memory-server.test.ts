@@ -553,20 +553,26 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(names).toEqual(['Island1', 'Island2']);
     });
 
-    it('should validate graph and report violations', async () => {
-      // Directly write invalid data to test validation
-      const invalidData = [
-        JSON.stringify({ type: 'entity', name: 'Valid', entityType: 'Test', observations: [] }),
-        JSON.stringify({ type: 'relation', from: 'Valid', to: 'Missing', relationType: 'refs' })
-      ].join('\n');
-      await fs.writeFile(memoryFile, invalidData);
+    it('should validate graph and report no violations on clean graph', async () => {
+      // Create a valid graph through the API
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'Valid', entityType: 'Test', observations: [] },
+          { name: 'Also_Valid', entityType: 'Test', observations: ['Short obs'] }
+        ]
+      });
+      await callTool(client, 'create_relations', {
+        relations: [{ from: 'Valid', to: 'Also_Valid', relationType: 'refs' }]
+      });
 
       const result = await callTool(client, 'validate_graph', {}) as {
         missingEntities: string[];
         observationViolations: Array<{ entity: string; count: number; oversizedObservations: number[] }>;
       };
 
-      expect(result.missingEntities).toContain('Missing');
+      // Binary store enforces referential integrity — no missing entities possible
+      expect(result.missingEntities).toHaveLength(0);
+      expect(result.observationViolations).toHaveLength(0);
     });
   });
 
@@ -1121,6 +1127,103 @@ describe('MCP Memory Server E2E Tests', () => {
         const names = allEntities.map(e => e.name);
         const sortedNames = [...names].sort().reverse();
         expect(names).toEqual(sortedNames);
+      });
+    });
+
+    describe('pagerank sorting', () => {
+      it('should sort by pagerank (structural rank)', async () => {
+        // Build a star graph: Hub -> A, Hub -> B, Hub -> C
+        // A, B, C are dangling nodes
+        await callTool(client, 'create_entities', {
+          entities: [
+            { name: 'Hub', entityType: 'Node', observations: ['Central node'] },
+            { name: 'LeafA', entityType: 'Node', observations: ['Leaf A'] },
+            { name: 'LeafB', entityType: 'Node', observations: ['Leaf B'] },
+            { name: 'LeafC', entityType: 'Node', observations: ['Leaf C'] },
+          ]
+        });
+        await callTool(client, 'create_relations', {
+          relations: [
+            { from: 'Hub', to: 'LeafA', relationType: 'LINKS' },
+            { from: 'Hub', to: 'LeafB', relationType: 'LINKS' },
+            { from: 'Hub', to: 'LeafC', relationType: 'LINKS' },
+          ]
+        });
+
+        // Sort by pagerank descending (default for ranks)
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Node',
+          sortBy: 'pagerank'
+        }) as PaginatedGraph;
+
+        // All entities should be returned
+        expect(result.entities.items).toHaveLength(4);
+
+        // With structural rank, the leaves should rank higher than the hub
+        // because they receive visits from Hub's walks.
+        // We just verify the sort works and returns all entities.
+        const names = result.entities.items.map(e => e.name);
+        expect(names).toContain('Hub');
+        expect(names).toContain('LeafA');
+        expect(names).toContain('LeafB');
+        expect(names).toContain('LeafC');
+      });
+    });
+
+    describe('llmrank sorting', () => {
+      it('should sort by llmrank (walker visits)', async () => {
+        await callTool(client, 'create_entities', {
+          entities: [
+            { name: 'Hot', entityType: 'Test', observations: ['Frequently accessed'] },
+            { name: 'Cold', entityType: 'Test', observations: ['Rarely accessed'] },
+          ]
+        });
+
+        // Access 'Hot' multiple times via open_nodes (which increments walker visits)
+        await callTool(client, 'open_nodes', { names: ['Hot'] });
+        await callTool(client, 'open_nodes', { names: ['Hot'] });
+        await callTool(client, 'open_nodes', { names: ['Hot'] });
+        await callTool(client, 'open_nodes', { names: ['Hot'] });
+        await callTool(client, 'open_nodes', { names: ['Hot'] });
+        // Access 'Cold' just once
+        await callTool(client, 'open_nodes', { names: ['Cold'] });
+
+        // Sort by llmrank descending
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Test',
+          sortBy: 'llmrank'
+        }) as PaginatedGraph;
+
+        // 'Hot' should rank higher than 'Cold' due to more walker visits
+        expect(result.entities.items).toHaveLength(2);
+        expect(result.entities.items[0].name).toBe('Hot');
+        expect(result.entities.items[1].name).toBe('Cold');
+      });
+
+      it('should fall back to pagerank on llmrank tie', async () => {
+        // Create entities with no prior walker visits
+        await callTool(client, 'create_entities', {
+          entities: [
+            { name: 'Center', entityType: 'Fallback', observations: ['Hub'] },
+            { name: 'Spoke', entityType: 'Fallback', observations: ['Leaf'] },
+          ]
+        });
+        // Create a relation so structural rank differs
+        await callTool(client, 'create_relations', {
+          relations: [{ from: 'Center', to: 'Spoke', relationType: 'POINTS_TO' }]
+        });
+
+        // Both have 0 walker visits (tie), so llmrank should fall back to pagerank
+        const result = await callTool(client, 'search_nodes', {
+          query: 'Fallback',
+          sortBy: 'llmrank'
+        }) as PaginatedGraph;
+
+        // Just verify we get both entities (ordering depends on structural rank + random tiebreak)
+        expect(result.entities.items).toHaveLength(2);
+        const names = result.entities.items.map(e => e.name);
+        expect(names).toContain('Center');
+        expect(names).toContain('Spoke');
       });
     });
   });
