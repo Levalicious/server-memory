@@ -25,7 +25,7 @@ jobs:
         id: check-tests
         continue-on-error: true
         run: |
-          found_tests="$(jq '.scripts? | has("test")')"
+          found_tests=$(jq '.scripts? | has("test")' package.json)
           echo "has-tests=$found_tests" >> $GITHUB_OUTPUT
       - name: Run tests
         if: steps.check-tests.outputs.has-tests == 'true'
