@@ -776,13 +776,17 @@ describe('MCP Memory Server E2E Tests', () => {
         ]);
       });
 
-      it('should preserve insertion order when sortBy is omitted', async () => {
+      it('should use llmrank as default sort when sortBy is omitted', async () => {
         const result = await callTool(client, 'search_nodes', {
           query: 'Letter'
         }) as PaginatedGraph;
 
+        // With llmrank default, all entities returned (order varies due to random tiebreak)
         const names = result.entities.items.map(e => e.name);
-        expect(names).toEqual(['Alpha', 'Beta', 'Gamma']);
+        expect(names).toHaveLength(3);
+        expect(names).toContain('Alpha');
+        expect(names).toContain('Beta');
+        expect(names).toContain('Gamma');
       });
 
       it('should sort by name ascending', async () => {
@@ -859,13 +863,17 @@ describe('MCP Memory Server E2E Tests', () => {
         ]);
       });
 
-      it('should preserve insertion order when sortBy is omitted', async () => {
+      it('should use llmrank as default sort when sortBy is omitted', async () => {
         const result = await callTool(client, 'get_entities_by_type', {
           entityType: 'Animal'
         }) as PaginatedResult<Entity>;
 
+        // With llmrank default, all entities returned (order varies due to random tiebreak)
         const names = result.items.map(e => e.name);
-        expect(names).toEqual(['Zebra', 'Aardvark', 'Monkey']);
+        expect(names).toHaveLength(3);
+        expect(names).toContain('Zebra');
+        expect(names).toContain('Aardvark');
+        expect(names).toContain('Monkey');
       });
 
       it('should sort by name ascending (default for name)', async () => {
@@ -923,11 +931,15 @@ describe('MCP Memory Server E2E Tests', () => {
         ]);
       });
 
-      it('should preserve insertion order when sortBy is omitted', async () => {
+      it('should use llmrank as default sort when sortBy is omitted', async () => {
         const result = await callTool(client, 'get_orphaned_entities', {}) as PaginatedResult<Entity>;
 
+        // With llmrank default, all entities returned (order varies due to random tiebreak)
         const names = result.items.map(e => e.name);
-        expect(names).toEqual(['Orphan_Z', 'Orphan_A', 'Orphan_M']);
+        expect(names).toHaveLength(3);
+        expect(names).toContain('Orphan_Z');
+        expect(names).toContain('Orphan_A');
+        expect(names).toContain('Orphan_M');
       });
 
       it('should sort by name ascending', async () => {
@@ -1002,13 +1014,13 @@ describe('MCP Memory Server E2E Tests', () => {
         });
       });
 
-      it('should return unsorted neighbors when sortBy is omitted', async () => {
+      it('should use llmrank as default sort when sortBy is omitted', async () => {
         const result = await callTool(client, 'get_neighbors', {
           entityName: 'Hub'
         }) as PaginatedResult<Neighbor>;
 
+        // With llmrank default, all neighbors returned (order varies due to random tiebreak)
         expect(result.items).toHaveLength(3);
-        // Just verify all neighbors are present
         const names = result.items.map(n => n.name);
         expect(names).toContain('Neighbor_Z');
         expect(names).toContain('Neighbor_A');

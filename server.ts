@@ -62,7 +62,7 @@ export interface Neighbor {
 /**
  * Sort entities by the specified field and direction.
  * Returns a new array (does not mutate input).
- * If sortBy is undefined, returns the original array (no sorting - preserves insertion order).
+ * Defaults to 'llmrank' when sortBy is undefined.
  *
  * For 'pagerank' sort: uses structural rank (desc by default).
  * For 'llmrank' sort: uses walker rank, falls back to structural rank on tie, then random.
@@ -70,12 +70,10 @@ export interface Neighbor {
  */
 function sortEntities(
   entities: Entity[],
-  sortBy?: EntitySortField,
+  sortBy: EntitySortField = "llmrank",
   sortDir?: SortDirection,
   rankMaps?: { structural: Map<string, number>; walker: Map<string, number> }
 ): Entity[] {
-  if (!sortBy) return entities; // No sorting - preserve current behavior
-
   const dir = sortDir ?? (sortBy === "name" ? "asc" : "desc");
   const mult = dir === "asc" ? 1 : -1;
 
@@ -113,16 +111,14 @@ function sortEntities(
 
 /**
  * Sort neighbors by the specified field and direction.
- * If sortBy is undefined, returns the original array (no sorting).
+ * Defaults to 'llmrank' when sortBy is undefined.
  */
 function sortNeighbors(
   neighbors: Neighbor[],
-  sortBy?: EntitySortField,
+  sortBy: EntitySortField = "llmrank",
   sortDir?: SortDirection,
   rankMaps?: { structural: Map<string, number>; walker: Map<string, number> }
 ): Neighbor[] {
-  if (!sortBy) return neighbors;
-
   const dir = sortDir ?? (sortBy === "name" ? "asc" : "desc");
   const mult = dir === "asc" ? 1 : -1;
 
@@ -614,7 +610,7 @@ export class KnowledgeGraphManager {
       return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to); // 'any' = both endpoints in set
     });
 
-    const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+    const rankMaps = this.getRankMaps();
     return {
       entities: sortEntities(filteredEntities, sortBy, sortDir, rankMaps),
       relations: filteredRelations,
@@ -717,7 +713,7 @@ export class KnowledgeGraphManager {
       return n;
     });
 
-    const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+    const rankMaps = this.getRankMaps();
     return sortNeighbors(neighbors, sortBy, sortDir, rankMaps);
   }
 
@@ -764,7 +760,7 @@ export class KnowledgeGraphManager {
 
   async getEntitiesByType(entityType: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
     const filtered = this.getAllEntities().filter(e => e.entityType === entityType);
-    const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+    const rankMaps = this.getRankMaps();
     return sortEntities(filtered, sortBy, sortDir, rankMaps);
   }
 
@@ -804,7 +800,7 @@ export class KnowledgeGraphManager {
         connectedEntityNames.add(r.to);
       });
       const orphans = entities.filter(e => !connectedEntityNames.has(e.name));
-      const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+      const rankMaps = this.getRankMaps();
       return sortEntities(orphans, sortBy, sortDir, rankMaps);
     }
 
@@ -837,7 +833,7 @@ export class KnowledgeGraphManager {
     }
 
     const orphans = entities.filter(e => !connectedToSelf.has(e.name));
-    const rankMaps = (sortBy === 'pagerank' || sortBy === 'llmrank') ? this.getRankMaps() : undefined;
+    const rankMaps = this.getRankMaps();
     return sortEntities(orphans, sortBy, sortDir, rankMaps);
   }
 
