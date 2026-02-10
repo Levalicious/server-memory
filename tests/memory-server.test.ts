@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
-import { createServer, Entity, Relation, KnowledgeGraph, Neighbor } from '../server.js';
-import { createTestClient, callTool, PaginatedGraph, PaginatedResult } from './test-utils.js';
+import { createServer, type Entity, type Relation, type Neighbor } from '../server.js';
+import { createTestClient, callTool, type PaginatedGraph, type PaginatedResult } from './test-utils.js';
 
 describe('MCP Memory Server E2E Tests', () => {
   let testDir: string;

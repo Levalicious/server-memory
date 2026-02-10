@@ -18,7 +18,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import { StringTable } from '../src/stringtable.js';
-import { GraphFile, DIR_FORWARD, DIR_BACKWARD, AdjEntry } from '../src/graphfile.js';
+import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type AdjEntry } from '../src/graphfile.js';
 
 interface JsonlEntity {
   type: 'entity';

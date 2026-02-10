@@ -5,10 +5,9 @@
  * one instance writes and the other reads.
  */
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createServer, Entity, Relation } from "../server.js";
-import { createTestClient, callTool, PaginatedResult, PaginatedGraph } from "./test-utils.js";
+import { type Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { createServer, type Entity } from "../server.js";
+import { createTestClient, callTool, type PaginatedResult, type PaginatedGraph } from "./test-utils.js";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";

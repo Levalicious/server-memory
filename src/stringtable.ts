@@ -49,7 +49,7 @@ const ENT_DATA = 10;      // u8[len]
 const ENT_HEADER_SIZE = 10;
 
 // Hash index field offsets (relative to index block start)
-const IDX_BUCKET_COUNT = 0;  // u32
+const _IDX_BUCKET_COUNT = 0;  // u32
 const IDX_BUCKETS = 8;       // u64[bucket_count]
 
 const INITIAL_BUCKETS = 4096;
@@ -186,7 +186,7 @@ export class StringTable {
     const data = Buffer.from(str, 'utf-8');
     const hash = fnv1a(data);
     const bucketCount = this.getBucketCount();
-    let bucket = hash % bucketCount;
+    const bucket = hash % bucketCount;
 
     // Linear probe to find existing or empty slot
     for (let i = 0; i < bucketCount; i++) {
@@ -251,7 +251,7 @@ export class StringTable {
     const data = Buffer.from(str, 'utf-8');
     const hash = fnv1a(data);
     const bucketCount = this.getBucketCount();
-    let bucket = hash % bucketCount;
+    const bucket = hash % bucketCount;
 
     for (let i = 0; i < bucketCount; i++) {
       const slotIdx = (bucket + i) % bucketCount;
@@ -311,7 +311,7 @@ export class StringTable {
 
   private removeFromIndex(offset: bigint, hash: number): void {
     const bucketCount = this.getBucketCount();
-    let bucket = hash % bucketCount;
+    const bucket = hash % bucketCount;
 
     // Find the entry in the index
     for (let i = 0; i < bucketCount; i++) {
@@ -354,7 +354,7 @@ export class StringTable {
     }
   }
 
-  private needsRelocation(natural: number, empty: number, current: number, size: number): boolean {
+  private needsRelocation(natural: number, empty: number, current: number, _size: number): boolean {
     // Is 'empty' between 'natural' and 'current' in the circular probe sequence?
     if (natural <= current) {
       return natural <= empty && empty < current;
@@ -396,7 +396,7 @@ export class StringTable {
 
       // Read hash and insert into new index
       const entry = this.readEntry(entryOffset);
-      let bucket = entry.hash % newBucketCount;
+      const bucket = entry.hash % newBucketCount;
       for (let j = 0; j < newBucketCount; j++) {
         const slotIdx = (bucket + j) % newBucketCount;
         const slotPos = newIndexOffset + BigInt(IDX_BUCKETS + slotIdx * 8);
