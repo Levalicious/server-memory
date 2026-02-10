@@ -46,7 +46,7 @@
  */
 
 import { MemoryFile } from './memoryfile.js';
-import { StringTable } from './stringtable.js';
+import { type StringTable } from './stringtable.js';
 
 // --- Constants ---
 

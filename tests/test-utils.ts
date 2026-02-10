@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { type Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { Entity, Relation, MAX_CHARS } from "../server.js";
+import { type Entity, type Relation, MAX_CHARS } from "../server.js";
 
 export { MAX_CHARS };
 

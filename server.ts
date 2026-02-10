@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -10,10 +9,10 @@ import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GraphFile, DIR_FORWARD, DIR_BACKWARD, EntityRecord, AdjEntry } from './src/graphfile.js';
+import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type EntityRecord, type AdjEntry } from './src/graphfile.js';
 import { StringTable } from './src/stringtable.js';
 import { structuralSample } from './src/pagerank.js';
-import { validateExtension, loadDocument, KbLoadResult } from './src/kb_load.js';
+import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
 
 // Define memory file path using environment variable with fallback
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
@@ -160,7 +159,7 @@ function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX
   
   // Calculate overhead for wrapper: {"items":[],"nextCursor":null,"totalCount":123}
   const wrapperTemplate = { items: [] as T[], nextCursor: null as number | null, totalCount: items.length };
-  let overhead = JSON.stringify(wrapperTemplate).length;
+  const overhead = JSON.stringify(wrapperTemplate).length;
   let charCount = overhead;
   
   while (i < items.length) {
@@ -645,7 +644,7 @@ export class KnowledgeGraphManager {
     let regex: RegExp;
     try {
       regex = new RegExp(query, 'i');
-    } catch (e) {
+    } catch {
       throw new Error(`Invalid regex pattern: ${query}`);
     }
 
@@ -731,7 +730,7 @@ export class KnowledgeGraphManager {
       const visited = new Set<string>();
       const neighborNames = new Set<string>();
 
-      const traverse = (currentName: string, currentDepth: number) => {
+      const traverse = (currentName: string, currentDepth: number): void => {
         if (currentDepth > depth || visited.has(currentName)) return;
         visited.add(currentName);
 
@@ -1550,8 +1549,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let text: string;
       try {
         text = fs.readFileSync(filePath, 'utf-8');
-      } catch (err: any) {
-        throw new Error(`Failed to read file: ${err.message}`);
+      } catch (err: unknown) {
+        throw new Error(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
       }
 
       // Derive title

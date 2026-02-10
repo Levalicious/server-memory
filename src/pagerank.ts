@@ -17,7 +17,7 @@
  * (14K starts × ~6.67 avg walk length) and gives <7% error for top pages.
  */
 
-import { GraphFile, DIR_FORWARD } from './graphfile.js';
+import { type GraphFile, DIR_FORWARD } from './graphfile.js';
 
 const DEFAULT_DAMPING = 0.85;
 
