@@ -161,7 +161,7 @@ function chunkObservations(observations: Observation[]): Chunk[] {
 // ─── Accessors ──────────────────────────────────────────────────────
 
 /** Get all words across a chunk's observations. */
-function chunkWords(chunk: Chunk): Word[] {
+function _chunkWords(chunk: Chunk): Word[] {
   const words: Word[] = [];
   for (const obs of chunk.observations) {
     words.push(...obs.words);
@@ -170,7 +170,7 @@ function chunkWords(chunk: Chunk): Word[] {
 }
 
 /** Get the full text of a chunk (all observations joined). */
-function chunkText(chunk: Chunk): string {
+function _chunkText(chunk: Chunk): string {
   return chunk.observations.map(o => o.text).join(' ');
 }
 
@@ -639,10 +639,10 @@ function buildIndex(
 
 function main() {
   const args = process.argv.slice(2);
-  let verbose = false;
+  let _verbose = false;
   const filtered: string[] = [];
   for (const arg of args) {
-    if (arg === '-v' || arg === '--verbose') verbose = true;
+    if (arg === '-v' || arg === '--verbose') _verbose = true;
     else filtered.push(arg);
   }
 

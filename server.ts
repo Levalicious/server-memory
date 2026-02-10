@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type EntityRecord, type AdjEntry } from './src/graphfile.js';
 import { StringTable } from './src/stringtable.js';
 import { structuralSample } from './src/pagerank.js';
-import { validateExtension, loadDocument, KbLoadResult } from './src/kb_load.js';
+import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
 
 // Define memory file path using environment variable with fallback
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
@@ -1549,8 +1549,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let text: string;
       try {
         text = fs.readFileSync(filePath, 'utf-8');
-      } catch (err: any) {
-        throw new Error(`Failed to read file: ${err.message}`);
+      } catch (err: unknown) {
+        throw new Error(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
       }
 
       // Derive title

@@ -13,9 +13,8 @@
  */
 
 import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as path from 'path';
-import { StringTable } from './stringtable.js';
+import { type StringTable } from './stringtable.js';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -175,18 +174,6 @@ function chunkObservations(observations: Observation[]): Chunk[] {
     });
   }
   return chunks;
-}
-
-function chunkText(chunk: Chunk): string {
-  return chunk.observations.map(o => o.text).join(' ');
-}
-
-function chunkWordKeys(chunk: Chunk): Set<string> {
-  const keys = new Set<string>();
-  for (const obs of chunk.observations) {
-    for (const w of obs.words) keys.add(w.normalized);
-  }
-  return keys;
 }
 
 // ─── Sentence Splitting ─────────────────────────────────────────────
