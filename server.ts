@@ -251,6 +251,8 @@ export class KnowledgeGraphManager {
   private st: StringTable;
   /** In-memory name→offset index, rebuilt from node log on open */
   private nameIndex: Map<string, bigint>;
+  /** Generation counter from last rebuildNameIndex — avoids redundant rebuilds */
+  private cachedEntityCount: number = -1;
 
   constructor(memoryFilePath: string = DEFAULT_MEMORY_FILE_PATH) {
     // Derive binary file paths from the base path
@@ -267,6 +269,47 @@ export class KnowledgeGraphManager {
     // Run initial structural sampling if graph is non-empty
     if (this.nameIndex.size > 0) {
       structuralSample(this.gf, 1, 0.85);
+      this.gf.sync();
+    }
+  }
+
+  // --- Locking helpers ---
+
+  /**
+   * Acquire a shared (read) lock, refresh mappings (in case another process
+   * grew the files), rebuild the name index if the entity count changed,
+   * run the callback, then release the lock.
+   */
+  private withReadLock<T>(fn: () => T): T {
+    this.gf.lockShared();
+    try {
+      this.gf.refresh();
+      this.st.refresh();
+      this.maybeRebuildNameIndex();
+      return fn();
+    } finally {
+      this.gf.unlock();
+    }
+  }
+
+  /**
+   * Acquire an exclusive (write) lock, refresh mappings, rebuild name index,
+   * run the callback, sync both files, then release the lock.
+   */
+  private withWriteLock<T>(fn: () => T): T {
+    this.gf.lockExclusive();
+    try {
+      this.gf.refresh();
+      this.st.refresh();
+      this.maybeRebuildNameIndex();
+      const result = fn();
+      this.gf.sync();
+      this.st.sync();
+      // Update cached count after write
+      this.cachedEntityCount = this.gf.getEntityCount();
+      return result;
+    } finally {
+      this.gf.unlock();
     }
   }
 
@@ -279,10 +322,23 @@ export class KnowledgeGraphManager {
       const name = this.st.get(BigInt(rec.nameId));
       this.nameIndex.set(name, offset);
     }
+    this.cachedEntityCount = this.gf.getEntityCount();
   }
 
-  /** Build rank maps from the binary store for pagerank/llmrank sorting */
-  getRankMaps(): { structural: Map<string, number>; walker: Map<string, number> } {
+  /**
+   * Rebuild nameIndex only if the entity count changed (another process wrote).
+   * This is cheap to check (single u32 read) and avoids a full scan on every lock.
+   */
+  private maybeRebuildNameIndex(): void {
+    const currentCount = this.gf.getEntityCount();
+    if (currentCount !== this.cachedEntityCount) {
+      this.rebuildNameIndex();
+    }
+  }
+
+  /** Build rank maps from the binary store for pagerank/llmrank sorting.
+   *  NOTE: Must be called inside a lock (read or write). */
+  private getRankMapsUnlocked(): { structural: Map<string, number>; walker: Map<string, number> } {
     const structural = new Map<string, number>();
     const walker = new Map<string, number>();
     const structTotal = this.gf.getStructuralTotal();
@@ -297,21 +353,30 @@ export class KnowledgeGraphManager {
     return { structural, walker };
   }
 
+  /** Build rank maps (acquires read lock). */
+  getRankMaps(): { structural: Map<string, number>; walker: Map<string, number> } {
+    return this.withReadLock(() => this.getRankMapsUnlocked());
+  }
+
   /** Increment walker visit count for a list of entity names */
   recordWalkerVisits(names: string[]): void {
-    for (const name of names) {
-      const offset = this.nameIndex.get(name);
-      if (offset !== undefined) {
-        this.gf.incrementWalkerVisit(offset);
+    this.withWriteLock(() => {
+      for (const name of names) {
+        const offset = this.nameIndex.get(name);
+        if (offset !== undefined) {
+          this.gf.incrementWalkerVisit(offset);
+        }
       }
-    }
+    });
   }
 
   /** Re-run structural sampling (call after graph mutations) */
   resample(): void {
-    if (this.nameIndex.size > 0) {
-      structuralSample(this.gf, 1, 0.85);
-    }
+    this.withWriteLock(() => {
+      if (this.nameIndex.size > 0) {
+        structuralSample(this.gf, 1, 0.85);
+      }
+    });
   }
 
   /** Convert an EntityRecord to the public Entity interface */
@@ -367,7 +432,7 @@ export class KnowledgeGraphManager {
   }
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
-    // Validate observation limits
+    // Validate observation limits (can do outside lock)
     for (const entity of entities) {
       if (entity.observations.length > 2) {
         throw new Error(`Entity "${entity.name}" has ${entity.observations.length} observations. Maximum allowed is 2.`);
@@ -379,284 +444,267 @@ export class KnowledgeGraphManager {
       }
     }
 
-    const now = BigInt(Date.now());
-    const newEntities: Entity[] = [];
+    return this.withWriteLock(() => {
+      const now = BigInt(Date.now());
+      const newEntities: Entity[] = [];
 
-    for (const e of entities) {
-      const existingOffset = this.nameIndex.get(e.name);
-      if (existingOffset !== undefined) {
-        // Check for exact match — skip silently if identical
-        const existing = this.recordToEntity(this.gf.readEntity(existingOffset));
-        const sameType = existing.entityType === e.entityType;
-        const sameObs = existing.observations.length === e.observations.length &&
-          existing.observations.every((o, i) => o === e.observations[i]);
-        if (sameType && sameObs) continue; // exact match, skip
-        throw new Error(`Entity "${e.name}" already exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`);
+      for (const e of entities) {
+        const existingOffset = this.nameIndex.get(e.name);
+        if (existingOffset !== undefined) {
+          const existing = this.recordToEntity(this.gf.readEntity(existingOffset));
+          const sameType = existing.entityType === e.entityType;
+          const sameObs = existing.observations.length === e.observations.length &&
+            existing.observations.every((o, i) => o === e.observations[i]);
+          if (sameType && sameObs) continue;
+          throw new Error(`Entity "${e.name}" already exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`);
+        }
+
+        const obsMtime = e.observations.length > 0 ? now : 0n;
+        const rec = this.gf.createEntity(e.name, e.entityType, now, obsMtime);
+
+        for (const obs of e.observations) {
+          this.gf.addObservation(rec.offset, obs, now);
+        }
+
+        if (e.observations.length > 0) {
+          const updated = this.gf.readEntity(rec.offset);
+          updated.mtime = now;
+          updated.obsMtime = now;
+          this.gf.updateEntity(updated);
+        }
+
+        this.nameIndex.set(e.name, rec.offset);
+
+        const newEntity: Entity = {
+          ...e,
+          mtime: Number(now),
+          obsMtime: e.observations.length > 0 ? Number(now) : undefined,
+        };
+        newEntities.push(newEntity);
       }
 
-      const obsMtime = e.observations.length > 0 ? now : 0n;
-      const rec = this.gf.createEntity(e.name, e.entityType, now, obsMtime);
-
-      // Add observations
-      for (const obs of e.observations) {
-        this.gf.addObservation(rec.offset, obs, now);
-      }
-
-      // Fix mtime back (addObservation clobbers it)
-      if (e.observations.length > 0) {
-        const updated = this.gf.readEntity(rec.offset);
-        updated.mtime = now;
-        updated.obsMtime = now;
-        this.gf.updateEntity(updated);
-      }
-
-      this.nameIndex.set(e.name, rec.offset);
-
-      const newEntity: Entity = {
-        ...e,
-        mtime: Number(now),
-        obsMtime: e.observations.length > 0 ? Number(now) : undefined,
-      };
-      newEntities.push(newEntity);
-    }
-
-    this.gf.sync();
-    return newEntities;
+      return newEntities;
+    });
   }
 
   async createRelations(relations: Relation[]): Promise<Relation[]> {
-    const now = BigInt(Date.now());
-    const newRelations: Relation[] = [];
+    return this.withWriteLock(() => {
+      const now = BigInt(Date.now());
+      const newRelations: Relation[] = [];
+      const fromOffsets = new Set<bigint>();
 
-    // Collect 'from' entity offsets to update mtime
-    const fromOffsets = new Set<bigint>();
+      for (const r of relations) {
+        const fromOffset = this.nameIndex.get(r.from);
+        const toOffset = this.nameIndex.get(r.to);
+        if (fromOffset === undefined || toOffset === undefined) continue;
 
-    for (const r of relations) {
-      const fromOffset = this.nameIndex.get(r.from);
-      const toOffset = this.nameIndex.get(r.to);
-      if (fromOffset === undefined || toOffset === undefined) continue;
+        const existingEdges = this.gf.getEdges(fromOffset);
+        const relTypeId = Number(this.st.find(r.relationType) ?? -1n);
+        const isDuplicate = existingEdges.some(e =>
+          e.direction === DIR_FORWARD &&
+          e.targetOffset === toOffset &&
+          e.relTypeId === relTypeId
+        );
+        if (isDuplicate) continue;
 
-      // Check for duplicate
-      const existingEdges = this.gf.getEdges(fromOffset);
-      const relTypeId = Number(this.st.find(r.relationType) ?? -1n);
-      const isDuplicate = existingEdges.some(e =>
-        e.direction === DIR_FORWARD &&
-        e.targetOffset === toOffset &&
-        e.relTypeId === relTypeId
-      );
-      if (isDuplicate) continue;
+        const rTypeId = Number(this.st.intern(r.relationType));
+        const forwardEntry: AdjEntry = {
+          targetOffset: toOffset,
+          direction: DIR_FORWARD,
+          relTypeId: rTypeId,
+          mtime: now,
+        };
+        this.gf.addEdge(fromOffset, forwardEntry);
 
-      // Intern the relation type (needs refcount)
-      const rTypeId = Number(this.st.intern(r.relationType));
+        const rTypeId2 = Number(this.st.intern(r.relationType));
+        const backwardEntry: AdjEntry = {
+          targetOffset: fromOffset,
+          direction: DIR_BACKWARD,
+          relTypeId: rTypeId2,
+          mtime: now,
+        };
+        this.gf.addEdge(toOffset, backwardEntry);
 
-      // Add forward edge on 'from' entity
-      const forwardEntry: AdjEntry = {
-        targetOffset: toOffset,
-        direction: DIR_FORWARD,
-        relTypeId: rTypeId,
-        mtime: now,
-      };
-      this.gf.addEdge(fromOffset, forwardEntry);
+        fromOffsets.add(fromOffset);
+        newRelations.push({ ...r, mtime: Number(now) });
+      }
 
-      // Add backward edge on 'to' entity
-      // Intern again to bump refcount for the backward edge
-      const rTypeId2 = Number(this.st.intern(r.relationType));
-      const backwardEntry: AdjEntry = {
-        targetOffset: fromOffset,
-        direction: DIR_BACKWARD,
-        relTypeId: rTypeId2,
-        mtime: now,
-      };
-      this.gf.addEdge(toOffset, backwardEntry);
+      for (const offset of fromOffsets) {
+        const rec = this.gf.readEntity(offset);
+        rec.mtime = now;
+        this.gf.updateEntity(rec);
+      }
 
-      fromOffsets.add(fromOffset);
-      newRelations.push({ ...r, mtime: Number(now) });
-    }
-
-    // Update mtime on 'from' entities
-    for (const offset of fromOffsets) {
-      const rec = this.gf.readEntity(offset);
-      rec.mtime = now;
-      this.gf.updateEntity(rec);
-    }
-
-    this.gf.sync();
-    return newRelations;
+      return newRelations;
+    });
   }
 
   async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
-    const results: { entityName: string; addedObservations: string[] }[] = [];
+    return this.withWriteLock(() => {
+      const results: { entityName: string; addedObservations: string[] }[] = [];
 
-    for (const o of observations) {
-      const offset = this.nameIndex.get(o.entityName);
-      if (offset === undefined) {
-        throw new Error(`Entity with name ${o.entityName} not found`);
-      }
-
-      // Validate observation character limits
-      for (const obs of o.contents) {
-        if (obs.length > 140) {
-          throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+      for (const o of observations) {
+        const offset = this.nameIndex.get(o.entityName);
+        if (offset === undefined) {
+          throw new Error(`Entity with name ${o.entityName} not found`);
         }
+
+        for (const obs of o.contents) {
+          if (obs.length > 140) {
+            throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+          }
+        }
+
+        const rec = this.gf.readEntity(offset);
+        const existingObs: string[] = [];
+        if (rec.obs0Id !== 0) existingObs.push(this.st.get(BigInt(rec.obs0Id)));
+        if (rec.obs1Id !== 0) existingObs.push(this.st.get(BigInt(rec.obs1Id)));
+
+        const newObservations = o.contents.filter(content => !existingObs.includes(content));
+
+        if (existingObs.length + newObservations.length > 2) {
+          throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${existingObs.length}).`);
+        }
+
+        const now = BigInt(Date.now());
+        for (const obs of newObservations) {
+          this.gf.addObservation(offset, obs, now);
+        }
+
+        results.push({ entityName: o.entityName, addedObservations: newObservations });
       }
 
-      const rec = this.gf.readEntity(offset);
-      const existingObs: string[] = [];
-      if (rec.obs0Id !== 0) existingObs.push(this.st.get(BigInt(rec.obs0Id)));
-      if (rec.obs1Id !== 0) existingObs.push(this.st.get(BigInt(rec.obs1Id)));
-
-      const newObservations = o.contents.filter(content => !existingObs.includes(content));
-
-      // Validate total observation count
-      if (existingObs.length + newObservations.length > 2) {
-        throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${existingObs.length}).`);
-      }
-
-      const now = BigInt(Date.now());
-      for (const obs of newObservations) {
-        this.gf.addObservation(offset, obs, now);
-      }
-
-      results.push({ entityName: o.entityName, addedObservations: newObservations });
-    }
-
-    this.gf.sync();
-    return results;
+      return results;
+    });
   }
 
   async deleteEntities(entityNames: string[]): Promise<void> {
-    for (const name of entityNames) {
-      const offset = this.nameIndex.get(name);
-      if (offset === undefined) continue;
+    this.withWriteLock(() => {
+      for (const name of entityNames) {
+        const offset = this.nameIndex.get(name);
+        if (offset === undefined) continue;
 
-      // Remove all edges that reference this entity from OTHER entities' adj lists
-      const edges = this.gf.getEdges(offset);
-      for (const edge of edges) {
-        // Remove the reverse edge from the other entity
-        const reverseDir = edge.direction === DIR_FORWARD ? DIR_BACKWARD : DIR_FORWARD;
-        this.gf.removeEdge(edge.targetOffset, offset, edge.relTypeId, reverseDir);
-        // Release the relType string ref for the reverse edge
-        this.st.release(BigInt(edge.relTypeId));
+        const edges = this.gf.getEdges(offset);
+        for (const edge of edges) {
+          const reverseDir = edge.direction === DIR_FORWARD ? DIR_BACKWARD : DIR_FORWARD;
+          this.gf.removeEdge(edge.targetOffset, offset, edge.relTypeId, reverseDir);
+          this.st.release(BigInt(edge.relTypeId));
+        }
+
+        this.gf.deleteEntity(offset);
+        this.nameIndex.delete(name);
       }
-
-      this.gf.deleteEntity(offset);
-      this.nameIndex.delete(name);
-    }
-
-    this.gf.sync();
+    });
   }
 
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
-    const now = BigInt(Date.now());
-    for (const d of deletions) {
-      const offset = this.nameIndex.get(d.entityName);
-      if (offset === undefined) continue;
+    this.withWriteLock(() => {
+      const now = BigInt(Date.now());
+      for (const d of deletions) {
+        const offset = this.nameIndex.get(d.entityName);
+        if (offset === undefined) continue;
 
-      for (const obs of d.observations) {
-        this.gf.removeObservation(offset, obs, now);
+        for (const obs of d.observations) {
+          this.gf.removeObservation(offset, obs, now);
+        }
       }
-    }
-
-    this.gf.sync();
+    });
   }
 
   async deleteRelations(relations: Relation[]): Promise<void> {
-    for (const r of relations) {
-      const fromOffset = this.nameIndex.get(r.from);
-      const toOffset = this.nameIndex.get(r.to);
-      if (fromOffset === undefined || toOffset === undefined) continue;
+    this.withWriteLock(() => {
+      for (const r of relations) {
+        const fromOffset = this.nameIndex.get(r.from);
+        const toOffset = this.nameIndex.get(r.to);
+        if (fromOffset === undefined || toOffset === undefined) continue;
 
-      const relTypeId = this.st.find(r.relationType);
-      if (relTypeId === null) continue;
+        const relTypeId = this.st.find(r.relationType);
+        if (relTypeId === null) continue;
 
-      // Remove forward edge from 'from'
-      const removedForward = this.gf.removeEdge(fromOffset, toOffset, Number(relTypeId), DIR_FORWARD);
-      if (removedForward) this.st.release(relTypeId);
+        const removedForward = this.gf.removeEdge(fromOffset, toOffset, Number(relTypeId), DIR_FORWARD);
+        if (removedForward) this.st.release(relTypeId);
 
-      // Remove backward edge from 'to'
-      const removedBackward = this.gf.removeEdge(toOffset, fromOffset, Number(relTypeId), DIR_BACKWARD);
-      if (removedBackward) this.st.release(relTypeId);
-    }
-
-    this.gf.sync();
+        const removedBackward = this.gf.removeEdge(toOffset, fromOffset, Number(relTypeId), DIR_BACKWARD);
+        if (removedBackward) this.st.release(relTypeId);
+      }
+    });
   }
 
   // Regex-based search function
   async searchNodes(query: string, sortBy?: EntitySortField, sortDir?: SortDirection, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
     let regex: RegExp;
     try {
-      regex = new RegExp(query, 'i'); // case-insensitive
+      regex = new RegExp(query, 'i');
     } catch (e) {
       throw new Error(`Invalid regex pattern: ${query}`);
     }
 
-    const allEntities = this.getAllEntities();
+    return this.withReadLock(() => {
+      const allEntities = this.getAllEntities();
 
-    // Filter entities
-    const filteredEntities = allEntities.filter(e =>
-      regex.test(e.name) ||
-      regex.test(e.entityType) ||
-      e.observations.some(o => regex.test(o))
-    );
+      const filteredEntities = allEntities.filter(e =>
+        regex.test(e.name) ||
+        regex.test(e.entityType) ||
+        e.observations.some(o => regex.test(o))
+      );
 
-    // Create a Set of filtered entity names for quick lookup
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+      const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
 
-    // Get all relations and filter based on direction
-    const allRelations = this.getAllRelations();
-    const filteredRelations = allRelations.filter(r => {
-      if (direction === 'forward') return filteredEntityNames.has(r.from);
-      if (direction === 'backward') return filteredEntityNames.has(r.to);
-      return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to); // 'any' = both endpoints in set
+      const allRelations = this.getAllRelations();
+      const filteredRelations = allRelations.filter(r => {
+        if (direction === 'forward') return filteredEntityNames.has(r.from);
+        if (direction === 'backward') return filteredEntityNames.has(r.to);
+        return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to);
+      });
+
+      const rankMaps = this.getRankMapsUnlocked();
+      return {
+        entities: sortEntities(filteredEntities, sortBy, sortDir, rankMaps),
+        relations: filteredRelations,
+      };
     });
-
-    const rankMaps = this.getRankMaps();
-    return {
-      entities: sortEntities(filteredEntities, sortBy, sortDir, rankMaps),
-      relations: filteredRelations,
-    };
   }
 
   async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
-    const filteredEntities: Entity[] = [];
-    for (const name of names) {
-      const offset = this.nameIndex.get(name);
-      if (offset === undefined) continue;
-      filteredEntities.push(this.recordToEntity(this.gf.readEntity(offset)));
-    }
+    return this.withReadLock(() => {
+      const filteredEntities: Entity[] = [];
+      for (const name of names) {
+        const offset = this.nameIndex.get(name);
+        if (offset === undefined) continue;
+        filteredEntities.push(this.recordToEntity(this.gf.readEntity(offset)));
+      }
 
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+      const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
 
-    // Collect relations from these entities
-    const filteredRelations: Relation[] = [];
-    for (const name of filteredEntityNames) {
-      const offset = this.nameIndex.get(name)!;
-      const edges = this.gf.getEdges(offset);
-      for (const edge of edges) {
-        if (edge.direction !== DIR_FORWARD && edge.direction !== DIR_BACKWARD) continue;
+      const filteredRelations: Relation[] = [];
+      for (const name of filteredEntityNames) {
+        const offset = this.nameIndex.get(name)!;
+        const edges = this.gf.getEdges(offset);
+        for (const edge of edges) {
+          if (edge.direction !== DIR_FORWARD && edge.direction !== DIR_BACKWARD) continue;
 
-        const targetRec = this.gf.readEntity(edge.targetOffset);
-        const targetName = this.st.get(BigInt(targetRec.nameId));
-        const relationType = this.st.get(BigInt(edge.relTypeId));
-        const mtime = Number(edge.mtime);
+          const targetRec = this.gf.readEntity(edge.targetOffset);
+          const targetName = this.st.get(BigInt(targetRec.nameId));
+          const relationType = this.st.get(BigInt(edge.relTypeId));
+          const mtime = Number(edge.mtime);
 
-        if (edge.direction === DIR_FORWARD) {
-          if (direction === 'backward') continue;
-          const r: Relation = { from: name, to: targetName, relationType };
-          if (mtime > 0) r.mtime = mtime;
-          filteredRelations.push(r);
-        } else {
-          // DIR_BACKWARD: this entity is 'to', target is 'from'
-          if (direction === 'forward') continue;
-          if (direction === 'any' && !filteredEntityNames.has(targetName)) continue;
-          const r: Relation = { from: targetName, to: name, relationType };
-          if (mtime > 0) r.mtime = mtime;
-          filteredRelations.push(r);
+          if (edge.direction === DIR_FORWARD) {
+            if (direction === 'backward') continue;
+            const r: Relation = { from: name, to: targetName, relationType };
+            if (mtime > 0) r.mtime = mtime;
+            filteredRelations.push(r);
+          } else {
+            if (direction === 'forward') continue;
+            if (direction === 'any' && !filteredEntityNames.has(targetName)) continue;
+            const r: Relation = { from: targetName, to: name, relationType };
+            if (mtime > 0) r.mtime = mtime;
+            filteredRelations.push(r);
+          }
         }
       }
-    }
 
-    return { entities: filteredEntities, relations: filteredRelations };
+      return { entities: filteredEntities, relations: filteredRelations };
+    });
   }
 
   async getNeighbors(
@@ -666,256 +714,265 @@ export class KnowledgeGraphManager {
     sortDir?: SortDirection,
     direction: 'forward' | 'backward' | 'any' = 'forward'
   ): Promise<Neighbor[]> {
-    const startOffset = this.nameIndex.get(entityName);
-    if (startOffset === undefined) return [];
+    return this.withReadLock(() => {
+      const startOffset = this.nameIndex.get(entityName);
+      if (startOffset === undefined) return [];
 
-    const visited = new Set<string>();
-    const neighborNames = new Set<string>();
+      const visited = new Set<string>();
+      const neighborNames = new Set<string>();
 
-    const traverse = (currentName: string, currentDepth: number) => {
-      if (currentDepth > depth || visited.has(currentName)) return;
-      visited.add(currentName);
+      const traverse = (currentName: string, currentDepth: number) => {
+        if (currentDepth > depth || visited.has(currentName)) return;
+        visited.add(currentName);
 
-      const offset = this.nameIndex.get(currentName);
-      if (offset === undefined) return;
+        const offset = this.nameIndex.get(currentName);
+        if (offset === undefined) return;
 
-      const edges = this.gf.getEdges(offset);
-      for (const edge of edges) {
-        // Filter by direction
-        if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-        if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+        const edges = this.gf.getEdges(offset);
+        for (const edge of edges) {
+          if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+          if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
 
-        const targetRec = this.gf.readEntity(edge.targetOffset);
-        const neighborName = this.st.get(BigInt(targetRec.nameId));
-        neighborNames.add(neighborName);
+          const targetRec = this.gf.readEntity(edge.targetOffset);
+          const neighborName = this.st.get(BigInt(targetRec.nameId));
+          neighborNames.add(neighborName);
 
-        if (currentDepth < depth) {
-          traverse(neighborName, currentDepth + 1);
+          if (currentDepth < depth) {
+            traverse(neighborName, currentDepth + 1);
+          }
         }
-      }
-    };
+      };
 
-    traverse(entityName, 0);
+      traverse(entityName, 0);
+      neighborNames.delete(entityName);
 
-    // Remove the starting entity from neighbors
-    neighborNames.delete(entityName);
+      const neighbors: Neighbor[] = Array.from(neighborNames).map(name => {
+        const offset = this.nameIndex.get(name);
+        if (!offset) return { name };
+        const rec = this.gf.readEntity(offset);
+        const mtime = Number(rec.mtime);
+        const obsMtime = Number(rec.obsMtime);
+        const n: Neighbor = { name };
+        if (mtime > 0) n.mtime = mtime;
+        if (obsMtime > 0) n.obsMtime = obsMtime;
+        return n;
+      });
 
-    // Build neighbor objects with timestamps
-    const neighbors: Neighbor[] = Array.from(neighborNames).map(name => {
-      const offset = this.nameIndex.get(name);
-      if (!offset) return { name };
-      const rec = this.gf.readEntity(offset);
-      const mtime = Number(rec.mtime);
-      const obsMtime = Number(rec.obsMtime);
-      const n: Neighbor = { name };
-      if (mtime > 0) n.mtime = mtime;
-      if (obsMtime > 0) n.obsMtime = obsMtime;
-      return n;
+      const rankMaps = this.getRankMapsUnlocked();
+      return sortNeighbors(neighbors, sortBy, sortDir, rankMaps);
     });
-
-    const rankMaps = this.getRankMaps();
-    return sortNeighbors(neighbors, sortBy, sortDir, rankMaps);
   }
 
   async findPath(fromEntity: string, toEntity: string, maxDepth: number = 5, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<Relation[]> {
-    const visited = new Set<string>();
+    return this.withReadLock(() => {
+      const visited = new Set<string>();
 
-    const dfs = (current: string, target: string, pathSoFar: Relation[], depth: number): Relation[] | null => {
-      if (depth > maxDepth || visited.has(current)) return null;
-      if (current === target) return pathSoFar;
+      const dfs = (current: string, target: string, pathSoFar: Relation[], depth: number): Relation[] | null => {
+        if (depth > maxDepth || visited.has(current)) return null;
+        if (current === target) return pathSoFar;
 
-      visited.add(current);
+        visited.add(current);
 
-      const offset = this.nameIndex.get(current);
-      if (offset === undefined) { visited.delete(current); return null; }
+        const offset = this.nameIndex.get(current);
+        if (offset === undefined) { visited.delete(current); return null; }
 
-      const edges = this.gf.getEdges(offset);
-      for (const edge of edges) {
-        if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-        if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+        const edges = this.gf.getEdges(offset);
+        for (const edge of edges) {
+          if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+          if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
 
-        const targetRec = this.gf.readEntity(edge.targetOffset);
-        const nextName = this.st.get(BigInt(targetRec.nameId));
-        const relationType = this.st.get(BigInt(edge.relTypeId));
-        const mtime = Number(edge.mtime);
+          const targetRec = this.gf.readEntity(edge.targetOffset);
+          const nextName = this.st.get(BigInt(targetRec.nameId));
+          const relationType = this.st.get(BigInt(edge.relTypeId));
+          const mtime = Number(edge.mtime);
 
-        let rel: Relation;
-        if (edge.direction === DIR_FORWARD) {
-          rel = { from: current, to: nextName, relationType };
-        } else {
-          rel = { from: nextName, to: current, relationType };
+          let rel: Relation;
+          if (edge.direction === DIR_FORWARD) {
+            rel = { from: current, to: nextName, relationType };
+          } else {
+            rel = { from: nextName, to: current, relationType };
+          }
+          if (mtime > 0) rel.mtime = mtime;
+
+          const result = dfs(nextName, target, [...pathSoFar, rel], depth + 1);
+          if (result) return result;
         }
-        if (mtime > 0) rel.mtime = mtime;
 
-        const result = dfs(nextName, target, [...pathSoFar, rel], depth + 1);
-        if (result) return result;
-      }
+        visited.delete(current);
+        return null;
+      };
 
-      visited.delete(current);
-      return null;
-    };
-
-    return dfs(fromEntity, toEntity, [], 0) || [];
+      return dfs(fromEntity, toEntity, [], 0) || [];
+    });
   }
 
   async getEntitiesByType(entityType: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
-    const filtered = this.getAllEntities().filter(e => e.entityType === entityType);
-    const rankMaps = this.getRankMaps();
-    return sortEntities(filtered, sortBy, sortDir, rankMaps);
+    return this.withReadLock(() => {
+      const filtered = this.getAllEntities().filter(e => e.entityType === entityType);
+      const rankMaps = this.getRankMapsUnlocked();
+      return sortEntities(filtered, sortBy, sortDir, rankMaps);
+    });
   }
 
   async getEntityTypes(): Promise<string[]> {
-    const types = new Set(this.getAllEntities().map(e => e.entityType));
-    return Array.from(types).sort();
+    return this.withReadLock(() => {
+      const types = new Set(this.getAllEntities().map(e => e.entityType));
+      return Array.from(types).sort();
+    });
   }
 
   async getRelationTypes(): Promise<string[]> {
-    const types = new Set(this.getAllRelations().map(r => r.relationType));
-    return Array.from(types).sort();
+    return this.withReadLock(() => {
+      const types = new Set(this.getAllRelations().map(r => r.relationType));
+      return Array.from(types).sort();
+    });
   }
 
   async getStats(): Promise<{ entityCount: number; relationCount: number; entityTypes: number; relationTypes: number }> {
-    const entities = this.getAllEntities();
-    const relations = this.getAllRelations();
-    const entityTypes = new Set(entities.map(e => e.entityType));
-    const relationTypes = new Set(relations.map(r => r.relationType));
+    return this.withReadLock(() => {
+      const entities = this.getAllEntities();
+      const relations = this.getAllRelations();
+      const entityTypes = new Set(entities.map(e => e.entityType));
+      const relationTypes = new Set(relations.map(r => r.relationType));
 
-    return {
-      entityCount: entities.length,
-      relationCount: relations.length,
-      entityTypes: entityTypes.size,
-      relationTypes: relationTypes.size,
-    };
+      return {
+        entityCount: entities.length,
+        relationCount: relations.length,
+        entityTypes: entityTypes.size,
+        relationTypes: relationTypes.size,
+      };
+    });
   }
 
   async getOrphanedEntities(strict: boolean = false, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
-    const entities = this.getAllEntities();
+    return this.withReadLock(() => {
+      const entities = this.getAllEntities();
 
-    if (!strict) {
-      // Simple mode: entities with no relations at all
-      const connectedEntityNames = new Set<string>();
+      if (!strict) {
+        const connectedEntityNames = new Set<string>();
+        const relations = this.getAllRelations();
+        relations.forEach(r => {
+          connectedEntityNames.add(r.from);
+          connectedEntityNames.add(r.to);
+        });
+        const orphans = entities.filter(e => !connectedEntityNames.has(e.name));
+        const rankMaps = this.getRankMapsUnlocked();
+        return sortEntities(orphans, sortBy, sortDir, rankMaps);
+      }
+
+      const neighbors = new Map<string, Set<string>>();
+      entities.forEach(e => neighbors.set(e.name, new Set()));
       const relations = this.getAllRelations();
       relations.forEach(r => {
-        connectedEntityNames.add(r.from);
-        connectedEntityNames.add(r.to);
+        neighbors.get(r.from)?.add(r.to);
+        neighbors.get(r.to)?.add(r.from);
       });
-      const orphans = entities.filter(e => !connectedEntityNames.has(e.name));
-      const rankMaps = this.getRankMaps();
-      return sortEntities(orphans, sortBy, sortDir, rankMaps);
-    }
 
-    // Strict mode: entities not connected to "Self" (directly or indirectly)
-    const neighbors = new Map<string, Set<string>>();
-    entities.forEach(e => neighbors.set(e.name, new Set()));
-    const relations = this.getAllRelations();
-    relations.forEach(r => {
-      neighbors.get(r.from)?.add(r.to);
-      neighbors.get(r.to)?.add(r.from);
-    });
+      const connectedToSelf = new Set<string>();
+      const queue: string[] = ['Self'];
 
-    // BFS from Self
-    const connectedToSelf = new Set<string>();
-    const queue: string[] = ['Self'];
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        if (connectedToSelf.has(current)) continue;
+        connectedToSelf.add(current);
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      if (connectedToSelf.has(current)) continue;
-      connectedToSelf.add(current);
-
-      const currentNeighbors = neighbors.get(current);
-      if (currentNeighbors) {
-        for (const neighbor of currentNeighbors) {
-          if (!connectedToSelf.has(neighbor)) {
-            queue.push(neighbor);
+        const currentNeighbors = neighbors.get(current);
+        if (currentNeighbors) {
+          for (const neighbor of currentNeighbors) {
+            if (!connectedToSelf.has(neighbor)) {
+              queue.push(neighbor);
+            }
           }
         }
       }
-    }
 
-    const orphans = entities.filter(e => !connectedToSelf.has(e.name));
-    const rankMaps = this.getRankMaps();
-    return sortEntities(orphans, sortBy, sortDir, rankMaps);
+      const orphans = entities.filter(e => !connectedToSelf.has(e.name));
+      const rankMaps = this.getRankMapsUnlocked();
+      return sortEntities(orphans, sortBy, sortDir, rankMaps);
+    });
   }
 
   async validateGraph(): Promise<{ missingEntities: string[]; observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] }> {
-    const entities = this.getAllEntities();
-    const relations = this.getAllRelations();
-    const entityNames = new Set(entities.map(e => e.name));
-    const missingEntities = new Set<string>();
-    const observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] = [];
+    return this.withReadLock(() => {
+      const entities = this.getAllEntities();
+      const relations = this.getAllRelations();
+      const entityNames = new Set(entities.map(e => e.name));
+      const missingEntities = new Set<string>();
+      const observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] = [];
 
-    // Check for missing entities in relations
-    relations.forEach(r => {
-      if (!entityNames.has(r.from)) missingEntities.add(r.from);
-      if (!entityNames.has(r.to)) missingEntities.add(r.to);
-    });
-
-    // Check for observation limit violations
-    entities.forEach(e => {
-      const oversizedObservations: number[] = [];
-      e.observations.forEach((obs, idx) => {
-        if (obs.length > 140) oversizedObservations.push(idx);
+      relations.forEach(r => {
+        if (!entityNames.has(r.from)) missingEntities.add(r.from);
+        if (!entityNames.has(r.to)) missingEntities.add(r.to);
       });
 
-      if (e.observations.length > 2 || oversizedObservations.length > 0) {
-        observationViolations.push({
-          entity: e.name,
-          count: e.observations.length,
-          oversizedObservations,
+      entities.forEach(e => {
+        const oversizedObservations: number[] = [];
+        e.observations.forEach((obs, idx) => {
+          if (obs.length > 140) oversizedObservations.push(idx);
         });
-      }
-    });
 
-    return { missingEntities: Array.from(missingEntities), observationViolations };
+        if (e.observations.length > 2 || oversizedObservations.length > 0) {
+          observationViolations.push({
+            entity: e.name,
+            count: e.observations.length,
+            oversizedObservations,
+          });
+        }
+      });
+
+      return { missingEntities: Array.from(missingEntities), observationViolations };
+    });
   }
 
   async randomWalk(start: string, depth: number = 3, seed?: string, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<{ entity: string; path: string[] }> {
-    const startOffset = this.nameIndex.get(start);
-    if (!startOffset) {
-      throw new Error(`Start entity not found: ${start}`);
-    }
-
-    // Create seeded RNG if seed provided
-    let rngState = seed ? this.hashSeed(seed) : null;
-    const random = (): number => {
-      if (rngState !== null) {
-        rngState ^= rngState << 13;
-        rngState ^= rngState >>> 17;
-        rngState ^= rngState << 5;
-        return (rngState >>> 0) / 0xFFFFFFFF;
-      } else {
-        return randomBytes(4).readUInt32BE() / 0xFFFFFFFF;
-      }
-    };
-
-    const pathNames: string[] = [start];
-    let current = start;
-
-    for (let i = 0; i < depth; i++) {
-      const offset = this.nameIndex.get(current);
-      if (!offset) break;
-
-      const edges = this.gf.getEdges(offset);
-      const validNeighbors = new Set<string>();
-
-      for (const edge of edges) {
-        if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-        if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
-
-        const targetRec = this.gf.readEntity(edge.targetOffset);
-        const neighborName = this.st.get(BigInt(targetRec.nameId));
-        if (neighborName !== current) validNeighbors.add(neighborName);
+    return this.withReadLock(() => {
+      const startOffset = this.nameIndex.get(start);
+      if (!startOffset) {
+        throw new Error(`Start entity not found: ${start}`);
       }
 
-      const neighborArr = Array.from(validNeighbors).filter(n => this.nameIndex.has(n));
-      if (neighborArr.length === 0) break;
+      // Create seeded RNG if seed provided
+      let rngState = seed ? this.hashSeed(seed) : null;
+      const random = (): number => {
+        if (rngState !== null) {
+          rngState ^= rngState << 13;
+          rngState ^= rngState >>> 17;
+          rngState ^= rngState << 5;
+          return (rngState >>> 0) / 0xFFFFFFFF;
+        } else {
+          return randomBytes(4).readUInt32BE() / 0xFFFFFFFF;
+        }
+      };
 
-      const idx = Math.floor(random() * neighborArr.length);
-      current = neighborArr[idx];
-      pathNames.push(current);
-    }
+      const pathNames: string[] = [start];
+      let current = start;
 
-    return { entity: current, path: pathNames };
+      for (let i = 0; i < depth; i++) {
+        const offset = this.nameIndex.get(current);
+        if (!offset) break;
+
+        const edges = this.gf.getEdges(offset);
+        const validNeighbors = new Set<string>();
+
+        for (const edge of edges) {
+          if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+          if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+
+          const targetRec = this.gf.readEntity(edge.targetOffset);
+          const neighborName = this.st.get(BigInt(targetRec.nameId));
+          if (neighborName !== current) validNeighbors.add(neighborName);
+        }
+
+        const neighborArr = Array.from(validNeighbors).filter(n => this.nameIndex.has(n));
+        if (neighborArr.length === 0) break;
+
+        const idx = Math.floor(random() * neighborArr.length);
+        current = neighborArr[idx];
+        pathNames.push(current);
+      }
+
+      return { entity: current, path: pathNames };
+    });
   }
 
   private hashSeed(seed: string): number {
@@ -968,7 +1025,7 @@ export class KnowledgeGraphManager {
   }
 
   async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string }> {
-    // Validate observations
+    // Validate observations (can do outside lock)
     if (observations.length > 2) {
       throw new Error(`Thought has ${observations.length} observations. Maximum allowed is 2.`);
     }
@@ -978,49 +1035,44 @@ export class KnowledgeGraphManager {
       }
     }
 
-    const now = BigInt(Date.now());
-    const ctxId = randomBytes(12).toString('hex');
+    return this.withWriteLock(() => {
+      const now = BigInt(Date.now());
+      const ctxId = randomBytes(12).toString('hex');
 
-    // Create thought entity
-    const obsMtime = observations.length > 0 ? now : 0n;
-    const rec = this.gf.createEntity(ctxId, 'Thought', now, obsMtime);
-    for (const obs of observations) {
-      this.gf.addObservation(rec.offset, obs, now);
-    }
-    // Fix mtime
-    if (observations.length > 0) {
-      const updated = this.gf.readEntity(rec.offset);
-      updated.mtime = now;
-      updated.obsMtime = now;
-      this.gf.updateEntity(updated);
-    }
-    this.nameIndex.set(ctxId, rec.offset);
-
-    // Link to previous thought if it exists
-    if (previousCtxId) {
-      const prevOffset = this.nameIndex.get(previousCtxId);
-      if (prevOffset !== undefined) {
-        // Update mtime on previous entity
-        const prevRec = this.gf.readEntity(prevOffset);
-        prevRec.mtime = now;
-        this.gf.updateEntity(prevRec);
-
-        // follows: previous -> new
-        const followsTypeId = Number(this.st.intern('follows'));
-        this.gf.addEdge(prevOffset, { targetOffset: rec.offset, direction: DIR_FORWARD, relTypeId: followsTypeId, mtime: now });
-        const followsTypeId2 = Number(this.st.intern('follows'));
-        this.gf.addEdge(rec.offset, { targetOffset: prevOffset, direction: DIR_BACKWARD, relTypeId: followsTypeId2, mtime: now });
-
-        // preceded_by: new -> previous
-        const precededByTypeId = Number(this.st.intern('preceded_by'));
-        this.gf.addEdge(rec.offset, { targetOffset: prevOffset, direction: DIR_FORWARD, relTypeId: precededByTypeId, mtime: now });
-        const precededByTypeId2 = Number(this.st.intern('preceded_by'));
-        this.gf.addEdge(prevOffset, { targetOffset: rec.offset, direction: DIR_BACKWARD, relTypeId: precededByTypeId2, mtime: now });
+      const obsMtime = observations.length > 0 ? now : 0n;
+      const rec = this.gf.createEntity(ctxId, 'Thought', now, obsMtime);
+      for (const obs of observations) {
+        this.gf.addObservation(rec.offset, obs, now);
       }
-    }
+      if (observations.length > 0) {
+        const updated = this.gf.readEntity(rec.offset);
+        updated.mtime = now;
+        updated.obsMtime = now;
+        this.gf.updateEntity(updated);
+      }
+      this.nameIndex.set(ctxId, rec.offset);
 
-    this.gf.sync();
-    return { ctxId };
+      if (previousCtxId) {
+        const prevOffset = this.nameIndex.get(previousCtxId);
+        if (prevOffset !== undefined) {
+          const prevRec = this.gf.readEntity(prevOffset);
+          prevRec.mtime = now;
+          this.gf.updateEntity(prevRec);
+
+          const followsTypeId = Number(this.st.intern('follows'));
+          this.gf.addEdge(prevOffset, { targetOffset: rec.offset, direction: DIR_FORWARD, relTypeId: followsTypeId, mtime: now });
+          const followsTypeId2 = Number(this.st.intern('follows'));
+          this.gf.addEdge(rec.offset, { targetOffset: prevOffset, direction: DIR_BACKWARD, relTypeId: followsTypeId2, mtime: now });
+
+          const precededByTypeId = Number(this.st.intern('preceded_by'));
+          this.gf.addEdge(rec.offset, { targetOffset: prevOffset, direction: DIR_FORWARD, relTypeId: precededByTypeId, mtime: now });
+          const precededByTypeId2 = Number(this.st.intern('preceded_by'));
+          this.gf.addEdge(prevOffset, { targetOffset: rec.offset, direction: DIR_BACKWARD, relTypeId: precededByTypeId2, mtime: now });
+        }
+      }
+
+      return { ctxId };
+    });
   }
 
   /** Close the underlying binary store files */

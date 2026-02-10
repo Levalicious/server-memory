@@ -640,7 +640,27 @@ export class GraphFile {
     return Number(rec.walkerVisits) / Number(total);
   }
 
-  // --- Lifecycle ---
+  // --- Lifecycle & Concurrency ---
+
+  /** Acquire a shared (read) lock on the graph file. */
+  lockShared(): void {
+    this.mf.lockShared();
+  }
+
+  /** Acquire an exclusive (write) lock on the graph file. */
+  lockExclusive(): void {
+    this.mf.lockExclusive();
+  }
+
+  /** Release the lock on the graph file. */
+  unlock(): void {
+    this.mf.unlock();
+  }
+
+  /** Refresh the mmap if the file was grown by another process. */
+  refresh(): void {
+    this.mf.refresh();
+  }
 
   sync(): void {
     this.mf.sync();

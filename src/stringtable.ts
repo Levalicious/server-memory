@@ -420,6 +420,11 @@ export class StringTable {
     this.mf.sync();
   }
 
+  /** Refresh the mmap if the file was grown by another process. */
+  refresh(): void {
+    this.mf.refresh();
+  }
+
   close(): void {
     this.mf.close();
   }

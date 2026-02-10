@@ -24,6 +24,7 @@ interface NativeMemoryFile {
   lockShared(handle: unknown): void;
   lockExclusive(handle: unknown): void;
   unlock(handle: unknown): void;
+  refresh(handle: unknown): void;
   stats(handle: unknown): { fileSize: bigint; allocated: bigint; freeListHead: bigint };
 }
 
@@ -106,6 +107,16 @@ export class MemoryFile {
   unlock(): void {
     this.assertOpen();
     native.unlock(this.handle);
+  }
+
+  /**
+   * Refresh the mmap if the file was grown by another process.
+   * Call this after acquiring a lock, before reading, to ensure
+   * the mapping covers the full file.
+   */
+  refresh(): void {
+    this.assertOpen();
+    native.refresh(this.handle);
   }
 
   /**
