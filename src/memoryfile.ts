@@ -6,6 +6,7 @@
  */
 
 import { createRequire } from 'module';
+import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -28,8 +29,20 @@ interface NativeMemoryFile {
   stats(handle: unknown): { fileSize: bigint; allocated: bigint; freeListHead: bigint };
 }
 
-// The .node binary is in build/Release/ relative to project root
-const native: NativeMemoryFile = require(join(__dirname, '..', 'build', 'Release', 'memoryfile.node'));
+// Walk up from __dirname to find the package root containing build/Release/memoryfile.node.
+// Works from source (src/), compiled (dist/src/), and npx cache contexts.
+function findNative(): string {
+  let dir = __dirname;
+  const { root } = require('path').parse(dir);
+  while (dir !== root) {
+    const candidate = join(dir, 'build', 'Release', 'memoryfile.node');
+    if (existsSync(candidate)) return candidate;
+    dir = dirname(dir);
+  }
+  throw new Error('Could not find native memoryfile.node — was the C addon built? Run: node-gyp rebuild');
+}
+
+const native: NativeMemoryFile = require(findNative());
 
 export class MemoryFile {
   private handle: unknown;

@@ -1,17 +1,20 @@
 {
   "name": "@levalicious/server-memory",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "description": "MCP server for enabling memory for Claude through a knowledge graph",
   "license": "MIT",
   "author": "Levalicious",
   "homepage": "https://modelcontextprotocol.io",
   "bugs": "https://github.com/modelcontextprotocol/servers/issues",
   "type": "module",
+  "gypfile": true,
   "bin": {
     "mcp-server-memory": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "binding.gyp",
+    "native"
   ],
   "scripts": {
     "build": "node-gyp rebuild && tsc && shx chmod +x dist/*.js",
