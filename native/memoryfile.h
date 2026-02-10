@@ -71,6 +71,9 @@ int memfile_write(memfile_t *mf, u64 offset, const void *buf, u64 len);
 /* Convert offset to pointer (CAUTION: invalid after alloc that triggers remap) */
 void *memfile_ptr(memfile_t *mf, u64 offset);
 
+/* Refresh mapping if the file was grown by another process */
+int memfile_refresh(memfile_t *mf);
+
 /* Concurrency - POSIX flock on the underlying fd */
 int memfile_lock_shared(memfile_t *mf);
 int memfile_lock_exclusive(memfile_t *mf);

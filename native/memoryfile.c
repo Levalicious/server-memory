@@ -228,6 +228,28 @@ void memfile_coalesce(memfile_t *mf) {
 }
 
 /* =========================================================================
+ * Refresh mapping after another process grows the file
+ * ========================================================================= */
+
+int memfile_refresh(memfile_t *mf) {
+    struct stat st;
+    if (fstat(mf->fd, &st) < 0) return -1;
+
+    size_t actual_size = (size_t)st.st_size;
+    if (actual_size <= mf->mmap_size) return 0;  /* No growth detected */
+
+    /* File grew — remap to cover the new size */
+    void *new_base = mremap(mf->mmap_base, mf->mmap_size, actual_size, MREMAP_MAYMOVE);
+    if (new_base == MAP_FAILED) return -1;
+
+    mf->mmap_base = new_base;
+    mf->mmap_size = actual_size;
+    mf->header = (memfile_header_t*)new_base;
+
+    return 0;
+}
+
+/* =========================================================================
  * Concurrency - POSIX flock
  * ========================================================================= */
 

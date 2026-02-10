@@ -295,6 +295,24 @@ static napi_value n_memfile_stats(napi_env env, napi_callback_info info) {
 }
 
 /* =========================================================================
+ * memfile_refresh(handle: external) => void
+ * ========================================================================= */
+
+static napi_value n_memfile_refresh(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1];
+    NAPI_CALL(napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+    memfile_t *mf = unwrap_mf(env, argv[0]);
+    if (memfile_refresh(mf) < 0) {
+        napi_throw_error(env, NULL, "memfile_refresh failed");
+        return NULL;
+    }
+
+    return NULL;
+}
+
+/* =========================================================================
  * Module init
  * ========================================================================= */
 
@@ -317,5 +335,6 @@ NAPI_MODULE_INIT(/* napi_env env, napi_value exports */) {
     EXPORT_FN("lockExclusive", n_memfile_lock_exclusive);
     EXPORT_FN("unlock",        n_memfile_unlock);
     EXPORT_FN("stats",         n_memfile_stats);
+    EXPORT_FN("refresh",       n_memfile_refresh);
     return exports;
 }
