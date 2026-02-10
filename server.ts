@@ -6,11 +6,13 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { randomBytes } from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type EntityRecord, type AdjEntry } from './src/graphfile.js';
 import { StringTable } from './src/stringtable.js';
 import { structuralSample } from './src/pagerank.js';
+import { validateExtension, loadDocument, KbLoadResult } from './src/kb_load.js';
 
 // Define memory file path using environment variable with fallback
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
@@ -270,6 +272,14 @@ export class KnowledgeGraphManager {
       structuralSample(this.gf, 1, 0.85);
       this.gf.sync();
     }
+  }
+
+  /**
+   * Run the loadDocument pipeline under a shared (read) lock,
+   * so the StringTable is consistent during IDF derivation.
+   */
+  prepareDocumentLoad(text: string, title: string, topK: number): KbLoadResult {
+    return this.withReadLock(() => loadDocument(text, title, this.st, topK));
   }
 
   // --- Locking helpers ---
@@ -1419,6 +1429,30 @@ Use this to build chains of reasoning that persist in the graph. Each thought ca
           required: ["observations"],
         },
       },
+      {
+        name: "kb_load",
+        description: `Load a plaintext document into the knowledge graph. Chunks the text into entities connected by a doubly-linked chain, runs sentence TextRank to identify the most important sentences, and creates an index entity that links directly to the chunks containing those sentences.
+
+The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use pdftotext first. For other binary formats, convert to text before calling this tool.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: {
+              type: "string",
+              description: "Absolute path to the plaintext file to load. Must have a plaintext extension (.txt, .tex, .md, .py, .ts, etc.).",
+            },
+            title: {
+              type: "string",
+              description: "Optional title for the document entity. Defaults to the filename without extension.",
+            },
+            topK: {
+              type: "number",
+              description: "Number of top-ranked sentences to highlight in the index (default: 15).",
+            },
+          },
+          required: ["filePath"],
+        },
+      },
     ],
   };
 });
@@ -1504,6 +1538,56 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         args.previousCtxId as string | undefined
       );
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    }
+    case "kb_load": {
+      const filePath = args.filePath as string;
+
+      // Validate extension
+      validateExtension(filePath);
+
+      // Read file
+      let text: string;
+      try {
+        text = fs.readFileSync(filePath, 'utf-8');
+      } catch (err: any) {
+        throw new Error(`Failed to read file: ${err.message}`);
+      }
+
+      // Derive title
+      const title = (args.title as string) ?? path.basename(filePath, path.extname(filePath));
+      const topK = (args.topK as number) ?? 15;
+
+      // Run the pipeline (reads string table under read lock)
+      const loadResult = knowledgeGraphManager.prepareDocumentLoad(text, title, topK);
+
+      // Insert into KB
+      const entities = await knowledgeGraphManager.createEntities(
+        loadResult.entities.map(e => ({
+          name: e.name,
+          entityType: e.entityType,
+          observations: e.observations,
+        }))
+      );
+      const relations = await knowledgeGraphManager.createRelations(
+        loadResult.relations.map(r => ({
+          from: r.from,
+          to: r.to,
+          relationType: r.relationType,
+        }))
+      );
+      knowledgeGraphManager.resample();
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            document: title,
+            stats: loadResult.stats,
+            entitiesCreated: entities.length,
+            relationsCreated: relations.length,
+          }, null, 2),
+        }],
+      };
     }
     default:
       throw new Error(`Unknown tool: ${name}`);

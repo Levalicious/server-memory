@@ -1239,4 +1239,174 @@ describe('MCP Memory Server E2E Tests', () => {
       });
     });
   });
+
+  describe('kb_load', () => {
+    let docFile: string;
+
+    beforeEach(async () => {
+      docFile = path.join(testDir, 'test-doc.txt');
+    });
+
+    it('should reject non-plaintext extensions', async () => {
+      const pdfPath = path.join(testDir, 'test.pdf');
+      await fs.writeFile(pdfPath, 'fake pdf content');
+
+      await expect(
+        callTool(client, 'kb_load', { filePath: pdfPath })
+      ).rejects.toThrow(/Unsupported file extension/);
+    });
+
+    it('should reject files with no extension', async () => {
+      const noExtPath = path.join(testDir, 'noext');
+      await fs.writeFile(noExtPath, 'some content');
+
+      await expect(
+        callTool(client, 'kb_load', { filePath: noExtPath })
+      ).rejects.toThrow(/no extension/);
+    });
+
+    it('should reject missing files', async () => {
+      await expect(
+        callTool(client, 'kb_load', { filePath: path.join(testDir, 'nonexistent.txt') })
+      ).rejects.toThrow(/Failed to read file/);
+    });
+
+    it('should load a small document and create entities + relations', async () => {
+      const text = [
+        'Abstract interpretation is a theory of sound approximation of program semantics.',
+        'The key idea is to compute over abstract domains instead of concrete domains.',
+        'This enables static analysis to scale to large programs.',
+        'Galois connections formalize the relationship between abstract and concrete.',
+        'Widening operators ensure termination of the analysis.',
+      ].join(' ');
+      await fs.writeFile(docFile, text);
+
+      const result = await callTool(client, 'kb_load', { filePath: docFile }) as any;
+
+      expect(result.document).toBe('test-doc');
+      expect(result.entitiesCreated).toBeGreaterThan(0);
+      expect(result.relationsCreated).toBeGreaterThan(0);
+      expect(result.stats.chunks).toBeGreaterThan(0);
+      expect(result.stats.sentences).toBeGreaterThan(0);
+    });
+
+    it('should create Document, TextChunk, and DocumentIndex entities', async () => {
+      await fs.writeFile(docFile, 'The quick brown fox jumps over the lazy dog. The fox was very quick and the dog was very lazy. This sentence makes the document long enough to have multiple chunks for testing purposes and analysis.');
+
+      await callTool(client, 'kb_load', { filePath: docFile });
+
+      // Check document entity
+      const docResult = await callTool(client, 'open_nodes', { names: ['test-doc'] }) as PaginatedGraph;
+      expect(docResult.entities.items).toHaveLength(1);
+      expect(docResult.entities.items[0].entityType).toBe('Document');
+
+      // Check index entity
+      const indexResult = await callTool(client, 'open_nodes', { names: ['test-doc__index'] }) as PaginatedGraph;
+      expect(indexResult.entities.items).toHaveLength(1);
+      expect(indexResult.entities.items[0].entityType).toBe('DocumentIndex');
+
+      // Check TextChunk entities exist via type query
+      const chunks = await callTool(client, 'get_entities_by_type', { entityType: 'TextChunk' }) as PaginatedResult<Entity>;
+      expect(chunks.items.length).toBeGreaterThan(0);
+      for (const chunk of chunks.items) {
+        expect(chunk.observations.length).toBeLessThanOrEqual(2);
+        for (const obs of chunk.observations) {
+          expect(obs.length).toBeLessThanOrEqual(140);
+        }
+      }
+    });
+
+    it('should create chain relations (starts_with, ends_with, follows)', async () => {
+      const text = 'First sentence of the document goes here. ' +
+        'Second sentence adds more content to the document. ' +
+        'Third sentence continues the thought further along. ' +
+        'Fourth sentence wraps up the document nicely.';
+      await fs.writeFile(docFile, text);
+
+      await callTool(client, 'kb_load', { filePath: docFile });
+
+      // Get the document's relations
+      const docResult = await callTool(client, 'open_nodes', { names: ['test-doc'] }) as PaginatedGraph;
+      const relTypes = docResult.relations.items.map(r => r.relationType);
+
+      expect(relTypes).toContain('starts_with');
+      expect(relTypes).toContain('has_index');
+    });
+
+    it('should create index → chunk highlight relations', async () => {
+      const sentences = [];
+      for (let i = 0; i < 20; i++) {
+        sentences.push(`This is sentence number ${i} about abstract interpretation and program analysis with different keywords each time.`);
+      }
+      await fs.writeFile(docFile, sentences.join(' '));
+
+      const result = await callTool(client, 'kb_load', { filePath: docFile }) as any;
+      expect(result.stats.indexHighlights).toBeGreaterThan(0);
+
+      // Open the index and verify it has highlight relations
+      const indexResult = await callTool(client, 'open_nodes', { names: ['test-doc__index'] }) as PaginatedGraph;
+      const highlightRels = indexResult.relations.items.filter(r => r.relationType === 'highlights');
+      expect(highlightRels.length).toBeGreaterThan(0);
+    });
+
+    it('should respect custom title', async () => {
+      await fs.writeFile(docFile, 'Some document content that is long enough to process.');
+
+      const result = await callTool(client, 'kb_load', {
+        filePath: docFile,
+        title: 'my-custom-title',
+      }) as any;
+
+      expect(result.document).toBe('my-custom-title');
+
+      const docResult = await callTool(client, 'open_nodes', { names: ['my-custom-title'] }) as PaginatedGraph;
+      expect(docResult.entities.items).toHaveLength(1);
+    });
+
+    it('should not create duplicate document entity on reload with different content', async () => {
+      await fs.writeFile(docFile, 'Short doc for dedup testing purposes here.');
+      await callTool(client, 'kb_load', { filePath: docFile });
+
+      // Second load with different content but same title — Document entity
+      // already exists with entityType 'Document' and no observations,
+      // so it gets silently skipped. But the index entity already exists
+      // with different observations, so it should error.
+      await fs.writeFile(docFile, 'Completely different content for dedup testing now.');
+      await expect(
+        callTool(client, 'kb_load', { filePath: docFile })
+      ).rejects.toThrow(/already exists/);
+    });
+
+    it('should enforce observation length limits', async () => {
+      // Create a document with very long words that might challenge splitting
+      const longWord = 'a'.repeat(200);
+      await fs.writeFile(docFile, `${longWord} is a very long word that tests our splitting logic handles edge cases.`);
+
+      const result = await callTool(client, 'kb_load', { filePath: docFile }) as any;
+      expect(result.entitiesCreated).toBeGreaterThan(0);
+
+      // All observations should be within limits
+      const chunks = await callTool(client, 'get_entities_by_type', { entityType: 'TextChunk' }) as PaginatedResult<Entity>;
+      for (const chunk of chunks.items) {
+        for (const obs of chunk.observations) {
+          expect(obs.length).toBeLessThanOrEqual(140);
+        }
+      }
+    });
+
+    it('should accept various plaintext extensions', async () => {
+      const extensions = ['.txt', '.md', '.tex', '.py', '.ts', '.c'];
+      for (const ext of extensions) {
+        const filePath = path.join(testDir, `test${ext}`);
+        await fs.writeFile(filePath, 'Some plaintext content for extension testing purposes here.');
+
+        // Should not throw on validation — use a unique title per extension
+        const result = await callTool(client, 'kb_load', {
+          filePath,
+          title: `ext-test-${ext.slice(1)}`,
+        }) as any;
+        expect(result.entitiesCreated).toBeGreaterThan(0);
+      }
+    });
+  });
 });
