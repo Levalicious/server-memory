@@ -307,6 +307,24 @@ export class StringTable {
     return this.getEntryCount();
   }
 
+  /**
+   * Iterate over all live strings in the table.
+   * Yields { id, text, refcount } for each entry.
+   */
+  *entries(): Generator<{ id: bigint; text: string; refcount: number }> {
+    const bucketCount = this.getBucketCount();
+    for (let i = 0; i < bucketCount; i++) {
+      const entryOffset = this.getBucket(i);
+      if (entryOffset === 0n) continue;
+      const entry = this.readEntry(entryOffset);
+      yield {
+        id: entryOffset,
+        text: entry.data.toString('utf-8'),
+        refcount: entry.refcount,
+      };
+    }
+  }
+
   // --- Hash index management ---
 
   private removeFromIndex(offset: bigint, hash: number): void {
