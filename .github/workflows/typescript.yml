@@ -8,8 +8,25 @@ on:
     types: [published]
 
 jobs:
+  lint:
+    name: Lint
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: yarn
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Run ESLint
+        run: yarn lint
+
   test:
     name: Test
+    needs: [lint]
     permissions:
       contents: read
     runs-on: ubuntu-latest

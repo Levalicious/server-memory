@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { type Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { Entity, Relation, MAX_CHARS } from "../server.js";
+import { type Entity, type Relation, MAX_CHARS } from "../server.js";
 
 export { MAX_CHARS };
 
@@ -57,6 +57,13 @@ export async function callTool(
   name: string,
   args: Record<string, unknown>
 ): Promise<unknown> {
+  // Verify tool is discoverable via ListTools before calling it
+  const listing = await client.listTools();
+  const toolNames = listing.tools.map((t: { name: string }) => t.name);
+  if (!toolNames.includes(name)) {
+    throw new Error(`Tool "${name}" is not listed in ListTools. Available: ${toolNames.join(', ')}`);
+  }
+
   const result = await client.callTool({ name, arguments: args });
   
   const content = result.content as Array<{ type: string; text?: string }> | undefined;
