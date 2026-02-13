@@ -4,6 +4,11 @@
  * All records live in a MemoryFile (graph.mem). Variable-length strings are
  * stored in a separate StringTable (strings.mem) and referenced by u32 ID.
  *
+ * Versioning:
+ *   MEMFILE_VERSION 1  = original 64-byte entity records (no psi field)
+ *   MEMFILE_VERSION 2  = 72-byte entity records with f64 psi for MERW
+ *   On open, version 1 files are migrated to version 2 automatically.
+ *
  * Graph file layout:
  *   [memfile header: 32 bytes]
  *   [graph header block: first allocation]
@@ -12,7 +17,7 @@
  *     u64 walker_total         total walker visits (global counter)
  *   [entity records, adj blocks, node log ...]
  *
- * EntityRecord: 64 bytes fixed
+ * EntityRecord: 72 bytes fixed (v2)
  *   u32  name_id         string table ID
  *   u32  type_id         string table ID
  *   u64  adj_offset      offset to AdjBlock (0 = no edges)
@@ -24,6 +29,7 @@
  *   u32  obs1_id         string table ID (0 = empty)
  *   u64  structural_visits  structural PageRank visit count
  *   u64  walker_visits      walker PageRank visit count
+ *   f64  psi             MERW dominant eigenvector component
  *
  * AdjBlock:
  *   u32  count
@@ -45,18 +51,25 @@
  *   u64  offsets[capacity]
  */
 
+import * as fs from 'fs';
 import { MemoryFile } from './memoryfile.js';
 import { type StringTable } from './stringtable.js';
 
 // --- Constants ---
 
-export const ENTITY_RECORD_SIZE = 64;
+export const ENTITY_RECORD_SIZE = 72;
+const OLD_ENTITY_RECORD_SIZE = 64;     // v1 layout without psi
 export const ADJ_ENTRY_SIZE = 24;      // 8 + 4 + 4 + 8, naturally aligned
 const ADJ_HEADER_SIZE = 8;             // count:u32 + capacity:u32
 const NODE_LOG_HEADER_SIZE = 8;        // count:u32 + capacity:u32
 const GRAPH_HEADER_SIZE = 24;          // node_log_offset:u64 + structural_total:u64 + walker_total:u64
 const INITIAL_ADJ_CAPACITY = 4;
 const INITIAL_LOG_CAPACITY = 256;
+
+// Graph-layer version stored in the memfile header version field
+const GRAPH_VERSION_V1 = 1;            // original 64-byte entity records
+const GRAPH_VERSION_V2 = 2;            // 72-byte entity records with f64 psi
+export const CURRENT_GRAPH_VERSION = GRAPH_VERSION_V2;
 
 // Direction flags
 export const DIR_FORWARD = 0n;
@@ -78,7 +91,8 @@ const E_OBS1_ID = 40;
 // 4 bytes pad at 44
 const E_STRUCTURAL_VISITS = 48;  // u64: 48..55, 8-aligned
 const E_WALKER_VISITS = 56;      // u64: 56..63, 8-aligned
-// total = 64
+const E_PSI = 64;               // f64: 64..71, 8-aligned (MERW eigenvector component)
+// total = 72
 
 // AdjEntry field offsets (within each entry)
 const AE_TARGET_DIR = 0;
@@ -119,6 +133,7 @@ export interface EntityRecord {
   obs1Id: number;         // 0 = empty
   structuralVisits: bigint;  // structural PageRank visit count
   walkerVisits: bigint;      // walker PageRank visit count
+  psi: number;               // MERW dominant eigenvector component
 }
 
 export interface AdjEntry {
@@ -144,6 +159,7 @@ export function readEntityRecord(mf: MemoryFile, offset: bigint): EntityRecord {
     obs1Id: buf.readUInt32LE(E_OBS1_ID),
     structuralVisits: buf.readBigUInt64LE(E_STRUCTURAL_VISITS),
     walkerVisits: buf.readBigUInt64LE(E_WALKER_VISITS),
+    psi: buf.readDoubleLE(E_PSI),
   };
 }
 
@@ -159,6 +175,7 @@ export function writeEntityRecord(mf: MemoryFile, rec: EntityRecord): void {
   buf.writeUInt32LE(rec.obs1Id, E_OBS1_ID);
   buf.writeBigUInt64LE(rec.structuralVisits, E_STRUCTURAL_VISITS);
   buf.writeBigUInt64LE(rec.walkerVisits, E_WALKER_VISITS);
+  buf.writeDoubleLE(rec.psi, E_PSI);
   mf.write(rec.offset, buf);
 }
 
@@ -222,11 +239,105 @@ export class GraphFile {
 
     const stats = this.mf.stats();
     if (stats.allocated <= 32n) {
+      // Fresh DB — initialize with current version
       this.graphHeaderOffset = this.initGraphHeader();
+      this.mf.setVersion(CURRENT_GRAPH_VERSION);
     } else {
-      // First allocation is graph header, at offset 40 (32 memfile header + 8 alloc_t header)
+      // Existing DB — check version and migrate if needed
       this.graphHeaderOffset = 40n;
+      const version = this.mf.getVersion();
+      if (version === GRAPH_VERSION_V1) {
+        this.migrateV1toV2(graphPath);
+      } else if (version !== CURRENT_GRAPH_VERSION) {
+        throw new Error(`GraphFile: unknown version ${version} (expected ${GRAPH_VERSION_V1} or ${CURRENT_GRAPH_VERSION})`);
+      }
     }
+  }
+
+  /**
+   * Migrate a v1 graph file (64-byte entity records) to v2 (72-byte with psi).
+   *
+   * Strategy: read all entities and edges from the current (v1) file into memory,
+   * close it, rename it to .v1, create a fresh file, write everything back with
+   * the new layout.
+   */
+  private migrateV1toV2(graphPath: string): void {
+    // 1. Read all entities and adjacency data from v1 layout
+    const offsets = this.getAllEntityOffsets();
+    const oldEntities: { rec: EntityRecord; edges: AdjEntry[] }[] = [];
+
+    for (const offset of offsets) {
+      // Read v1 entity (64 bytes) — the first 64 bytes match our struct minus psi
+      const buf = this.mf.read(offset, BigInt(OLD_ENTITY_RECORD_SIZE));
+      const rec: EntityRecord = {
+        offset,
+        nameId: buf.readUInt32LE(E_NAME_ID),
+        typeId: buf.readUInt32LE(E_TYPE_ID),
+        adjOffset: buf.readBigUInt64LE(E_ADJ_OFFSET),
+        mtime: buf.readBigUInt64LE(E_MTIME),
+        obsMtime: buf.readBigUInt64LE(E_OBS_MTIME),
+        obsCount: buf.readUInt8(E_OBS_COUNT),
+        obs0Id: buf.readUInt32LE(E_OBS0_ID),
+        obs1Id: buf.readUInt32LE(E_OBS1_ID),
+        structuralVisits: buf.readBigUInt64LE(E_STRUCTURAL_VISITS),
+        walkerVisits: buf.readBigUInt64LE(E_WALKER_VISITS),
+        psi: 0,
+      };
+      const edges = rec.adjOffset !== 0n ? readAdjBlock(this.mf, rec.adjOffset).entries : [];
+      oldEntities.push({ rec, edges });
+    }
+
+    // 2. Read global counters
+    const structuralTotal = this.getStructuralTotal();
+    const walkerTotal = this.getWalkerTotal();
+
+    // 3. Close old file, rename to .v1 backup
+    this.mf.sync();
+    this.mf.close();
+    const backupPath = graphPath + '.v1';
+    fs.renameSync(graphPath, backupPath);
+
+    // 4. Create fresh v2 file
+    this.mf = new MemoryFile(graphPath, 65536);
+    this.mf.setVersion(CURRENT_GRAPH_VERSION);
+    this.graphHeaderOffset = this.initGraphHeader();
+
+    // 5. Write global counters
+    const ghBuf = Buffer.alloc(8);
+    ghBuf.writeBigUInt64LE(structuralTotal, 0);
+    this.mf.write(this.graphHeaderOffset + BigInt(GH_STRUCTURAL_TOTAL), ghBuf);
+    ghBuf.writeBigUInt64LE(walkerTotal, 0);
+    this.mf.write(this.graphHeaderOffset + BigInt(GH_WALKER_TOTAL), ghBuf);
+
+    // 6. Write all entities with new 72-byte layout, building offset remap
+    const offsetMap = new Map<bigint, bigint>();  // old offset → new offset
+
+    for (const { rec } of oldEntities) {
+      const newOffset = this.mf.alloc(BigInt(ENTITY_RECORD_SIZE));
+      if (newOffset === 0n) throw new Error('GraphFile migration: entity alloc failed');
+      offsetMap.set(rec.offset, newOffset);
+
+      const newRec: EntityRecord = { ...rec, offset: newOffset, adjOffset: 0n, psi: 0 };
+      writeEntityRecord(this.mf, newRec);
+      this.nodeLogAppend(newOffset);
+    }
+
+    // 7. Rebuild adjacency blocks with remapped target offsets
+    for (const { rec, edges } of oldEntities) {
+      const newOffset = offsetMap.get(rec.offset)!;
+      for (const edge of edges) {
+        const newTarget = offsetMap.get(edge.targetOffset);
+        if (newTarget === undefined) continue;  // skip dangling refs
+        this.addEdge(newOffset, {
+          targetOffset: newTarget,
+          direction: edge.direction,
+          relTypeId: edge.relTypeId,
+          mtime: edge.mtime,
+        });
+      }
+    }
+
+    this.mf.sync();
   }
 
   private initGraphHeader(): bigint {
@@ -289,6 +400,7 @@ export class GraphFile {
       obs1Id: 0,
       structuralVisits: 0n,
       walkerVisits: 0n,
+      psi: 0,
     };
     writeEntityRecord(this.mf, rec);
     this.nodeLogAppend(offset);
@@ -638,6 +750,21 @@ export class GraphFile {
     if (total === 0n) return 0;
     const rec = this.readEntity(entityOffset);
     return Number(rec.walkerVisits) / Number(total);
+  }
+
+  // --- MERW eigenvector ---
+
+  /** Write the psi (MERW eigenvector component) for an entity. */
+  setPsi(entityOffset: bigint, psi: number): void {
+    const buf = Buffer.alloc(8);
+    buf.writeDoubleLE(psi, 0);
+    this.mf.write(entityOffset + BigInt(E_PSI), buf);
+  }
+
+  /** Read the psi (MERW eigenvector component) for an entity. */
+  getPsi(entityOffset: bigint): number {
+    const buf = this.mf.read(entityOffset + BigInt(E_PSI), 8n);
+    return buf.readDoubleLE(0);
   }
 
   // --- Lifecycle & Concurrency ---

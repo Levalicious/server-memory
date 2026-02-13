@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type EntityRecord, type AdjEntry } from './src/graphfile.js';
 import { StringTable } from './src/stringtable.js';
 import { structuralSample } from './src/pagerank.js';
+import { computeMerwPsi } from './src/merw.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
 
 // Define memory file path using environment variable with fallback
@@ -186,63 +187,13 @@ function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX
 }
 
 function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relationCursor: number = 0): { entities: PaginatedResult<Entity>; relations: PaginatedResult<Relation> } {
-  // Build incrementally, measuring actual serialized size
-  const entityCount = graph.entities.length;
-  const relationCount = graph.relations.length;
-  
-  // Start with empty result to measure base overhead
-  const emptyResult = {
-    entities: { items: [] as Entity[], nextCursor: null as number | null, totalCount: entityCount },
-    relations: { items: [] as Relation[], nextCursor: null as number | null, totalCount: relationCount }
-  };
-  let currentSize = JSON.stringify(emptyResult).length;
-  
-  const resultEntities: Entity[] = [];
-  const resultRelations: Relation[] = [];
-  let entityIdx = entityCursor;
-  let relationIdx = relationCursor;
-  
-  // Add entities until we hit the limit
-  while (entityIdx < graph.entities.length) {
-    const entity = graph.entities[entityIdx];
-    const entityJson = JSON.stringify(entity);
-    const addedChars = entityJson.length + (resultEntities.length > 0 ? 1 : 0);
-    
-    if (currentSize + addedChars > MAX_CHARS) {
-      break;
-    }
-    
-    resultEntities.push(entity);
-    currentSize += addedChars;
-    entityIdx++;
-  }
-  
-  // Add relations with remaining space
-  while (relationIdx < graph.relations.length) {
-    const relation = graph.relations[relationIdx];
-    const relationJson = JSON.stringify(relation);
-    const addedChars = relationJson.length + (resultRelations.length > 0 ? 1 : 0);
-    
-    if (currentSize + addedChars > MAX_CHARS) {
-      break;
-    }
-    
-    resultRelations.push(relation);
-    currentSize += addedChars;
-    relationIdx++;
-  }
-  
+  // Entities and relations have independent cursors, so paginate them
+  // independently — each gets the full budget.  The caller already has
+  // previously-returned pages and only needs the next page of whichever
+  // section it is advancing.
   return {
-    entities: {
-      items: resultEntities,
-      nextCursor: entityIdx < graph.entities.length ? entityIdx : null,
-      totalCount: entityCount
-    },
-    relations: {
-      items: resultRelations,
-      nextCursor: relationIdx < graph.relations.length ? relationIdx : null,
-      totalCount: relationCount
-    }
+    entities: paginateItems(graph.entities, entityCursor),
+    relations: paginateItems(graph.relations, relationCursor),
   };
 }
 
@@ -267,9 +218,10 @@ export class KnowledgeGraphManager {
     this.nameIndex = new Map();
     this.rebuildNameIndex();
 
-    // Run initial structural sampling if graph is non-empty
+    // Run initial structural sampling and MERW if graph is non-empty
     if (this.nameIndex.size > 0) {
       structuralSample(this.gf, 1, 0.85);
+      computeMerwPsi(this.gf);
       this.gf.sync();
     }
   }
@@ -379,11 +331,12 @@ export class KnowledgeGraphManager {
     });
   }
 
-  /** Re-run structural sampling (call after graph mutations) */
+  /** Re-run structural sampling and MERW eigenvector computation (call after graph mutations) */
   resample(): void {
     this.withWriteLock(() => {
       if (this.nameIndex.size > 0) {
         structuralSample(this.gf, 1, 0.85);
+        computeMerwPsi(this.gf);
       }
     });
   }
@@ -961,7 +914,7 @@ export class KnowledgeGraphManager {
         if (!offset) break;
 
         const edges = this.gf.getEdges(offset);
-        const validNeighbors = new Set<string>();
+        const candidates: { name: string; psi: number }[] = [];
 
         for (const edge of edges) {
           if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
@@ -969,14 +922,49 @@ export class KnowledgeGraphManager {
 
           const targetRec = this.gf.readEntity(edge.targetOffset);
           const neighborName = this.st.get(BigInt(targetRec.nameId));
-          if (neighborName !== current) validNeighbors.add(neighborName);
+          if (neighborName !== current && this.nameIndex.has(neighborName)) {
+            candidates.push({ name: neighborName, psi: targetRec.psi });
+          }
         }
 
-        const neighborArr = Array.from(validNeighbors).filter(n => this.nameIndex.has(n));
-        if (neighborArr.length === 0) break;
+        // Deduplicate: keep max psi per name (multiple edge types to same target)
+        const byName = new Map<string, number>();
+        for (const c of candidates) {
+          const existing = byName.get(c.name);
+          if (existing === undefined || c.psi > existing) {
+            byName.set(c.name, c.psi);
+          }
+        }
 
-        const idx = Math.floor(random() * neighborArr.length);
-        current = neighborArr[idx];
+        if (byName.size === 0) break;
+
+        const neighborArr = Array.from(byName.entries());
+
+        // MERW-weighted sampling: probability proportional to ψ_j
+        // (The ψ_i denominator is constant for all neighbors and cancels in normalization)
+        let totalPsi = 0;
+        for (const [, psi] of neighborArr) totalPsi += psi;
+
+        let chosen: string;
+        if (totalPsi > 0) {
+          // Weighted sampling by psi
+          const r = random() * totalPsi;
+          let cumulative = 0;
+          chosen = neighborArr[neighborArr.length - 1][0]; // fallback
+          for (const [name, psi] of neighborArr) {
+            cumulative += psi;
+            if (r <= cumulative) {
+              chosen = name;
+              break;
+            }
+          }
+        } else {
+          // psi not yet computed (all zero) — fall back to uniform
+          const idx = Math.floor(random() * neighborArr.length);
+          chosen = neighborArr[idx][0];
+        }
+
+        current = chosen;
         pathNames.push(current);
       }
 
