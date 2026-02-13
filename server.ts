@@ -186,63 +186,13 @@ function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX
 }
 
 function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relationCursor: number = 0): { entities: PaginatedResult<Entity>; relations: PaginatedResult<Relation> } {
-  // Build incrementally, measuring actual serialized size
-  const entityCount = graph.entities.length;
-  const relationCount = graph.relations.length;
-  
-  // Start with empty result to measure base overhead
-  const emptyResult = {
-    entities: { items: [] as Entity[], nextCursor: null as number | null, totalCount: entityCount },
-    relations: { items: [] as Relation[], nextCursor: null as number | null, totalCount: relationCount }
-  };
-  let currentSize = JSON.stringify(emptyResult).length;
-  
-  const resultEntities: Entity[] = [];
-  const resultRelations: Relation[] = [];
-  let entityIdx = entityCursor;
-  let relationIdx = relationCursor;
-  
-  // Add entities until we hit the limit
-  while (entityIdx < graph.entities.length) {
-    const entity = graph.entities[entityIdx];
-    const entityJson = JSON.stringify(entity);
-    const addedChars = entityJson.length + (resultEntities.length > 0 ? 1 : 0);
-    
-    if (currentSize + addedChars > MAX_CHARS) {
-      break;
-    }
-    
-    resultEntities.push(entity);
-    currentSize += addedChars;
-    entityIdx++;
-  }
-  
-  // Add relations with remaining space
-  while (relationIdx < graph.relations.length) {
-    const relation = graph.relations[relationIdx];
-    const relationJson = JSON.stringify(relation);
-    const addedChars = relationJson.length + (resultRelations.length > 0 ? 1 : 0);
-    
-    if (currentSize + addedChars > MAX_CHARS) {
-      break;
-    }
-    
-    resultRelations.push(relation);
-    currentSize += addedChars;
-    relationIdx++;
-  }
-  
+  // Entities and relations have independent cursors, so paginate them
+  // independently — each gets the full budget.  The caller already has
+  // previously-returned pages and only needs the next page of whichever
+  // section it is advancing.
   return {
-    entities: {
-      items: resultEntities,
-      nextCursor: entityIdx < graph.entities.length ? entityIdx : null,
-      totalCount: entityCount
-    },
-    relations: {
-      items: resultRelations,
-      nextCursor: relationIdx < graph.relations.length ? relationIdx : null,
-      totalCount: relationCount
-    }
+    entities: paginateItems(graph.entities, entityCursor),
+    relations: paginateItems(graph.relations, relationCursor),
   };
 }
 
