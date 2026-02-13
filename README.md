@@ -1,6 +1,25 @@
 # Knowledge Graph Memory Server
 
-A basic implementation of persistent memory using a local knowledge graph. This lets Claude remember information about the user across chats.
+A persistent knowledge graph with binary storage, PageRank-based ranking, and Maximum Entropy Random Walk (MERW) exploration. Designed as an MCP server for use with LLM agents.
+
+## Storage Format
+
+The knowledge graph is stored in two binary files using a custom mmap-backed arena allocator:
+
+- **`<base>.graph`** — Entity records (72 bytes each), adjacency blocks, and node log
+- **`<base>.strings`** — Interned, refcounted string table
+
+This replaces the original JSONL format. The binary format supports O(1) entity lookup, POSIX file locking for concurrent access, and in-place mutation without rewriting the entire file.
+
+> [!NOTE]
+> **Migrating from JSONL:** If you have an existing `.json` knowledge graph, use the migration script:
+> ```sh
+> npx tsx scripts/migrate-jsonl.ts [path/to/memory.json]
+> ```
+> The original `.json` file is preserved. See also `scripts/verify-migration.ts` to validate the result. The `MEMORY_FILE_PATH` does not need to change.
+
+> [!NOTE]
+> **Automatic v1→v2 migration:** Graph files using the v1 format (64-byte entity records) are automatically migrated to v2 (72-byte records with MERW ψ field) on first open. The old file is preserved as `<name>.graph.v1`.
 
 ## Core Concepts
 
@@ -52,6 +71,27 @@ Example:
   ]
 }
 ```
+
+### Ranking
+
+Two ranking systems are maintained and updated after every graph mutation:
+
+- **PageRank (`pagerank`)** — Structural importance via Monte Carlo random walks on graph topology (Avrachenkov et al. Algorithm 4). Each mutation triggers a full sampling pass.
+- **LLM Rank (`llmrank`)** — Walker visit counts that track which nodes the LLM actually opens/searches. Primary sort for `llmrank` is walker visits, with PageRank as tiebreaker.
+
+### Maximum Entropy Random Walk (MERW)
+
+The `random_walk` tool uses MERW rather than a standard uniform random walk. MERW maximizes the global entropy rate by sampling uniformly among all paths in the graph, rather than locally maximizing entropy at each vertex.
+
+Transition probabilities are computed from the dominant eigenvector ψ of the (damped) adjacency matrix:
+
+```
+S_ij = (A_ij / λ) · (ψ_j / ψ_i)
+```
+
+The eigenvector is computed via sparse power iteration with teleportation damping (α=0.85), warm-started from the previously stored ψ values. After a small graph mutation, convergence typically requires only 2–5 iterations rather than a full cold start.
+
+**Practical effect:** Walks gravitate toward structurally rich regions of the graph rather than wandering down linear chains, making serendipitous exploration more productive.
 
 ## API
 
@@ -110,51 +150,51 @@ Example:
   - Search for nodes using a regex pattern
   - Input: 
     - `query` (string): Regex pattern to search
-    - `sortBy` (string, optional): Sort field ("mtime", "obsMtime", or "name")
-    - `sortDir` (string, optional): Sort direction ("asc" or "desc")
-    - `entityCursor` (number, optional), `relationCursor` (number, optional)
+    - `sortBy` (string, optional): Sort field (`mtime`, `obsMtime`, `name`, `pagerank`, `llmrank`). Default: `llmrank`
+    - `sortDir` (string, optional): Sort direction (`asc` or `desc`)
+    - `direction` (string, optional): Edge direction filter (`forward`, `backward`, `any`). Default: `forward`
+    - `entityCursor`, `relationCursor` (number, optional): Pagination cursors
   - Searches across entity names, types, and observation content
   - Returns matching entities and their relations (paginated)
 
-- **open_nodes_filtered**
-  - Retrieve specific nodes by name with filtered relations
-  - Input: `names` (string[]), `entityCursor` (number, optional), `relationCursor` (number, optional)
-  - Returns:
-    - Requested entities
-    - Only relations where both endpoints are in the requested set
-  - Silently skips non-existent nodes (paginated)
-
 - **open_nodes**
   - Retrieve specific nodes by name
-  - Input: `names` (string[]), `entityCursor` (number, optional), `relationCursor` (number, optional)
-  - Returns:
-    - Requested entities
-    - Relations originating from requested entities
-  - Silently skips non-existent nodes (paginated)
+  - Input:
+    - `names` (string[]): Entity names to retrieve
+    - `direction` (string, optional): Edge direction filter (`forward`, `backward`, `any`). Default: `forward`
+    - `entityCursor`, `relationCursor` (number, optional): Pagination cursors
+  - Returns requested entities and relations originating from them (paginated)
+  - Silently skips non-existent nodes
 
 - **get_neighbors**
   - Get names of neighboring entities connected to a specific entity within a given depth
   - Input: 
     - `entityName` (string): The entity to find neighbors for
     - `depth` (number, default: 1): Maximum traversal depth
-    - `sortBy` (string, optional): Sort field ("mtime", "obsMtime", or "name")
-    - `sortDir` (string, optional): Sort direction ("asc" or "desc")
+    - `sortBy` (string, optional): Sort field (`mtime`, `obsMtime`, `name`, `pagerank`, `llmrank`). Default: `llmrank`
+    - `sortDir` (string, optional): Sort direction (`asc` or `desc`)
+    - `direction` (string, optional): Edge direction filter (`forward`, `backward`, `any`). Default: `forward`
     - `cursor` (number, optional): Pagination cursor
   - Returns neighbor names with timestamps (paginated)
   - Use `open_nodes` to get full entity data for neighbors
 
 - **find_path**
   - Find a path between two entities in the knowledge graph
-  - Input: `fromEntity` (string), `toEntity` (string), `maxDepth` (number, default: 5), `cursor` (number, optional)
+  - Input:
+    - `fromEntity` (string): Starting entity
+    - `toEntity` (string): Target entity
+    - `maxDepth` (number, default: 5): Maximum search depth
+    - `direction` (string, optional): Edge direction filter (`forward`, `backward`, `any`). Default: `forward`
+    - `cursor` (number, optional): Pagination cursor
   - Returns path between entities if one exists (paginated)
 
 - **get_entities_by_type**
   - Get all entities of a specific type
   - Input: 
     - `entityType` (string): Type to filter by
-    - `sortBy` (string, optional): Sort field ("mtime", "obsMtime", or "name")
-    - `sortDir` (string, optional): Sort direction ("asc" or "desc")
-    - `cursor` (number, optional)
+    - `sortBy` (string, optional): Sort field (`mtime`, `obsMtime`, `name`, `pagerank`, `llmrank`). Default: `llmrank`
+    - `sortDir` (string, optional): Sort direction (`asc` or `desc`)
+    - `cursor` (number, optional): Pagination cursor
   - Returns all entities matching the specified type (paginated)
 
 - **get_entity_types**
@@ -176,9 +216,9 @@ Example:
   - Get entities that have no relations (orphaned entities)
   - Input: 
     - `strict` (boolean, default: false): If true, returns entities not connected to 'Self' entity
-    - `sortBy` (string, optional): Sort field ("mtime", "obsMtime", or "name")
-    - `sortDir` (string, optional): Sort direction ("asc" or "desc")
-    - `cursor` (number, optional)
+    - `sortBy` (string, optional): Sort field (`mtime`, `obsMtime`, `name`, `pagerank`, `llmrank`). Default: `llmrank`
+    - `sortDir` (string, optional): Sort direction (`asc` or `desc`)
+    - `cursor` (number, optional): Pagination cursor
   - Returns entities with no connections (paginated)
 
 - **validate_graph**
@@ -195,19 +235,30 @@ Example:
   - Useful for interpreting `mtime`/`obsMtime` values from entities
 
 - **random_walk**
-  - Perform a random walk from a starting entity, following random relations
+  - Perform a MERW-weighted random walk from a starting entity
   - Input:
     - `start` (string): Name of the entity to start the walk from
     - `depth` (number, default: 3): Number of hops to take
     - `seed` (string, optional): Seed for reproducible walks
+    - `direction` (string, optional): Edge direction filter (`forward`, `backward`, `any`). Default: `forward`
+  - Neighbors are selected proportional to their MERW eigenvector component ψ
+  - Falls back to uniform sampling if ψ has not been computed
   - Returns the terminal entity name and the path taken
-  - Useful for serendipitous exploration of the knowledge graph
 
 - **sequentialthinking**
   - Record a thought in the knowledge graph
   - Input: `observations` (string[], max 2, each max 140 chars), `previousCtxId` (string, optional)
   - Creates a Thought entity and links it to the previous thought if provided
   - Returns the new thought's context ID for chaining
+
+- **kb_load**
+  - Load a plaintext document into the knowledge graph
+  - Input:
+    - `filePath` (string): Absolute path to a plaintext file (`.txt`, `.md`, `.tex`, source code, etc.)
+    - `title` (string, optional): Document title. Defaults to filename without extension
+    - `topK` (number, optional): Number of top TextRank sentences to highlight in the index. Default: 15
+  - Creates a doubly-linked chain of TextChunk entities, a Document entity, and a DocumentIndex with TextRank-selected entry points
+  - For PDFs, convert to text first (e.g., `pdftotext`)
 
 # Usage with Claude Desktop
 
