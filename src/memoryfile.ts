@@ -149,6 +149,25 @@ export class MemoryFile {
   }
 
   /**
+   * Read the memfile version field (u32 at offset 4).
+   */
+  getVersion(): number {
+    this.assertOpen();
+    const buf = native.read(this.handle, 4n, 4n);
+    return buf.readUInt32LE(0);
+  }
+
+  /**
+   * Write the memfile version field (u32 at offset 4).
+   */
+  setVersion(version: number): void {
+    this.assertOpen();
+    const buf = Buffer.alloc(4);
+    buf.writeUInt32LE(version, 0);
+    native.write(this.handle, 4n, buf);
+  }
+
+  /**
    * Close the memory file. Syncs and unmaps.
    * The instance is unusable after this.
    */
