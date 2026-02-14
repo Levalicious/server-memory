@@ -152,7 +152,7 @@ function sortNeighbors(
   });
 }
 
-export const MAX_CHARS = 2048;
+export const MAX_CHARS = 16384;
 
 function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
   const result: T[] = [];
