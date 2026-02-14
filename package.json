@@ -1,6 +1,6 @@
 {
   "name": "@levalicious/server-memory",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "description": "MCP server for enabling memory for Claude through a knowledge graph",
   "license": "MIT",
   "author": "Levalicious",
