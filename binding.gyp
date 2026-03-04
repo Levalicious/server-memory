@@ -10,7 +10,16 @@
         "native"
       ],
       "cflags": ["-std=c11", "-Wall", "-Wextra", "-O2"],
-      "defines": ["_GNU_SOURCE"]
+      "conditions": [
+        ["OS=='linux'", {
+          "defines": ["_GNU_SOURCE"]
+        }],
+        ["OS=='mac'", {
+          "xcode_settings": {
+            "OTHER_CFLAGS": ["-std=c11", "-Wall", "-Wextra", "-O2"]
+          }
+        }]
+      ]
     }
   ]
 }
