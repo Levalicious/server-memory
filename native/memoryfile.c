@@ -52,10 +52,20 @@ static int memfile_remap(memfile_t *mf, size_t new_size) {
         return -1;
     }
 
+#ifdef __linux__
     void *new_base = mremap(mf->mmap_base, mf->mmap_size, new_size, MREMAP_MAYMOVE);
     if (new_base == MAP_FAILED) {
         return -1;
     }
+#else
+    /* Portable fallback: unmap old region, map new size */
+    munmap(mf->mmap_base, mf->mmap_size);
+    void *new_base = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, mf->fd, 0);
+    if (new_base == MAP_FAILED) {
+        return -1;
+    }
+#endif
 
     mf->mmap_base = new_base;
     mf->mmap_size = new_size;
@@ -239,8 +249,15 @@ int memfile_refresh(memfile_t *mf) {
     if (actual_size <= mf->mmap_size) return 0;  /* No growth detected */
 
     /* File grew — remap to cover the new size */
+#ifdef __linux__
     void *new_base = mremap(mf->mmap_base, mf->mmap_size, actual_size, MREMAP_MAYMOVE);
     if (new_base == MAP_FAILED) return -1;
+#else
+    munmap(mf->mmap_base, mf->mmap_size);
+    void *new_base = mmap(NULL, actual_size, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, mf->fd, 0);
+    if (new_base == MAP_FAILED) return -1;
+#endif
 
     mf->mmap_base = new_base;
     mf->mmap_size = actual_size;
