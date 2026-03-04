@@ -25,11 +25,15 @@ jobs:
         run: yarn lint
 
   test:
-    name: Test
+    name: Test (${{ matrix.os }})
     needs: [lint]
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -50,10 +54,14 @@ jobs:
 
   build:
     needs: [test]
-    name: Build
+    name: Build (${{ matrix.os }})
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6

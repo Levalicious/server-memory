@@ -1,6 +1,6 @@
 {
   "name": "@levalicious/server-memory",
-  "version": "0.0.16",
+  "version": "0.0.17",
   "description": "MCP server for enabling memory for Claude through a knowledge graph",
   "license": "MIT",
   "author": "Levalicious",
@@ -26,7 +26,7 @@
     "test": "NODE_OPTIONS='--experimental-vm-modules' jest"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.26.0"
+    "@modelcontextprotocol/sdk": "1.27.1"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",
