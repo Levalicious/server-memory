@@ -1300,13 +1300,16 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(docResult.entities.items).toHaveLength(1);
       expect(docResult.entities.items[0].entityType).toBe('Document');
 
-      // Check index entities (one per key phrase)
+      // Check index entities — one hub (0 observations) + entries (1 observation each)
       const indexEntities = await callTool(client, 'get_entities_by_type', { entityType: 'DocumentIndex' }) as PaginatedResult<Entity>;
-      expect(indexEntities.items.length).toBeGreaterThan(0);
-      for (const idx of indexEntities.items) {
-        expect(idx.entityType).toBe('DocumentIndex');
-        expect(idx.observations.length).toBe(1);
-        expect(idx.observations[0].length).toBeLessThanOrEqual(140);
+      expect(indexEntities.items.length).toBeGreaterThan(1);
+      const hub = indexEntities.items.filter(e => e.observations.length === 0);
+      const entries = indexEntities.items.filter(e => e.observations.length > 0);
+      expect(hub).toHaveLength(1);
+      expect(entries.length).toBeGreaterThan(0);
+      for (const entry of entries) {
+        expect(entry.observations.length).toBe(1);
+        expect(entry.observations[0].length).toBeLessThanOrEqual(140);
       }
 
       // Check TextChunk entities exist via type query
