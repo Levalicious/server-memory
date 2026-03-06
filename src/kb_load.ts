@@ -403,24 +403,18 @@ export function loadDocument(
     highlights.push({ chunk, sentence, score });
   }
 
-  // 6. Build index observations (compressed sentence previews)
-  const indexId = `${title}__index`;
-  const indexObs: string[] = [];
-  let current = '';
-  for (const { sentence } of highlights) {
-    const preview = sentence.text.length > 60
-      ? sentence.text.slice(0, 57) + '...'
-      : sentence.text;
-    const candidate = current ? current + ' | ' + preview : preview;
-    if (candidate.length <= MAX_OBS_LENGTH) {
-      current = candidate;
-    } else {
-      if (current) indexObs.push(current);
-      if (indexObs.length >= MAX_OBS_PER_ENTITY) break;
-      current = preview.length <= MAX_OBS_LENGTH ? preview : preview.slice(0, MAX_OBS_LENGTH);
-    }
+  // 6. Build index entities — one per highlighted phrase
+  //    Each DocumentIndex entity holds a single extracted key phrase as its
+  //    observation, and links to the chunk that contains it. This gives the
+  //    walker discrete semantic entry points into the document chain.
+  const indexEntities: Array<{ id: string; phrase: string; chunk: Chunk }> = [];
+  for (const { chunk, sentence } of highlights) {
+    const phrase = sentence.text.length <= MAX_OBS_LENGTH
+      ? sentence.text
+      : sentence.text.slice(0, MAX_OBS_LENGTH - 3) + '...';
+    const indexId = `${title}__idx_${indexEntities.length}`;
+    indexEntities.push({ id: indexId, phrase, chunk });
   }
-  if (current && indexObs.length < MAX_OBS_PER_ENTITY) indexObs.push(current);
 
   // ─── Assemble entities ──────────────────────────────────────────
 
@@ -439,12 +433,14 @@ export function loadDocument(
     });
   }
 
-  // Index entity
-  entities.push({
-    name: indexId,
-    entityType: 'DocumentIndex',
-    observations: indexObs,
-  });
+  // Index entities — one per key phrase
+  for (const idx of indexEntities) {
+    entities.push({
+      name: idx.id,
+      entityType: 'DocumentIndex',
+      observations: [idx.phrase],
+    });
+  }
 
   // ─── Assemble relations ─────────────────────────────────────────
 
@@ -464,14 +460,16 @@ export function loadDocument(
     relations.push({ from: chunks[i + 1].id, to: chunks[i].id, relationType: 'preceded_by' });
   }
 
-  // Document → index
-  relations.push({ from: title, to: indexId, relationType: 'has_index' });
-  relations.push({ from: indexId, to: title, relationType: 'indexes' });
+  // Document → index entries
+  for (const idx of indexEntities) {
+    relations.push({ from: title, to: idx.id, relationType: 'has_index' });
+    relations.push({ from: idx.id, to: title, relationType: 'indexes' });
+  }
 
   // Index → highlighted chunks
-  for (const { chunk } of highlights) {
-    relations.push({ from: indexId, to: chunk.id, relationType: 'highlights' });
-    relations.push({ from: chunk.id, to: indexId, relationType: 'highlighted_by' });
+  for (const idx of indexEntities) {
+    relations.push({ from: idx.id, to: idx.chunk.id, relationType: 'highlights' });
+    relations.push({ from: idx.chunk.id, to: idx.id, relationType: 'highlighted_by' });
   }
 
   return {

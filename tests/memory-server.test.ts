@@ -1300,10 +1300,14 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(docResult.entities.items).toHaveLength(1);
       expect(docResult.entities.items[0].entityType).toBe('Document');
 
-      // Check index entity
-      const indexResult = await callTool(client, 'open_nodes', { names: ['test-doc__index'] }) as PaginatedGraph;
-      expect(indexResult.entities.items).toHaveLength(1);
-      expect(indexResult.entities.items[0].entityType).toBe('DocumentIndex');
+      // Check index entities (one per key phrase)
+      const indexEntities = await callTool(client, 'get_entities_by_type', { entityType: 'DocumentIndex' }) as PaginatedResult<Entity>;
+      expect(indexEntities.items.length).toBeGreaterThan(0);
+      for (const idx of indexEntities.items) {
+        expect(idx.entityType).toBe('DocumentIndex');
+        expect(idx.observations.length).toBe(1);
+        expect(idx.observations[0].length).toBeLessThanOrEqual(140);
+      }
 
       // Check TextChunk entities exist via type query
       const chunks = await callTool(client, 'get_entities_by_type', { entityType: 'TextChunk' }) as PaginatedResult<Entity>;
@@ -1343,8 +1347,11 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'kb_load', { filePath: docFile }) as any;
       expect(result.stats.indexHighlights).toBeGreaterThan(0);
 
-      // Open the index and verify it has highlight relations
-      const indexResult = await callTool(client, 'open_nodes', { names: ['test-doc__index'] }) as PaginatedGraph;
+      // Find index entities and verify they have highlight relations
+      const indexEntities = await callTool(client, 'get_entities_by_type', { entityType: 'DocumentIndex' }) as PaginatedResult<Entity>;
+      expect(indexEntities.items.length).toBeGreaterThan(0);
+      const indexNames = indexEntities.items.map(e => e.name);
+      const indexResult = await callTool(client, 'open_nodes', { names: indexNames }) as PaginatedGraph;
       const highlightRels = indexResult.relations.items.filter(r => r.relationType === 'highlights');
       expect(highlightRels.length).toBeGreaterThan(0);
     });
@@ -1369,7 +1376,7 @@ describe('MCP Memory Server E2E Tests', () => {
 
       // Second load with different content but same title — Document entity
       // already exists with entityType 'Document' and no observations,
-      // so it gets silently skipped. But the index entity already exists
+      // so it gets silently skipped. But the index entities already exist
       // with different observations, so it should error.
       await fs.writeFile(docFile, 'Completely different content for dedup testing now.');
       await expect(
