@@ -1094,7 +1094,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.17",
+    version: "0.0.18",
   }, {
     capabilities: {
       tools: {},
@@ -1419,7 +1419,7 @@ Use this to build chains of reasoning that persist in the graph. Each thought ca
       },
       {
         name: "kb_load",
-        description: `Load a plaintext document into the knowledge graph. Chunks the text into entities connected by a doubly-linked chain, runs sentence TextRank to identify the most important sentences, and creates an index entity that links directly to the chunks containing those sentences.
+        description: `Load a plaintext document into the knowledge graph. Chunks the text into entities connected by a doubly-linked chain, runs sentence TextRank to identify the most important sentences, and creates an index entity per key phrase that links directly to the chunk containing that sentence.
 
 The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use pdftotext first. For other binary formats, convert to text before calling this tool.`,
         inputSchema: {
