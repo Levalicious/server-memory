@@ -442,6 +442,10 @@ export function loadDocument(
     });
   }
 
+  // Index hub — empty structural node linking Document to index entries
+  const indexHubId = `${title}__index`;
+  entities.push({ name: indexHubId, entityType: 'DocumentIndex', observations: [] });
+
   // ─── Assemble relations ─────────────────────────────────────────
 
   // Document → chain endpoints
@@ -460,13 +464,17 @@ export function loadDocument(
     relations.push({ from: chunks[i + 1].id, to: chunks[i].id, relationType: 'preceded_by' });
   }
 
-  // Document → index entries
+  // Document → index hub
+  relations.push({ from: title, to: indexHubId, relationType: 'has_index' });
+  relations.push({ from: indexHubId, to: title, relationType: 'indexes' });
+
+  // Index hub → index entries
   for (const idx of indexEntities) {
-    relations.push({ from: title, to: idx.id, relationType: 'has_index' });
-    relations.push({ from: idx.id, to: title, relationType: 'indexes' });
+    relations.push({ from: indexHubId, to: idx.id, relationType: 'contains' });
+    relations.push({ from: idx.id, to: indexHubId, relationType: 'contained_in' });
   }
 
-  // Index → highlighted chunks
+  // Index entries → highlighted chunks
   for (const idx of indexEntities) {
     relations.push({ from: idx.id, to: idx.chunk.id, relationType: 'highlights' });
     relations.push({ from: idx.chunk.id, to: idx.id, relationType: 'highlighted_by' });
