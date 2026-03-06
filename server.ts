@@ -1094,7 +1094,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.18",
+    version: "0.0.19",
   }, {
     capabilities: {
       tools: {},
