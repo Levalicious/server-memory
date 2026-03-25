@@ -152,7 +152,7 @@ function sortNeighbors(
   });
 }
 
-export const MAX_CHARS = 16384;
+export const MAX_CHARS = 4096;
 
 function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
   const result: T[] = [];
@@ -1248,7 +1248,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_nodes",
-        description: "Search for nodes in the knowledge graph using a regex pattern. Results are paginated (max 512 chars).",
+        description: "Search for nodes in the knowledge graph using a regex pattern. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
           properties: {
@@ -1264,7 +1264,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "open_nodes",
-        description: "Open specific nodes in the knowledge graph by their names. Results are paginated (max 512 chars).",
+        description: "Open specific nodes in the knowledge graph by their names. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
           properties: {
@@ -1282,7 +1282,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_neighbors",
-        description: "Get names of neighboring entities connected to a specific entity within a given depth. Returns neighbor names with timestamps for sorting. Use open_nodes to get full entity data. Results are paginated (max 512 chars).",
+        description: "Get names of neighboring entities connected to a specific entity within a given depth. Returns neighbor names with timestamps for sorting. Use open_nodes to get full entity data. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
           properties: {
@@ -1298,7 +1298,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "find_path",
-        description: "Find a path between two entities in the knowledge graph. Results are paginated (max 512 chars).",
+        description: "Find a path between two entities in the knowledge graph. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
           properties: {
@@ -1313,7 +1313,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_entities_by_type",
-        description: "Get all entities of a specific type. Results are paginated (max 512 chars).",
+        description: "Get all entities of a specific type. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
           properties: {
@@ -1351,7 +1351,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_orphaned_entities",
-        description: "Get entities that have no relations (orphaned entities). In strict mode, returns entities not connected to 'Self' entity. Results are paginated (max 512 chars).",
+        description: "Get entities that have no relations (orphaned entities). In strict mode, returns entities not connected to 'Self' entity. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
           properties: {
