@@ -829,6 +829,59 @@ describe('MCP Memory Server E2E Tests', () => {
         callTool(client, 'random_walk', { start: 'NonExistent', depth: 2 })
       ).rejects.toThrow(/not found/);
     });
+
+    it('should accept mode=uniform and produce a valid walk', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 2,
+        mode: 'uniform',
+      }) as { entity: string; path: string[] };
+
+      expect(result.path[0]).toBe('Center');
+      expect(result.path.length).toBeGreaterThanOrEqual(1);
+      expect(result.path.length).toBeLessThanOrEqual(3);
+      expect(result.entity).toBe(result.path[result.path.length - 1]);
+      // Every step must land on an existing graph node — uniform mode must
+      // never invent entities or step off the graph.
+      for (const node of result.path) {
+        expect(['Center', 'North', 'South', 'East']).toContain(node);
+      }
+    });
+
+    it('should produce reproducible uniform walks with the same seed', async () => {
+      const r1 = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 3,
+        seed: 'uniform-seed-xyz',
+        mode: 'uniform',
+      }) as { entity: string; path: string[] };
+      const r2 = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 3,
+        seed: 'uniform-seed-xyz',
+        mode: 'uniform',
+      }) as { entity: string; path: string[] };
+      expect(r1.path).toEqual(r2.path);
+    });
+
+    it('uniform mode should explore all neighbors over many unseeded walks', async () => {
+      // From 'Center' with direction=forward the 1-step neighbor set is
+      // {North, South, East}. Use unseeded walks (true RNG via crypto) so
+      // the test is statistically robust: P(any single neighbor missed in
+      // 200 draws of 1/3) ≈ (2/3)^200 ≈ 1e-35 — well past flake territory.
+      const visited = new Set<string>();
+      for (let i = 0; i < 200; i++) {
+        const r = await callTool(client, 'random_walk', {
+          start: 'Center',
+          depth: 1,
+          mode: 'uniform',
+        }) as { entity: string; path: string[] };
+        if (r.path.length > 1) visited.add(r.path[1]);
+      }
+      expect(visited.has('North')).toBe(true);
+      expect(visited.has('South')).toBe(true);
+      expect(visited.has('East')).toBe(true);
+    });
   });
 
   describe('Sorting', () => {
