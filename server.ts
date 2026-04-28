@@ -77,6 +77,21 @@ export interface PaginatedResult<T> {
 export type EntitySortField = "mtime" | "obsMtime" | "name" | "pagerank" | "llmrank";
 export type SortDirection = "asc" | "desc";
 
+/**
+ * Random-walk transition policy.
+ *
+ *   'merw'    — Maximum-Entropy Random Walk: probability of stepping to
+ *               neighbor j is proportional to ψ_j (the cached MERW
+ *               eigenvector entry), which biases the walk toward
+ *               structurally important nodes. This is the default and
+ *               matches the historical behavior. Falls back to uniform
+ *               if ψ has not been computed yet (all zeros).
+ *   'uniform' — Plain uniform random walk: every eligible neighbor is
+ *               equally likely. Useful for unbiased structural sampling
+ *               or for comparing against MERW.
+ */
+export type RandomWalkMode = "merw" | "uniform";
+
 export interface Neighbor {
   name: string;
   mtime?: number;
@@ -1036,12 +1051,19 @@ export class KnowledgeGraphManager {
     });
   }
 
-  async randomWalk(start: string, depth: number = 3, seed?: string, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<{ entity: string; path: string[] }> {
+  async randomWalk(
+    start: string,
+    depth: number = 3,
+    seed?: string,
+    direction: 'forward' | 'backward' | 'any' = 'forward',
+    mode: RandomWalkMode = 'merw',
+  ): Promise<{ entity: string; path: string[] }> {
     return traced(
       'kb.random_walk',
       {
         'kb.traversal.depth': depth,
         'kb.traversal.direction': direction,
+        'kb.walker.mode': mode,
         'kb.walker.seeded': seed !== undefined,
       },
       (span) => this.withReadLock(() => {
@@ -1100,14 +1122,16 @@ export class KnowledgeGraphManager {
 
           const neighborArr = Array.from(byName.entries());
 
-          // MERW-weighted sampling: probability proportional to ψ_j
-          // (The ψ_i denominator is constant for all neighbors and cancels in normalization)
+          // Compute total ψ once; both modes need it (uniform skips it, but
+          // we still want to know whether ψ is populated for telemetry).
           let totalPsi = 0;
           for (const [, psi] of neighborArr) totalPsi += psi;
 
           let chosen: string;
-          if (totalPsi > 0) {
-            // Weighted sampling by psi
+          if (mode === 'merw' && totalPsi > 0) {
+            // MERW-weighted sampling: probability proportional to ψ_j.
+            // (The ψ_i denominator is constant for all neighbors and
+            //  cancels in normalization.)
             const r = random() * totalPsi;
             let cumulative = 0;
             chosen = neighborArr[neighborArr.length - 1][0]; // fallback
@@ -1119,7 +1143,8 @@ export class KnowledgeGraphManager {
               }
             }
           } else {
-            // psi not yet computed (all zero) — fall back to uniform
+            // mode === 'uniform', or MERW with ψ not yet computed (all zero).
+            // Plain uniform sampling over the deduplicated neighbor set.
             const idx = Math.floor(random() * neighborArr.length);
             chosen = neighborArr[idx][0];
           }
@@ -1555,6 +1580,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             depth: { type: "number", description: "Number of steps to take. Default: 3" },
             seed: { type: "string", description: "Optional seed for reproducible walks." },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
+            mode: {
+              type: "string",
+              enum: ["merw", "uniform"],
+              description:
+                "Transition policy. 'merw' (default) weights each step by ψ (the cached Maximum-Entropy Random Walk eigenvector), biasing the walk toward structurally important nodes; falls back to uniform if ψ is not yet computed. 'uniform' samples each eligible neighbor with equal probability — useful for unbiased exploration or as a baseline for comparison.",
+            },
           },
           required: ["start"],
         },
@@ -1703,7 +1734,13 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
       case "decode_timestamp":
         return { content: [{ type: "text", text: JSON.stringify(knowledgeGraphManager.decodeTimestamp(args.timestamp as number | undefined, args.relative as boolean ?? false)) }] };
       case "random_walk": {
-        const result = await knowledgeGraphManager.randomWalk(args.start as string, args.depth as number ?? 3, args.seed as string | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        const result = await knowledgeGraphManager.randomWalk(
+          args.start as string,
+          args.depth as number ?? 3,
+          args.seed as string | undefined,
+          (args.direction as 'forward' | 'backward' | 'any') ?? 'forward',
+          (args.mode as RandomWalkMode) ?? 'merw',
+        );
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       }
       case "sequentialthinking": {
