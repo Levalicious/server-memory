@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+// MUST be the first import: brings up the OTel SDK (when enabled via env)
+// before any MCP modules construct anything that should be traced.
+import "./src/tracing.js";
+
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "./server.js";
 
