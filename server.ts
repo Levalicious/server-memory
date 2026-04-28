@@ -5,6 +5,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -14,6 +15,27 @@ import { StringTable } from './src/stringtable.js';
 import { structuralSample } from './src/pagerank.js';
 import { computeMerwPsi } from './src/merw.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
+import { toolDurationHistogram, tracer } from './src/tracing.js';
+
+/**
+ * Result envelope for a single tool dispatch. Mirrors the MCP CallToolResult
+ * shape we return from every case; `isError: true` signals a tool-level error
+ * that the LLM should see (vs. a thrown error which becomes a hidden JSON-RPC
+ * protocol error).
+ */
+type ToolDispatchResult = {
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+};
+
+/**
+ * True if the query contains any regex metacharacter. Used to gate the
+ * `search_nodes` natural-language warning: a pure literal that returns no
+ * matches is the signal we want to flag, since regex queries (anchors,
+ * quantifiers, alternation, classes, etc.) are deliberate and may legitimately
+ * match nothing.
+ */
+const HAS_REGEX_META = /[\\^$.*+?()[\]{}|]/;
 
 // Define memory file path using environment variable with fallback
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
@@ -1445,142 +1467,235 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
   };
 });
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  if (!args) {
-    throw new Error(`No arguments provided for tool: ${name}`);
-  }
-
-  switch (name) {
-    case "create_entities": {
-      const result = await knowledgeGraphManager.createEntities(args.entities as Entity[]);
-      knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-    case "create_relations": {
-      const result = await knowledgeGraphManager.createRelations(args.relations as Relation[]);
-      knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    }
-    case "add_observations":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[]), null, 2) }] };
-    case "delete_entities":
-      await knowledgeGraphManager.deleteEntities(args.entityNames as string[]);
-      knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
-      return { content: [{ type: "text", text: "Entities deleted successfully" }] };
-    case "delete_observations":
-      await knowledgeGraphManager.deleteObservations(args.deletions as { entityName: string; observations: string[] }[]);
-      return { content: [{ type: "text", text: "Observations deleted successfully" }] };
-    case "delete_relations":
-      await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
-      knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
-      return { content: [{ type: "text", text: "Relations deleted successfully" }] };
-    case "search_nodes": {
-      const graph = await knowledgeGraphManager.searchNodes(args.query as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
-      // Record walker visits for entities that will be returned to the LLM
-      knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
-      return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
-    }
-    case "open_nodes": {
-      const graph = await knowledgeGraphManager.openNodes(args.names as string[], (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
-      // Record walker visits for opened nodes
-      knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
-      return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
-    }
-    case "get_neighbors": {
-      const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 1, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
-      // Record walker visits for returned neighbors
-      knowledgeGraphManager.recordWalkerVisits(neighbors.map(n => n.name));
-      return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
-    }
-    case "find_path": {
-      const path = await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
-      return { content: [{ type: "text", text: JSON.stringify(paginateItems(path, args.cursor as number ?? 0)) }] };
-    }
-    case "get_entities_by_type": {
-      const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
-      return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
-    }
-    case "get_entity_types":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getEntityTypes(), null, 2) }] };
-    case "get_relation_types":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getRelationTypes(), null, 2) }] };
-    case "get_stats":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
-    case "get_orphaned_entities": {
-      const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
-      return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
-    }
-    case "validate_graph":
-      return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.validateGraph(), null, 2) }] };
-    case "decode_timestamp":
-      return { content: [{ type: "text", text: JSON.stringify(knowledgeGraphManager.decodeTimestamp(args.timestamp as number | undefined, args.relative as boolean ?? false)) }] };
-    case "random_walk": {
-      const result = await knowledgeGraphManager.randomWalk(args.start as string, args.depth as number ?? 3, args.seed as string | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
-    }
-    case "sequentialthinking": {
-      const result = await knowledgeGraphManager.addThought(
-        args.observations as string[],
-        args.previousCtxId as string | undefined
-      );
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
-    }
-    case "kb_load": {
-      const filePath = args.filePath as string;
-
-      // Validate extension
-      validateExtension(filePath);
-
-      // Read file
-      let text: string;
-      try {
-        text = fs.readFileSync(filePath, 'utf-8');
-      } catch (err: unknown) {
-        throw new Error(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
+  /**
+   * Dispatch a single tool call. Extracted from the request handler so the
+   * handler can wrap it with span/metric instrumentation without duplicating
+   * the per-tool logic. Returns the MCP `CallToolResult` shape; thrown errors
+   * become JSON-RPC protocol errors (hidden from the model), while
+   * `{ isError: true }` returns are visible tool-level errors.
+   */
+  async function dispatch(name: string, args: Record<string, unknown>): Promise<ToolDispatchResult> {
+    switch (name) {
+      case "create_entities": {
+        const result = await knowledgeGraphManager.createEntities(args.entities as Entity[]);
+        knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
+      case "create_relations": {
+        const result = await knowledgeGraphManager.createRelations(args.relations as Relation[]);
+        knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+      case "add_observations":
+        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[]), null, 2) }] };
+      case "delete_entities":
+        await knowledgeGraphManager.deleteEntities(args.entityNames as string[]);
+        knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
+        return { content: [{ type: "text", text: "Entities deleted successfully" }] };
+      case "delete_observations":
+        await knowledgeGraphManager.deleteObservations(args.deletions as { entityName: string; observations: string[] }[]);
+        return { content: [{ type: "text", text: "Observations deleted successfully" }] };
+      case "delete_relations":
+        await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
+        knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
+        return { content: [{ type: "text", text: "Relations deleted successfully" }] };
+      case "search_nodes": {
+        const query = args.query as string;
+        const graph = await knowledgeGraphManager.searchNodes(query, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
 
-      // Derive title
-      const title = (args.title as string) ?? path.basename(filePath, path.extname(filePath));
-      const topK = (args.topK as number) ?? 15;
+        // Natural-language guard: literal queries (no regex metacharacters) that
+        // produce zero matches are almost always the LLM mistaking this tool
+        // for a vector-search/NL-search endpoint. Surface a tool-level error
+        // (visible to the model) with a regex suggestion. Skip walker-visit
+        // recording on this path so failed NL queries don't bias llmrank.
+        if (!HAS_REGEX_META.test(query) && graph.entities.length === 0 && graph.relations.length === 0) {
+          const suggested = query.trim().split(/\s+/).filter(Boolean).join('|');
+          const suggestion = suggested && suggested !== query
+            ? ` For multiple terms try ${JSON.stringify(suggested)}.`
+            : '';
+          return {
+            content: [{
+              type: "text",
+              text: `No matches for ${JSON.stringify(query)}. search_nodes uses regex (case-insensitive), not natural language.${suggestion} You can also browse with get_entities_by_type, get_neighbors, or random_walk.`,
+            }],
+            isError: true,
+          };
+        }
 
-      // Run the pipeline (reads string table under read lock)
-      const loadResult = knowledgeGraphManager.prepareDocumentLoad(text, title, topK);
+        // Record walker visits for entities that will be returned to the LLM
+        knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
+        return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+      }
+      case "open_nodes": {
+        const graph = await knowledgeGraphManager.openNodes(args.names as string[], (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        // Record walker visits for opened nodes
+        knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
+        return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+      }
+      case "get_neighbors": {
+        const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 1, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        // Record walker visits for returned neighbors
+        knowledgeGraphManager.recordWalkerVisits(neighbors.map(n => n.name));
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
+      }
+      case "find_path": {
+        const found = await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(found, args.cursor as number ?? 0)) }] };
+      }
+      case "get_entities_by_type": {
+        const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
+      }
+      case "get_entity_types":
+        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getEntityTypes(), null, 2) }] };
+      case "get_relation_types":
+        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getRelationTypes(), null, 2) }] };
+      case "get_stats":
+        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
+      case "get_orphaned_entities": {
+        const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
+      }
+      case "validate_graph":
+        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.validateGraph(), null, 2) }] };
+      case "decode_timestamp":
+        return { content: [{ type: "text", text: JSON.stringify(knowledgeGraphManager.decodeTimestamp(args.timestamp as number | undefined, args.relative as boolean ?? false)) }] };
+      case "random_walk": {
+        const result = await knowledgeGraphManager.randomWalk(args.start as string, args.depth as number ?? 3, args.seed as string | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      }
+      case "sequentialthinking": {
+        const result = await knowledgeGraphManager.addThought(
+          args.observations as string[],
+          args.previousCtxId as string | undefined
+        );
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      }
+      case "kb_load": {
+        const filePath = args.filePath as string;
 
-      // Insert into KB
-      const entities = await knowledgeGraphManager.createEntities(
-        loadResult.entities.map(e => ({
-          name: e.name,
-          entityType: e.entityType,
-          observations: e.observations,
-        }))
-      );
-      const relations = await knowledgeGraphManager.createRelations(
-        loadResult.relations.map(r => ({
-          from: r.from,
-          to: r.to,
-          relationType: r.relationType,
-        }))
-      );
-      knowledgeGraphManager.resample();
+        // Validate extension
+        validateExtension(filePath);
 
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            document: title,
-            stats: loadResult.stats,
-            entitiesCreated: entities.length,
-            relationsCreated: relations.length,
-          }, null, 2),
-        }],
-      };
+        // Read file
+        let text: string;
+        try {
+          text = fs.readFileSync(filePath, 'utf-8');
+        } catch (err: unknown) {
+          throw new Error(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        // Derive title
+        const title = (args.title as string) ?? path.basename(filePath, path.extname(filePath));
+        const topK = (args.topK as number) ?? 15;
+
+        // Run the pipeline (reads string table under read lock)
+        const loadResult = knowledgeGraphManager.prepareDocumentLoad(text, title, topK);
+
+        // Insert into KB
+        const entities = await knowledgeGraphManager.createEntities(
+          loadResult.entities.map(e => ({
+            name: e.name,
+            entityType: e.entityType,
+            observations: e.observations,
+          }))
+        );
+        const relations = await knowledgeGraphManager.createRelations(
+          loadResult.relations.map(r => ({
+            from: r.from,
+            to: r.to,
+            relationType: r.relationType,
+          }))
+        );
+        knowledgeGraphManager.resample();
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              document: title,
+              stats: loadResult.stats,
+              entitiesCreated: entities.length,
+              relationsCreated: relations.length,
+            }, null, 2),
+          }],
+        };
+      }
+      default:
+        throw new Error(`Unknown tool: ${name}`);
     }
-    default:
-      throw new Error(`Unknown tool: ${name}`);
   }
-});
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args, _meta } = request.params;
+
+    if (!args) {
+      throw new Error(`No arguments provided for tool: ${name}`);
+    }
+
+    // Per MCP SEP-414 + OTel SemConv for MCP, clients propagate W3C Trace
+    // Context (traceparent / tracestate / baggage) inside `params._meta`. The
+    // SDK validates `_meta` with `z.core.$loose` so unknown keys pass through
+    // untouched. Here we read them as a plain carrier object and let the
+    // global propagator (W3CTraceContextPropagator + W3CBaggagePropagator,
+    // registered by NodeSDK when enabled) extract a parent context. When the
+    // SDK is disabled, propagation.extract is a no-op and the resulting span
+    // is also a no-op — no overhead and no behavior change.
+    const meta = (_meta ?? {}) as Record<string, unknown>;
+    const carrier: Record<string, string> = {};
+    if (typeof meta.traceparent === 'string') carrier.traceparent = meta.traceparent;
+    if (typeof meta.tracestate  === 'string') carrier.tracestate  = meta.tracestate;
+    if (typeof meta.baggage     === 'string') carrier.baggage     = meta.baggage;
+    const parentCtx = propagation.extract(context.active(), carrier);
+
+    return tracer.startActiveSpan(
+      `tools/call ${name}`,
+      {
+        kind: SpanKind.SERVER,
+        attributes: {
+          'rpc.system': 'mcp',
+          'rpc.service': 'tools',
+          'rpc.method': name,
+          'mcp.method': 'tools/call',
+          'mcp.tool.name': name,
+        },
+      },
+      parentCtx,
+      async (span) => {
+        const startNs = process.hrtime.bigint();
+        let errorType: string | undefined;
+        try {
+          const result = await dispatch(name, args);
+          if (result.isError) {
+            errorType = 'tool_error';
+            span.setAttribute('error.type', errorType);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: 'isError' });
+          } else {
+            span.setStatus({ code: SpanStatusCode.OK });
+          }
+          return result;
+        } catch (err) {
+          errorType = (err as Error)?.constructor?.name ?? 'Error';
+          span.setAttribute('error.type', errorType);
+          span.recordException(err as Error);
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: (err as Error)?.message ?? String(err),
+          });
+          throw err;
+        } finally {
+          const seconds = Number(process.hrtime.bigint() - startNs) / 1e9;
+          const histAttrs: Record<string, string> = {
+            'rpc.system': 'mcp',
+            'rpc.method': name,
+          };
+          if (errorType) histAttrs['error.type'] = errorType;
+          toolDurationHistogram.record(seconds, histAttrs);
+          span.end();
+        }
+      }
+    );
+  });
 
   return server;
 }

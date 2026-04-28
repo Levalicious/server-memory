@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { createServer, type Entity, type Relation, type Neighbor } from '../server.js';
-import { createTestClient, callTool, type PaginatedGraph, type PaginatedResult } from './test-utils.js';
+import { createTestClient, callTool, callToolRaw, type PaginatedGraph, type PaginatedResult } from './test-utils.js';
 
 describe('MCP Memory Server E2E Tests', () => {
   let testDir: string;
@@ -305,6 +305,81 @@ describe('MCP Memory Server E2E Tests', () => {
         callTool(client, 'search_nodes', { query: '[invalid' })
       ).rejects.toThrow(/Invalid regex pattern/);
     });
+  });
+
+  describe('search_nodes natural-language guard', () => {
+    beforeEach(async () => {
+      // Same fixture as the parent suite — a small, populated KB.
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'JavaScript', entityType: 'Language', observations: ['Dynamic typing'] },
+          { name: 'TypeScript', entityType: 'Language', observations: ['Static typing'] },
+          { name: 'Python', entityType: 'Language', observations: ['Dynamic typing'] },
+        ],
+      });
+    });
+
+    it('flags a literal natural-language query with isError + suggestion', async () => {
+      const raw = await callToolRaw(client, 'search_nodes', {
+        query: 'knowledge graph features',
+      });
+
+      expect(raw.isError).toBe(true);
+      const text = raw.content[0]?.text ?? '';
+      expect(text).toContain('knowledge graph features');
+      expect(text).toContain('regex');
+      // Auto-suggested |-joined regex should appear.
+      expect(text).toContain('knowledge|graph|features');
+    });
+
+    it('does NOT flag a regex query with anchors that simply misses', async () => {
+      const raw = await callToolRaw(client, 'search_nodes', {
+        query: '^MissingEntity$',
+      });
+
+      expect(raw.isError).toBeFalsy();
+      const parsed = JSON.parse(raw.content[0]?.text ?? '{}') as PaginatedGraph;
+      expect(parsed.entities.items).toEqual([]);
+      expect(parsed.relations.items).toEqual([]);
+    });
+
+    it('does NOT flag an alternation query that misses', async () => {
+      const raw = await callToolRaw(client, 'search_nodes', {
+        query: 'foo|bar|baz',
+      });
+
+      expect(raw.isError).toBeFalsy();
+      const parsed = JSON.parse(raw.content[0]?.text ?? '{}') as PaginatedGraph;
+      expect(parsed.entities.items).toEqual([]);
+    });
+
+    it('does NOT flag a literal query that DOES return matches', async () => {
+      const raw = await callToolRaw(client, 'search_nodes', {
+        query: 'Script',
+      });
+
+      expect(raw.isError).toBeFalsy();
+      const parsed = JSON.parse(raw.content[0]?.text ?? '{}') as PaginatedGraph;
+      expect(parsed.entities.items.length).toBeGreaterThan(0);
+    });
+
+    it('omits the alternation suggestion when the query is a single word', async () => {
+      const raw = await callToolRaw(client, 'search_nodes', {
+        query: 'Slef', // typo, no spaces
+      });
+
+      expect(raw.isError).toBe(true);
+      const text = raw.content[0]?.text ?? '';
+      expect(text).toContain('Slef');
+      expect(text).toContain('regex');
+      // No multi-term suggestion because there's only one term.
+      expect(text).not.toContain('"Slef|');
+    });
+
+    // Note: a "walker bias" test is intentionally omitted because the guard
+    // path's entity list is always empty, so recordWalkerVisits([]) is a
+    // no-op even without the early return — there's nothing externally
+    // observable to assert against. The early return is defensive only.
   });
 
   describe('Node Retrieval', () => {

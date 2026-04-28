@@ -65,12 +65,12 @@ export async function callTool(
   }
 
   const result = await client.callTool({ name, arguments: args });
-  
+
   const content = result.content as Array<{ type: string; text?: string }> | undefined;
   if (!content || content.length === 0) {
     return null;
   }
-  
+
   const first = content[0];
   if (first.type === 'text' && first.text) {
     // Only enforce char limit on paginated read operations
@@ -83,6 +83,35 @@ export async function callTool(
       return first.text;
     }
   }
-  
+
   return first;
+}
+
+/**
+ * Like {@link callTool}, but returns the unparsed `CallToolResult` so tests can
+ * assert on `isError`, multi-part content, or the literal text body. Use this
+ * for any test that needs to verify a tool returned a tool-level error
+ * (`isError: true`) — the parsed `callTool` helper drops that flag.
+ */
+export interface RawToolResult {
+  content: Array<{ type: string; text?: string }>;
+  isError?: boolean;
+}
+
+export async function callToolRaw(
+  client: Client,
+  name: string,
+  args: Record<string, unknown>
+): Promise<RawToolResult> {
+  const listing = await client.listTools();
+  const toolNames = listing.tools.map((t: { name: string }) => t.name);
+  if (!toolNames.includes(name)) {
+    throw new Error(`Tool "${name}" is not listed in ListTools. Available: ${toolNames.join(', ')}`);
+  }
+
+  const result = await client.callTool({ name, arguments: args });
+  return {
+    content: (result.content as Array<{ type: string; text?: string }>) ?? [],
+    isError: (result as { isError?: boolean }).isError,
+  };
 }
