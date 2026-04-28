@@ -15,6 +15,7 @@
 import * as crypto from 'crypto';
 import * as path from 'path';
 import { type StringTable } from './stringtable.js';
+import { traced } from './tracing.js';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -370,9 +371,19 @@ export function loadDocument(
   topK = 15,
 ): KbLoadResult {
   // 1. Normalize and chunk
-  const normalizedText = normalize(text);
-  const observations = splitIntoObservations(normalizedText);
-  const chunks = chunkObservations(observations);
+  const { normalizedText, chunks } = traced(
+    'kb.load.chunking',
+    { 'kb.load.input_chars': text.length },
+    (span) => {
+      const normalizedText = normalize(text);
+      const observations = splitIntoObservations(normalizedText);
+      const chunks = chunkObservations(observations);
+      span.setAttribute('kb.load.normalized_chars', normalizedText.length);
+      span.setAttribute('kb.load.observations', observations.length);
+      span.setAttribute('kb.load.chunks', chunks.length);
+      return { normalizedText, chunks };
+    },
+  );
 
   // Collect all words
   const allWords: Word[] = [];
@@ -381,115 +392,144 @@ export function loadDocument(
   }
   const vocab = new Set(allWords.map(w => w.normalized));
 
-  // 2. IDF from corpus
-  const { df, corpusSize } = deriveCorpusDocFreqs(st);
-  const idf = buildIdfVector(vocab, df, corpusSize);
-
-  // 3. TF-IDF weight vector
-  const weights = buildWeightVector(allWords, idf);
+  // 2. IDF from corpus + 3. TF-IDF weight vector
+  const weights = traced(
+    'kb.load.idf',
+    {
+      'kb.load.words': allWords.length,
+      'kb.load.unique_words': vocab.size,
+    },
+    (span) => {
+      const { df, corpusSize } = deriveCorpusDocFreqs(st);
+      span.setAttribute('kb.load.corpus_size', corpusSize);
+      span.setAttribute('kb.load.corpus_terms', df.size);
+      const idf = buildIdfVector(vocab, df, corpusSize);
+      return buildWeightVector(allWords, idf);
+    },
+  );
 
   // 4. Sentence TextRank
-  const sentences = splitSentences(normalizedText);
-  const rankedSentences = sentenceTextRank(sentences, weights);
-
-  // 5. Map top sentences to chunks (deduplicate)
-  const topSents = rankedSentences.slice(0, topK);
-  const highlights: Array<{ chunk: Chunk; sentence: Sentence; score: number }> = [];
-  const seenChunks = new Set<string>();
-  for (const { sentence, score } of topSents) {
-    const chunk = sentenceToChunk(sentence, chunks);
-    if (!chunk || seenChunks.has(chunk.id)) continue;
-    seenChunks.add(chunk.id);
-    highlights.push({ chunk, sentence, score });
-  }
-
-  // 6. Build index entities — one per highlighted phrase
-  //    Each DocumentIndex entity holds a single extracted key phrase as its
-  //    observation, and links to the chunk that contains it. This gives the
-  //    walker discrete semantic entry points into the document chain.
-  const indexEntities: Array<{ id: string; phrase: string; chunk: Chunk }> = [];
-  for (const { chunk, sentence } of highlights) {
-    const phrase = sentence.text.length <= MAX_OBS_LENGTH
-      ? sentence.text
-      : sentence.text.slice(0, MAX_OBS_LENGTH - 3) + '...';
-    const indexId = `${title}__idx_${indexEntities.length}`;
-    indexEntities.push({ id: indexId, phrase, chunk });
-  }
-
-  // ─── Assemble entities ──────────────────────────────────────────
-
-  const entities: KbLoadResult['entities'] = [];
-  const relations: KbLoadResult['relations'] = [];
-
-  // Document entity (no observations — it's a pointer node)
-  entities.push({ name: title, entityType: 'Document', observations: [] });
-
-  // Chunk entities
-  for (const chunk of chunks) {
-    entities.push({
-      name: chunk.id,
-      entityType: 'TextChunk',
-      observations: chunk.observations.map(o => o.text),
-    });
-  }
-
-  // Index entities — one per key phrase
-  for (const idx of indexEntities) {
-    entities.push({
-      name: idx.id,
-      entityType: 'DocumentIndex',
-      observations: [idx.phrase],
-    });
-  }
-
-  // Index hub — empty structural node linking Document to index entries
-  const indexHubId = `${title}__index`;
-  entities.push({ name: indexHubId, entityType: 'DocumentIndex', observations: [] });
-
-  // ─── Assemble relations ─────────────────────────────────────────
-
-  // Document → chain endpoints
-  if (chunks.length > 0) {
-    relations.push({ from: title, to: chunks[0].id, relationType: 'starts_with' });
-    relations.push({ from: chunks[0].id, to: title, relationType: 'belongs_to' });
-    if (chunks.length > 1) {
-      relations.push({ from: title, to: chunks[chunks.length - 1].id, relationType: 'ends_with' });
-      relations.push({ from: chunks[chunks.length - 1].id, to: title, relationType: 'belongs_to' });
-    }
-  }
-
-  // Chain: follows/preceded_by
-  for (let i = 0; i < chunks.length - 1; i++) {
-    relations.push({ from: chunks[i].id, to: chunks[i + 1].id, relationType: 'follows' });
-    relations.push({ from: chunks[i + 1].id, to: chunks[i].id, relationType: 'preceded_by' });
-  }
-
-  // Document → index hub
-  relations.push({ from: title, to: indexHubId, relationType: 'has_index' });
-  relations.push({ from: indexHubId, to: title, relationType: 'indexes' });
-
-  // Index hub → index entries
-  for (const idx of indexEntities) {
-    relations.push({ from: indexHubId, to: idx.id, relationType: 'contains' });
-    relations.push({ from: idx.id, to: indexHubId, relationType: 'contained_in' });
-  }
-
-  // Index entries → highlighted chunks
-  for (const idx of indexEntities) {
-    relations.push({ from: idx.id, to: idx.chunk.id, relationType: 'highlights' });
-    relations.push({ from: idx.chunk.id, to: idx.id, relationType: 'highlighted_by' });
-  }
-
-  return {
-    entities,
-    relations,
-    stats: {
-      chars: text.length,
-      words: allWords.length,
-      uniqueWords: vocab.size,
-      chunks: chunks.length,
-      sentences: sentences.length,
-      indexHighlights: highlights.length,
+  const { sentences, rankedSentences } = traced(
+    'kb.load.textrank',
+    {},
+    (span) => {
+      const sentences = splitSentences(normalizedText);
+      span.setAttribute('kb.load.sentences', sentences.length);
+      const rankedSentences = sentenceTextRank(sentences, weights);
+      return { sentences, rankedSentences };
     },
-  };
+  );
+
+  // 5+6. Highlights → index entities → assemble entities and relations
+  return traced(
+    'kb.load.assemble',
+    { 'kb.load.top_k': topK },
+    (span) => {
+      // 5. Map top sentences to chunks (deduplicate)
+      const topSents = rankedSentences.slice(0, topK);
+      const highlights: Array<{ chunk: Chunk; sentence: Sentence; score: number }> = [];
+      const seenChunks = new Set<string>();
+      for (const { sentence, score } of topSents) {
+        const chunk = sentenceToChunk(sentence, chunks);
+        if (!chunk || seenChunks.has(chunk.id)) continue;
+        seenChunks.add(chunk.id);
+        highlights.push({ chunk, sentence, score });
+      }
+
+      // 6. Build index entities — one per highlighted phrase
+      //    Each DocumentIndex entity holds a single extracted key phrase as
+      //    its observation, and links to the chunk that contains it. This
+      //    gives the walker discrete semantic entry points into the document
+      //    chain.
+      const indexEntities: Array<{ id: string; phrase: string; chunk: Chunk }> = [];
+      for (const { chunk, sentence } of highlights) {
+        const phrase = sentence.text.length <= MAX_OBS_LENGTH
+          ? sentence.text
+          : sentence.text.slice(0, MAX_OBS_LENGTH - 3) + '...';
+        const indexId = `${title}__idx_${indexEntities.length}`;
+        indexEntities.push({ id: indexId, phrase, chunk });
+      }
+
+      // ─── Assemble entities ──────────────────────────────────────
+
+      const entities: KbLoadResult['entities'] = [];
+      const relations: KbLoadResult['relations'] = [];
+
+      // Document entity (no observations — it's a pointer node)
+      entities.push({ name: title, entityType: 'Document', observations: [] });
+
+      // Chunk entities
+      for (const chunk of chunks) {
+        entities.push({
+          name: chunk.id,
+          entityType: 'TextChunk',
+          observations: chunk.observations.map(o => o.text),
+        });
+      }
+
+      // Index entities — one per key phrase
+      for (const idx of indexEntities) {
+        entities.push({
+          name: idx.id,
+          entityType: 'DocumentIndex',
+          observations: [idx.phrase],
+        });
+      }
+
+      // Index hub — empty structural node linking Document to index entries
+      const indexHubId = `${title}__index`;
+      entities.push({ name: indexHubId, entityType: 'DocumentIndex', observations: [] });
+
+      // ─── Assemble relations ─────────────────────────────────────
+
+      // Document → chain endpoints
+      if (chunks.length > 0) {
+        relations.push({ from: title, to: chunks[0].id, relationType: 'starts_with' });
+        relations.push({ from: chunks[0].id, to: title, relationType: 'belongs_to' });
+        if (chunks.length > 1) {
+          relations.push({ from: title, to: chunks[chunks.length - 1].id, relationType: 'ends_with' });
+          relations.push({ from: chunks[chunks.length - 1].id, to: title, relationType: 'belongs_to' });
+        }
+      }
+
+      // Chain: follows/preceded_by
+      for (let i = 0; i < chunks.length - 1; i++) {
+        relations.push({ from: chunks[i].id, to: chunks[i + 1].id, relationType: 'follows' });
+        relations.push({ from: chunks[i + 1].id, to: chunks[i].id, relationType: 'preceded_by' });
+      }
+
+      // Document → index hub
+      relations.push({ from: title, to: indexHubId, relationType: 'has_index' });
+      relations.push({ from: indexHubId, to: title, relationType: 'indexes' });
+
+      // Index hub → index entries
+      for (const idx of indexEntities) {
+        relations.push({ from: indexHubId, to: idx.id, relationType: 'contains' });
+        relations.push({ from: idx.id, to: indexHubId, relationType: 'contained_in' });
+      }
+
+      // Index entries → highlighted chunks
+      for (const idx of indexEntities) {
+        relations.push({ from: idx.id, to: idx.chunk.id, relationType: 'highlights' });
+        relations.push({ from: idx.chunk.id, to: idx.id, relationType: 'highlighted_by' });
+      }
+
+      span.setAttribute('kb.load.highlights', highlights.length);
+      span.setAttribute('kb.load.entities', entities.length);
+      span.setAttribute('kb.load.relations', relations.length);
+
+      return {
+        entities,
+        relations,
+        stats: {
+          chars: text.length,
+          words: allWords.length,
+          uniqueWords: vocab.size,
+          chunks: chunks.length,
+          sentences: sentences.length,
+          indexHighlights: highlights.length,
+        },
+      };
+    },
+  );
 }

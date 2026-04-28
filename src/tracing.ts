@@ -23,10 +23,14 @@ import {
   diag,
   DiagLogLevel,
   metrics,
+  SpanKind,
+  SpanStatusCode,
   trace,
+  type Attributes,
   type DiagLogger,
   type Histogram,
   type Meter,
+  type Span,
   type Tracer,
 } from '@opentelemetry/api';
 
@@ -188,6 +192,78 @@ export const toolDurationHistogram: Histogram = meter.createHistogram(
  * Whether the OTel SDK is initialized. Useful for tests.
  */
 export const otelEnabled = enabled;
+
+/**
+ * Run `fn` inside a child span named `name` with INTERNAL kind. Sets OK/ERROR
+ * status, records exceptions, and ends the span on completion. Works for both
+ * sync and async functions:
+ *
+ *   - If `fn` returns a value synchronously, the span ends synchronously and
+ *     the value is returned directly.
+ *   - If `fn` returns a thenable, the span ends when the promise settles and a
+ *     promise is returned that resolves/rejects with the same value/error.
+ *
+ * When the OTel SDK is disabled, `tracer` is the API's no-op tracer and this
+ * helper has zero attribution overhead beyond the function-call frame and a
+ * cheap `instanceof`-style check on the return value.
+ *
+ * Use for sub-spans inside instrumented operations — heavy traversals, lock
+ * acquisition, rank-map reads, etc. Tool-level spans are created in the MCP
+ * request handler with `SpanKind.SERVER` and should not go through this helper.
+ */
+export function traced<T>(
+  name: string,
+  attributes: Attributes,
+  fn: (span: Span) => T,
+): T {
+  return tracer.startActiveSpan(
+    name,
+    { kind: SpanKind.INTERNAL, attributes },
+    (span: Span): T => {
+      let result: T;
+      try {
+        result = fn(span);
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: (err as Error)?.message ?? String(err),
+        });
+        span.end();
+        throw err;
+      }
+
+      // Async path — settle span when the promise resolves/rejects.
+      if (
+        result !== null &&
+        typeof result === 'object' &&
+        typeof (result as { then?: unknown }).then === 'function'
+      ) {
+        return (result as unknown as Promise<unknown>).then(
+          (v) => {
+            span.setStatus({ code: SpanStatusCode.OK });
+            span.end();
+            return v;
+          },
+          (e) => {
+            span.recordException(e as Error);
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: (e as Error)?.message ?? String(e),
+            });
+            span.end();
+            throw e;
+          },
+        ) as unknown as T;
+      }
+
+      // Sync path.
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+      return result;
+    },
+  );
+}
 
 /**
  * Explicit shutdown — safe to call multiple times. Tests use this to flush

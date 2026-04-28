@@ -15,7 +15,7 @@ import { StringTable } from './src/stringtable.js';
 import { structuralSample } from './src/pagerank.js';
 import { computeMerwPsi } from './src/merw.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
-import { toolDurationHistogram, tracer } from './src/tracing.js';
+import { toolDurationHistogram, traced, tracer } from './src/tracing.js';
 
 /**
  * Result envelope for a single tool dispatch. Mirrors the MCP CallToolResult
@@ -76,6 +76,21 @@ export interface PaginatedResult<T> {
 
 export type EntitySortField = "mtime" | "obsMtime" | "name" | "pagerank" | "llmrank";
 export type SortDirection = "asc" | "desc";
+
+/**
+ * Random-walk transition policy.
+ *
+ *   'merw'    — Maximum-Entropy Random Walk: probability of stepping to
+ *               neighbor j is proportional to ψ_j (the cached MERW
+ *               eigenvector entry), which biases the walk toward
+ *               structurally important nodes. This is the default and
+ *               matches the historical behavior. Falls back to uniform
+ *               if ψ has not been computed yet (all zeros).
+ *   'uniform' — Plain uniform random walk: every eligible neighbor is
+ *               equally likely. Useful for unbiased structural sampling
+ *               or for comparing against MERW.
+ */
+export type RandomWalkMode = "merw" | "uniform";
 
 export interface Neighbor {
   name: string;
@@ -251,9 +266,31 @@ export class KnowledgeGraphManager {
   /**
    * Run the loadDocument pipeline under a shared (read) lock,
    * so the StringTable is consistent during IDF derivation.
+   *
+   * The full pipeline is wrapped in a `kb.load_document` span; the inner
+   * `loadDocument` emits per-stage child spans (normalize → chunking →
+   * IDF → TextRank → assemble) so users can attribute time to specific
+   * stages without spelunking flame graphs.
    */
   prepareDocumentLoad(text: string, title: string, topK: number): KbLoadResult {
-    return this.withReadLock(() => loadDocument(text, title, this.st, topK));
+    return traced(
+      'kb.load_document',
+      {
+        'kb.load.title': title,
+        'kb.load.input_chars': text.length,
+        'kb.load.top_k': topK,
+      },
+      (span) => this.withReadLock(() => {
+        const result = loadDocument(text, title, this.st, topK);
+        span.setAttribute('kb.load.chunks', result.stats.chunks);
+        span.setAttribute('kb.load.sentences', result.stats.sentences);
+        span.setAttribute('kb.load.unique_words', result.stats.uniqueWords);
+        span.setAttribute('kb.load.index_highlights', result.stats.indexHighlights);
+        span.setAttribute('kb.load.entities', result.entities.length);
+        span.setAttribute('kb.load.relations', result.relations.length);
+        return result;
+      }),
+    );
   }
 
   // --- Locking helpers ---
@@ -262,38 +299,57 @@ export class KnowledgeGraphManager {
    * Acquire a shared (read) lock, refresh mappings (in case another process
    * grew the files), rebuild the name index if the entity count changed,
    * run the callback, then release the lock.
+   *
+   * Wrapped in a `kb.lock.read` span. The `kb.lock.wait_ms` attribute records
+   * how long we blocked acquiring the OS-level shared lock — useful for
+   * spotting contention from concurrent writers.
    */
   private withReadLock<T>(fn: () => T): T {
-    this.gf.lockShared();
-    try {
-      this.gf.refresh();
-      this.st.refresh();
-      this.maybeRebuildNameIndex();
-      return fn();
-    } finally {
-      this.gf.unlock();
-    }
+    return traced('kb.lock.read', {}, (span) => {
+      const acquireStart = process.hrtime.bigint();
+      this.gf.lockShared();
+      const waitMs = Number(process.hrtime.bigint() - acquireStart) / 1e6;
+      span.setAttribute('kb.lock.wait_ms', waitMs);
+      try {
+        this.gf.refresh();
+        this.st.refresh();
+        this.maybeRebuildNameIndex();
+        span.setAttribute('kb.entity_count', this.nameIndex.size);
+        return fn();
+      } finally {
+        this.gf.unlock();
+      }
+    });
   }
 
   /**
    * Acquire an exclusive (write) lock, refresh mappings, rebuild name index,
    * run the callback, sync both files, then release the lock.
+   *
+   * Wrapped in a `kb.lock.write` span. The `kb.lock.wait_ms` attribute records
+   * blocking time waiting for the exclusive lock.
    */
   private withWriteLock<T>(fn: () => T): T {
-    this.gf.lockExclusive();
-    try {
-      this.gf.refresh();
-      this.st.refresh();
-      this.maybeRebuildNameIndex();
-      const result = fn();
-      this.gf.sync();
-      this.st.sync();
-      // Update cached count after write
-      this.cachedEntityCount = this.gf.getEntityCount();
-      return result;
-    } finally {
-      this.gf.unlock();
-    }
+    return traced('kb.lock.write', {}, (span) => {
+      const acquireStart = process.hrtime.bigint();
+      this.gf.lockExclusive();
+      const waitMs = Number(process.hrtime.bigint() - acquireStart) / 1e6;
+      span.setAttribute('kb.lock.wait_ms', waitMs);
+      try {
+        this.gf.refresh();
+        this.st.refresh();
+        this.maybeRebuildNameIndex();
+        span.setAttribute('kb.entity_count', this.nameIndex.size);
+        const result = fn();
+        this.gf.sync();
+        this.st.sync();
+        // Update cached count after write
+        this.cachedEntityCount = this.gf.getEntityCount();
+        return result;
+      } finally {
+        this.gf.unlock();
+      }
+    });
   }
 
   /** Rebuild the in-memory name→offset index from the node log */
@@ -320,20 +376,27 @@ export class KnowledgeGraphManager {
   }
 
   /** Build rank maps from the binary store for pagerank/llmrank sorting.
-   *  NOTE: Must be called inside a lock (read or write). */
+   *  NOTE: Must be called inside a lock (read or write).
+   *
+   *  Always-on `kb.rank.read` child span: this is a hot path called from every
+   *  read tool that sorts by rank, and surfaces the cost of reading the
+   *  per-entity rank fields under the active lock.
+   */
   private getRankMapsUnlocked(): { structural: Map<string, number>; walker: Map<string, number> } {
-    const structural = new Map<string, number>();
-    const walker = new Map<string, number>();
-    const structTotal = this.gf.getStructuralTotal();
-    const walkerTotal = this.gf.getWalkerTotal();
+    return traced('kb.rank.read', { 'kb.entity_count': this.nameIndex.size }, () => {
+      const structural = new Map<string, number>();
+      const walker = new Map<string, number>();
+      const structTotal = this.gf.getStructuralTotal();
+      const walkerTotal = this.gf.getWalkerTotal();
 
-    for (const [name, offset] of this.nameIndex) {
-      const rec = this.gf.readEntity(offset);
-      structural.set(name, structTotal > 0n ? Number(rec.structuralVisits) / Number(structTotal) : 0);
-      walker.set(name, walkerTotal > 0n ? Number(rec.walkerVisits) / Number(walkerTotal) : 0);
-    }
+      for (const [name, offset] of this.nameIndex) {
+        const rec = this.gf.readEntity(offset);
+        structural.set(name, structTotal > 0n ? Number(rec.structuralVisits) / Number(structTotal) : 0);
+        walker.set(name, walkerTotal > 0n ? Number(rec.walkerVisits) / Number(walkerTotal) : 0);
+      }
 
-    return { structural, walker };
+      return { structural, walker };
+    });
   }
 
   /** Build rank maps (acquires read lock). */
@@ -343,23 +406,40 @@ export class KnowledgeGraphManager {
 
   /** Increment walker visit count for a list of entity names */
   recordWalkerVisits(names: string[]): void {
-    this.withWriteLock(() => {
-      for (const name of names) {
-        const offset = this.nameIndex.get(name);
-        if (offset !== undefined) {
-          this.gf.incrementWalkerVisit(offset);
+    traced('kb.walker.record', { 'kb.walker.count': names.length }, () => {
+      this.withWriteLock(() => {
+        for (const name of names) {
+          const offset = this.nameIndex.get(name);
+          if (offset !== undefined) {
+            this.gf.incrementWalkerVisit(offset);
+          }
         }
-      }
+      });
     });
   }
 
-  /** Re-run structural sampling and MERW eigenvector computation (call after graph mutations) */
+  /**
+   * Re-run structural sampling and MERW eigenvector computation (call after
+   * graph mutations).
+   *
+   * Emits two child spans under the active span: `kb.rank.pagerank`
+   * (structural sampling — PageRank-style random walks) and `kb.rank.merw`
+   * (Maximum-Entropy Random Walk eigenvector). Skipped entirely on an empty
+   * graph so the spans aren't emitted for trivial no-op resamples.
+   */
   resample(): void {
     this.withWriteLock(() => {
-      if (this.nameIndex.size > 0) {
-        structuralSample(this.gf, 1, 0.85);
-        computeMerwPsi(this.gf);
-      }
+      if (this.nameIndex.size === 0) return;
+      traced(
+        'kb.rank.pagerank',
+        { 'kb.entity_count': this.nameIndex.size },
+        () => structuralSample(this.gf, 1, 0.85),
+      );
+      traced(
+        'kb.rank.merw',
+        { 'kb.entity_count': this.nameIndex.size },
+        () => computeMerwPsi(this.gf),
+      );
     });
   }
 
@@ -623,30 +703,45 @@ export class KnowledgeGraphManager {
       throw new Error(`Invalid regex pattern: ${query}`);
     }
 
-    return this.withReadLock(() => {
-      const allEntities = this.getAllEntities();
+    return traced(
+      'kb.search_nodes',
+      {
+        'kb.search.direction': direction,
+        'kb.search.query_length': query.length,
+        ...(sortBy ? { 'kb.search.sort_by': sortBy } : {}),
+      },
+      (span) => this.withReadLock(() => {
+        const allEntities = this.getAllEntities();
 
-      const filteredEntities = allEntities.filter(e =>
-        regex.test(e.name) ||
-        regex.test(e.entityType) ||
-        e.observations.some(o => regex.test(o))
-      );
+        const filteredEntities = allEntities.filter(e =>
+          regex.test(e.name) ||
+          regex.test(e.entityType) ||
+          e.observations.some(o => regex.test(o))
+        );
 
-      const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
+        const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
 
-      const allRelations = this.getAllRelations();
-      const filteredRelations = allRelations.filter(r => {
-        if (direction === 'forward') return filteredEntityNames.has(r.from);
-        if (direction === 'backward') return filteredEntityNames.has(r.to);
-        return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to);
-      });
+        const allRelations = this.getAllRelations();
+        const filteredRelations = allRelations.filter(r => {
+          if (direction === 'forward') return filteredEntityNames.has(r.from);
+          if (direction === 'backward') return filteredEntityNames.has(r.to);
+          return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to);
+        });
 
-      const rankMaps = this.getRankMapsUnlocked();
-      return {
-        entities: sortEntities(filteredEntities, sortBy, sortDir, rankMaps),
-        relations: filteredRelations,
-      };
-    });
+        // Aggregate scan/match stats — the LLM-visible knobs that explain why
+        // a query was slow: how big the haystack is and how big the result.
+        span.setAttribute('kb.search.scanned.entities', allEntities.length);
+        span.setAttribute('kb.search.scanned.relations', allRelations.length);
+        span.setAttribute('kb.search.matched.entities', filteredEntities.length);
+        span.setAttribute('kb.search.matched.relations', filteredRelations.length);
+
+        const rankMaps = this.getRankMapsUnlocked();
+        return {
+          entities: sortEntities(filteredEntities, sortBy, sortDir, rankMaps),
+          relations: filteredRelations,
+        };
+      }),
+    );
   }
 
   async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
@@ -698,96 +793,133 @@ export class KnowledgeGraphManager {
     sortDir?: SortDirection,
     direction: 'forward' | 'backward' | 'any' = 'forward'
   ): Promise<Neighbor[]> {
-    return this.withReadLock(() => {
-      const startOffset = this.nameIndex.get(entityName);
-      if (startOffset === undefined) return [];
-
-      const visited = new Set<string>();
-      const neighborNames = new Set<string>();
-
-      const traverse = (currentName: string, currentDepth: number): void => {
-        if (currentDepth > depth || visited.has(currentName)) return;
-        visited.add(currentName);
-
-        const offset = this.nameIndex.get(currentName);
-        if (offset === undefined) return;
-
-        const edges = this.gf.getEdges(offset);
-        for (const edge of edges) {
-          if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-          if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
-
-          const targetRec = this.gf.readEntity(edge.targetOffset);
-          const neighborName = this.st.get(BigInt(targetRec.nameId));
-          neighborNames.add(neighborName);
-
-          if (currentDepth < depth) {
-            traverse(neighborName, currentDepth + 1);
-          }
+    return traced(
+      'kb.get_neighbors',
+      {
+        'kb.traversal.depth': depth,
+        'kb.traversal.direction': direction,
+        ...(sortBy ? { 'kb.traversal.sort_by': sortBy } : {}),
+      },
+      (span) => this.withReadLock(() => {
+        const startOffset = this.nameIndex.get(entityName);
+        if (startOffset === undefined) {
+          span.setAttribute('kb.traversal.start_found', false);
+          return [];
         }
-      };
+        span.setAttribute('kb.traversal.start_found', true);
 
-      traverse(entityName, 0);
-      neighborNames.delete(entityName);
+        const visited = new Set<string>();
+        const neighborNames = new Set<string>();
+        let edgesScanned = 0;
 
-      const neighbors: Neighbor[] = Array.from(neighborNames).map(name => {
-        const offset = this.nameIndex.get(name);
-        if (!offset) return { name };
-        const rec = this.gf.readEntity(offset);
-        const mtime = Number(rec.mtime);
-        const obsMtime = Number(rec.obsMtime);
-        const n: Neighbor = { name };
-        if (mtime > 0) n.mtime = mtime;
-        if (obsMtime > 0) n.obsMtime = obsMtime;
-        return n;
-      });
+        const traverse = (currentName: string, currentDepth: number): void => {
+          if (currentDepth > depth || visited.has(currentName)) return;
+          visited.add(currentName);
 
-      const rankMaps = this.getRankMapsUnlocked();
-      return sortNeighbors(neighbors, sortBy, sortDir, rankMaps);
-    });
+          const offset = this.nameIndex.get(currentName);
+          if (offset === undefined) return;
+
+          const edges = this.gf.getEdges(offset);
+          for (const edge of edges) {
+            edgesScanned++;
+            if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+            if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+
+            const targetRec = this.gf.readEntity(edge.targetOffset);
+            const neighborName = this.st.get(BigInt(targetRec.nameId));
+            neighborNames.add(neighborName);
+
+            if (currentDepth < depth) {
+              traverse(neighborName, currentDepth + 1);
+            }
+          }
+        };
+
+        traverse(entityName, 0);
+        neighborNames.delete(entityName);
+
+        const neighbors: Neighbor[] = Array.from(neighborNames).map(name => {
+          const offset = this.nameIndex.get(name);
+          if (!offset) return { name };
+          const rec = this.gf.readEntity(offset);
+          const mtime = Number(rec.mtime);
+          const obsMtime = Number(rec.obsMtime);
+          const n: Neighbor = { name };
+          if (mtime > 0) n.mtime = mtime;
+          if (obsMtime > 0) n.obsMtime = obsMtime;
+          return n;
+        });
+
+        // Aggregate traversal stats: the size of the BFS frontier the
+        // resulting neighbor set, and how many edges we walked through. Cheap
+        // to compute and explains slow calls without per-step span fanout.
+        span.setAttribute('kb.traversal.visited_count', visited.size);
+        span.setAttribute('kb.traversal.neighbor_count', neighbors.length);
+        span.setAttribute('kb.traversal.edges_scanned', edgesScanned);
+
+        const rankMaps = this.getRankMapsUnlocked();
+        return sortNeighbors(neighbors, sortBy, sortDir, rankMaps);
+      }),
+    );
   }
 
   async findPath(fromEntity: string, toEntity: string, maxDepth: number = 5, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<Relation[]> {
-    return this.withReadLock(() => {
-      const visited = new Set<string>();
+    return traced(
+      'kb.find_path',
+      {
+        'kb.traversal.max_depth': maxDepth,
+        'kb.traversal.direction': direction,
+      },
+      (span) => this.withReadLock(() => {
+        const visited = new Set<string>();
+        let edgesScanned = 0;
+        let nodesExpanded = 0;
 
-      const dfs = (current: string, target: string, pathSoFar: Relation[], depth: number): Relation[] | null => {
-        if (depth > maxDepth || visited.has(current)) return null;
-        if (current === target) return pathSoFar;
+        const dfs = (current: string, target: string, pathSoFar: Relation[], depth: number): Relation[] | null => {
+          if (depth > maxDepth || visited.has(current)) return null;
+          if (current === target) return pathSoFar;
 
-        visited.add(current);
+          visited.add(current);
+          nodesExpanded++;
 
-        const offset = this.nameIndex.get(current);
-        if (offset === undefined) { visited.delete(current); return null; }
+          const offset = this.nameIndex.get(current);
+          if (offset === undefined) { visited.delete(current); return null; }
 
-        const edges = this.gf.getEdges(offset);
-        for (const edge of edges) {
-          if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-          if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+          const edges = this.gf.getEdges(offset);
+          for (const edge of edges) {
+            edgesScanned++;
+            if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+            if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
 
-          const targetRec = this.gf.readEntity(edge.targetOffset);
-          const nextName = this.st.get(BigInt(targetRec.nameId));
-          const relationType = this.st.get(BigInt(edge.relTypeId));
-          const mtime = Number(edge.mtime);
+            const targetRec = this.gf.readEntity(edge.targetOffset);
+            const nextName = this.st.get(BigInt(targetRec.nameId));
+            const relationType = this.st.get(BigInt(edge.relTypeId));
+            const mtime = Number(edge.mtime);
 
-          let rel: Relation;
-          if (edge.direction === DIR_FORWARD) {
-            rel = { from: current, to: nextName, relationType };
-          } else {
-            rel = { from: nextName, to: current, relationType };
+            let rel: Relation;
+            if (edge.direction === DIR_FORWARD) {
+              rel = { from: current, to: nextName, relationType };
+            } else {
+              rel = { from: nextName, to: current, relationType };
+            }
+            if (mtime > 0) rel.mtime = mtime;
+
+            const result = dfs(nextName, target, [...pathSoFar, rel], depth + 1);
+            if (result) return result;
           }
-          if (mtime > 0) rel.mtime = mtime;
 
-          const result = dfs(nextName, target, [...pathSoFar, rel], depth + 1);
-          if (result) return result;
-        }
+          visited.delete(current);
+          return null;
+        };
 
-        visited.delete(current);
-        return null;
-      };
-
-      return dfs(fromEntity, toEntity, [], 0) || [];
-    });
+        const path = dfs(fromEntity, toEntity, [], 0) || [];
+        span.setAttribute('kb.traversal.nodes_expanded', nodesExpanded);
+        span.setAttribute('kb.traversal.edges_scanned', edgesScanned);
+        span.setAttribute('kb.traversal.path_length', path.length);
+        span.setAttribute('kb.traversal.path_found', path.length > 0);
+        return path;
+      }),
+    );
   }
 
   async getEntitiesByType(entityType: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
@@ -829,51 +961,62 @@ export class KnowledgeGraphManager {
   }
 
   async getOrphanedEntities(strict: boolean = false, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
-    return this.withReadLock(() => {
-      const entities = this.getAllEntities();
+    return traced(
+      'kb.get_orphaned_entities',
+      { 'kb.orphan.strict': strict },
+      (span) => this.withReadLock(() => {
+        const entities = this.getAllEntities();
 
-      if (!strict) {
-        const connectedEntityNames = new Set<string>();
+        if (!strict) {
+          const connectedEntityNames = new Set<string>();
+          const relations = this.getAllRelations();
+          relations.forEach(r => {
+            connectedEntityNames.add(r.from);
+            connectedEntityNames.add(r.to);
+          });
+          const orphans = entities.filter(e => !connectedEntityNames.has(e.name));
+          span.setAttribute('kb.entity_count', entities.length);
+          span.setAttribute('kb.relation_count', relations.length);
+          span.setAttribute('kb.orphan.count', orphans.length);
+          const rankMaps = this.getRankMapsUnlocked();
+          return sortEntities(orphans, sortBy, sortDir, rankMaps);
+        }
+
+        const neighbors = new Map<string, Set<string>>();
+        entities.forEach(e => neighbors.set(e.name, new Set()));
         const relations = this.getAllRelations();
         relations.forEach(r => {
-          connectedEntityNames.add(r.from);
-          connectedEntityNames.add(r.to);
+          neighbors.get(r.from)?.add(r.to);
+          neighbors.get(r.to)?.add(r.from);
         });
-        const orphans = entities.filter(e => !connectedEntityNames.has(e.name));
-        const rankMaps = this.getRankMapsUnlocked();
-        return sortEntities(orphans, sortBy, sortDir, rankMaps);
-      }
 
-      const neighbors = new Map<string, Set<string>>();
-      entities.forEach(e => neighbors.set(e.name, new Set()));
-      const relations = this.getAllRelations();
-      relations.forEach(r => {
-        neighbors.get(r.from)?.add(r.to);
-        neighbors.get(r.to)?.add(r.from);
-      });
+        const connectedToSelf = new Set<string>();
+        const queue: string[] = ['Self'];
 
-      const connectedToSelf = new Set<string>();
-      const queue: string[] = ['Self'];
+        while (queue.length > 0) {
+          const current = queue.shift()!;
+          if (connectedToSelf.has(current)) continue;
+          connectedToSelf.add(current);
 
-      while (queue.length > 0) {
-        const current = queue.shift()!;
-        if (connectedToSelf.has(current)) continue;
-        connectedToSelf.add(current);
-
-        const currentNeighbors = neighbors.get(current);
-        if (currentNeighbors) {
-          for (const neighbor of currentNeighbors) {
-            if (!connectedToSelf.has(neighbor)) {
-              queue.push(neighbor);
+          const currentNeighbors = neighbors.get(current);
+          if (currentNeighbors) {
+            for (const neighbor of currentNeighbors) {
+              if (!connectedToSelf.has(neighbor)) {
+                queue.push(neighbor);
+              }
             }
           }
         }
-      }
 
-      const orphans = entities.filter(e => !connectedToSelf.has(e.name));
-      const rankMaps = this.getRankMapsUnlocked();
-      return sortEntities(orphans, sortBy, sortDir, rankMaps);
-    });
+        const orphans = entities.filter(e => !connectedToSelf.has(e.name));
+        span.setAttribute('kb.entity_count', entities.length);
+        span.setAttribute('kb.relation_count', relations.length);
+        span.setAttribute('kb.orphan.count', orphans.length);
+        span.setAttribute('kb.orphan.connected_to_self', connectedToSelf.size);
+        const rankMaps = this.getRankMapsUnlocked();
+        return sortEntities(orphans, sortBy, sortDir, rankMaps);
+      }),
+    );
   }
 
   async validateGraph(): Promise<{ missingEntities: string[]; observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] }> {
@@ -908,90 +1051,114 @@ export class KnowledgeGraphManager {
     });
   }
 
-  async randomWalk(start: string, depth: number = 3, seed?: string, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<{ entity: string; path: string[] }> {
-    return this.withReadLock(() => {
-      const startOffset = this.nameIndex.get(start);
-      if (!startOffset) {
-        throw new Error(`Start entity not found: ${start}`);
-      }
-
-      // Create seeded RNG if seed provided
-      let rngState = seed ? this.hashSeed(seed) : null;
-      const random = (): number => {
-        if (rngState !== null) {
-          rngState ^= rngState << 13;
-          rngState ^= rngState >>> 17;
-          rngState ^= rngState << 5;
-          return (rngState >>> 0) / 0xFFFFFFFF;
-        } else {
-          return randomBytes(4).readUInt32BE() / 0xFFFFFFFF;
+  async randomWalk(
+    start: string,
+    depth: number = 3,
+    seed?: string,
+    direction: 'forward' | 'backward' | 'any' = 'forward',
+    mode: RandomWalkMode = 'merw',
+  ): Promise<{ entity: string; path: string[] }> {
+    return traced(
+      'kb.random_walk',
+      {
+        'kb.traversal.depth': depth,
+        'kb.traversal.direction': direction,
+        'kb.walker.mode': mode,
+        'kb.walker.seeded': seed !== undefined,
+      },
+      (span) => this.withReadLock(() => {
+        const startOffset = this.nameIndex.get(start);
+        if (!startOffset) {
+          throw new Error(`Start entity not found: ${start}`);
         }
-      };
 
-      const pathNames: string[] = [start];
-      let current = start;
-
-      for (let i = 0; i < depth; i++) {
-        const offset = this.nameIndex.get(current);
-        if (!offset) break;
-
-        const edges = this.gf.getEdges(offset);
-        const candidates: { name: string; psi: number }[] = [];
-
-        for (const edge of edges) {
-          if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-          if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
-
-          const targetRec = this.gf.readEntity(edge.targetOffset);
-          const neighborName = this.st.get(BigInt(targetRec.nameId));
-          if (neighborName !== current && this.nameIndex.has(neighborName)) {
-            candidates.push({ name: neighborName, psi: targetRec.psi });
+        // Create seeded RNG if seed provided
+        let rngState = seed ? this.hashSeed(seed) : null;
+        const random = (): number => {
+          if (rngState !== null) {
+            rngState ^= rngState << 13;
+            rngState ^= rngState >>> 17;
+            rngState ^= rngState << 5;
+            return (rngState >>> 0) / 0xFFFFFFFF;
+          } else {
+            return randomBytes(4).readUInt32BE() / 0xFFFFFFFF;
           }
-        }
+        };
 
-        // Deduplicate: keep max psi per name (multiple edge types to same target)
-        const byName = new Map<string, number>();
-        for (const c of candidates) {
-          const existing = byName.get(c.name);
-          if (existing === undefined || c.psi > existing) {
-            byName.set(c.name, c.psi);
-          }
-        }
+        const pathNames: string[] = [start];
+        let current = start;
+        let edgesScanned = 0;
+        let truncated = false;
 
-        if (byName.size === 0) break;
+        for (let i = 0; i < depth; i++) {
+          const offset = this.nameIndex.get(current);
+          if (!offset) { truncated = true; break; }
 
-        const neighborArr = Array.from(byName.entries());
+          const edges = this.gf.getEdges(offset);
+          const candidates: { name: string; psi: number }[] = [];
 
-        // MERW-weighted sampling: probability proportional to ψ_j
-        // (The ψ_i denominator is constant for all neighbors and cancels in normalization)
-        let totalPsi = 0;
-        for (const [, psi] of neighborArr) totalPsi += psi;
+          for (const edge of edges) {
+            edgesScanned++;
+            if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+            if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
 
-        let chosen: string;
-        if (totalPsi > 0) {
-          // Weighted sampling by psi
-          const r = random() * totalPsi;
-          let cumulative = 0;
-          chosen = neighborArr[neighborArr.length - 1][0]; // fallback
-          for (const [name, psi] of neighborArr) {
-            cumulative += psi;
-            if (r <= cumulative) {
-              chosen = name;
-              break;
+            const targetRec = this.gf.readEntity(edge.targetOffset);
+            const neighborName = this.st.get(BigInt(targetRec.nameId));
+            if (neighborName !== current && this.nameIndex.has(neighborName)) {
+              candidates.push({ name: neighborName, psi: targetRec.psi });
             }
           }
-        } else {
-          // psi not yet computed (all zero) — fall back to uniform
-          const idx = Math.floor(random() * neighborArr.length);
-          chosen = neighborArr[idx][0];
+
+          // Deduplicate: keep max psi per name (multiple edge types to same target)
+          const byName = new Map<string, number>();
+          for (const c of candidates) {
+            const existing = byName.get(c.name);
+            if (existing === undefined || c.psi > existing) {
+              byName.set(c.name, c.psi);
+            }
+          }
+
+          if (byName.size === 0) { truncated = true; break; }
+
+          const neighborArr = Array.from(byName.entries());
+
+          // Compute total ψ once; both modes need it (uniform skips it, but
+          // we still want to know whether ψ is populated for telemetry).
+          let totalPsi = 0;
+          for (const [, psi] of neighborArr) totalPsi += psi;
+
+          let chosen: string;
+          if (mode === 'merw' && totalPsi > 0) {
+            // MERW-weighted sampling: probability proportional to ψ_j.
+            // (The ψ_i denominator is constant for all neighbors and
+            //  cancels in normalization.)
+            const r = random() * totalPsi;
+            let cumulative = 0;
+            chosen = neighborArr[neighborArr.length - 1][0]; // fallback
+            for (const [name, psi] of neighborArr) {
+              cumulative += psi;
+              if (r <= cumulative) {
+                chosen = name;
+                break;
+              }
+            }
+          } else {
+            // mode === 'uniform', or MERW with ψ not yet computed (all zero).
+            // Plain uniform sampling over the deduplicated neighbor set.
+            const idx = Math.floor(random() * neighborArr.length);
+            chosen = neighborArr[idx][0];
+          }
+
+          current = chosen;
+          pathNames.push(current);
         }
 
-        current = chosen;
-        pathNames.push(current);
-      }
-
-      return { entity: current, path: pathNames };
-    });
+        span.setAttribute('kb.walker.steps_taken', pathNames.length - 1);
+        span.setAttribute('kb.walker.edges_scanned', edgesScanned);
+        span.setAttribute('kb.walker.truncated', truncated);
+        return { entity: current, path: pathNames };
+      }),
+    );
   }
 
   private hashSeed(seed: string): number {
@@ -1413,6 +1580,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             depth: { type: "number", description: "Number of steps to take. Default: 3" },
             seed: { type: "string", description: "Optional seed for reproducible walks." },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
+            mode: {
+              type: "string",
+              enum: ["merw", "uniform"],
+              description:
+                "Transition policy. 'merw' (default) weights each step by ψ (the cached Maximum-Entropy Random Walk eigenvector), biasing the walk toward structurally important nodes; falls back to uniform if ψ is not yet computed. 'uniform' samples each eligible neighbor with equal probability — useful for unbiased exploration or as a baseline for comparison.",
+            },
           },
           required: ["start"],
         },
@@ -1561,7 +1734,13 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
       case "decode_timestamp":
         return { content: [{ type: "text", text: JSON.stringify(knowledgeGraphManager.decodeTimestamp(args.timestamp as number | undefined, args.relative as boolean ?? false)) }] };
       case "random_walk": {
-        const result = await knowledgeGraphManager.randomWalk(args.start as string, args.depth as number ?? 3, args.seed as string | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        const result = await knowledgeGraphManager.randomWalk(
+          args.start as string,
+          args.depth as number ?? 3,
+          args.seed as string | undefined,
+          (args.direction as 'forward' | 'backward' | 'any') ?? 'forward',
+          (args.mode as RandomWalkMode) ?? 'merw',
+        );
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       }
       case "sequentialthinking": {
