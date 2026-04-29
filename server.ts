@@ -255,32 +255,11 @@ export class KnowledgeGraphManager {
     this.nameIndex = new Map();
     this.rebuildNameIndex();
 
-    // Run initial structural sampling and MERW if graph is non-empty.
-    //
-    // Both calls *write* to the graph file (incrementStructuralVisit and
-    // setPsi). Without holding the exclusive flock, two concurrently
-    // starting processes can interleave their u64 read-modify-writes on
-    // structural_visits / walker_total / ψ_i, corrupting counters and
-    // potentially scrambling adjacency-related fields. That kind of
-    // corruption is exactly what produces the pathological "walk forever"
-    // case the structuralWalk hard cap also defends against. Acquire the
-    // exclusive lock so process startup is serialized.
+    // Run initial structural sampling and MERW if graph is non-empty
     if (this.nameIndex.size > 0) {
-      this.gf.lockExclusive();
-      try {
-        this.gf.refresh();
-        this.st.refresh();
-        this.maybeRebuildNameIndex();
-        if (this.nameIndex.size > 0) {
-          structuralSample(this.gf, 1, 0.85);
-          computeMerwPsi(this.gf);
-          this.gf.sync();
-          this.st.sync();
-          this.cachedEntityCount = this.gf.getEntityCount();
-        }
-      } finally {
-        this.gf.unlock();
-      }
+      structuralSample(this.gf, 1, 0.85);
+      computeMerwPsi(this.gf);
+      this.gf.sync();
     }
   }
 
@@ -1304,7 +1283,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.23",
+    version: "0.0.22",
   }, {
     capabilities: {
       tools: {},
