@@ -22,6 +22,27 @@ import { type GraphFile, DIR_FORWARD } from './graphfile.js';
 const DEFAULT_DAMPING = 0.85;
 
 /**
+ * Hard cap on the number of steps in a single structural walk.
+ *
+ * Probabilistic termination (1 - damping) gives an expected walk length of
+ * 1/(1-c) ≈ 6.67 at c=0.85, with the tail of the geometric distribution
+ * decaying exponentially. In *theory* the walk is finite-mean. In practice,
+ * a corrupted or bogus adjacency list — for example, an edge pointing into
+ * recycled arena memory whose `forward` list is large and self-referential —
+ * can keep `Math.random() < damping` succeeding for an unbounded run, with
+ * each step costing several mmap reads + a u64 read-modify-write under the
+ * lock that the caller holds. Concretely, this manifested as a memory-server
+ * process pinned at 100 % CPU for 13 + hours holding the read flock, while
+ * every other process queued on LOCK_EX behind it.
+ *
+ * Guarantee a finite number of steps just like MERW's power iteration cap
+ * (`DEFAULT_MAX_ITER = 200`). 10 000 is well past the 99.999 999th percentile
+ * of geometric(0.15) (≈ 56 steps), so a healthy graph never approaches it,
+ * and a pathological one can no longer hang the lock holder.
+ */
+const MAX_WALK_STEPS = 10000;
+
+/**
  * Run one full iteration of structural PageRank sampling.
  * Starts one random walk from every node in the graph.
  *
@@ -51,7 +72,10 @@ export function structuralWalk(gf: GraphFile, startOffset: bigint, damping: numb
   let current = startOffset;
   let visits = 0;
 
-  while (true) {
+  // Hard step cap (see MAX_WALK_STEPS doc): guarantees the walk terminates
+  // even if the adjacency list is corrupted into a self-sustaining cycle, so
+  // the caller's lock cannot be held arbitrarily long.
+  while (visits < MAX_WALK_STEPS) {
     // Visit current node
     gf.incrementStructuralVisit(current);
     visits++;
