@@ -7,6 +7,7 @@
 
 #define NAPI_VERSION 8
 #include <node_api.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "memoryfile.h"
@@ -181,7 +182,16 @@ static napi_value n_memfile_read(napi_env env, napi_callback_info info) {
     NAPI_CALL(napi_create_buffer(env, (size_t)len, &buf_data, &result));
 
     if (memfile_read(mf, offset, buf_data, len) < 0) {
-        napi_throw_error(env, NULL, "memfile_read: offset/length out of bounds");
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "memfile_read: offset/length out of bounds "
+                 "(offset=%llu len=%llu mmap_size=%llu allocated=%llu file_size=%llu)",
+                 (unsigned long long)offset,
+                 (unsigned long long)len,
+                 (unsigned long long)mf->mmap_size,
+                 (unsigned long long)mf->header->allocated,
+                 (unsigned long long)mf->header->file_size);
+        napi_throw_error(env, NULL, msg);
         return NULL;
     }
 
@@ -206,7 +216,16 @@ static napi_value n_memfile_write(napi_env env, napi_callback_info info) {
     NAPI_CALL(napi_get_buffer_info(env, argv[2], &buf_data, &buf_len));
 
     if (memfile_write(mf, offset, buf_data, buf_len) < 0) {
-        napi_throw_error(env, NULL, "memfile_write: offset/length out of bounds");
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "memfile_write: offset/length out of bounds "
+                 "(offset=%llu len=%llu mmap_size=%llu allocated=%llu file_size=%llu)",
+                 (unsigned long long)offset,
+                 (unsigned long long)buf_len,
+                 (unsigned long long)mf->mmap_size,
+                 (unsigned long long)mf->header->allocated,
+                 (unsigned long long)mf->header->file_size);
+        napi_throw_error(env, NULL, msg);
         return NULL;
     }
 

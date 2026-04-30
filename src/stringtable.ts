@@ -66,23 +66,42 @@ function fnv1a(data: Buffer): number {
 }
 
 export class StringTable {
-  private mf: MemoryFile;
+  /**
+   * Public so that {@link GraphFile} can acquire/release the strings flock
+   * alongside its own. The string-table file has its own fd, so flock on the
+   * graph fd does NOT serialize strings-file mutations — `GraphFile.lockShared`
+   * / `lockExclusive` / `unlock` reach in here to flock both fds together.
+   */
+  readonly mf: MemoryFile;
   private headerOffset: bigint;  // offset to our header block
 
   constructor(path: string, initialSize: number = 65536) {
     this.mf = new MemoryFile(path, initialSize);
 
-    const stats = this.mf.stats();
-    // A fresh memfile has allocated = 32 (just the memfile header).
-    // If anything has been allocated, the file was previously initialized.
-    if (stats.allocated <= 32n) {
-      this.headerOffset = this.initHeader();
-    } else {
-      // The first allocation in the file is always our header block.
-      // It's at the first allocatable position after the memfile header.
-      // memfile_alloc returns the offset past the alloc_t header (8 bytes),
-      // so the first allocation is at offset 32 (memfile header) + 8 (alloc_t) = 40.
-      this.headerOffset = 40n;
+    // Hold an exclusive flock on the strings fd while we decide whether the
+    // file needs initialization. Without this, two processes that open the
+    // same fresh file simultaneously will both observe `allocated == 32` and
+    // both run `initHeader()` — double-allocating the header block and the
+    // hash index, corrupting the free list. With the lock, the loser sees the
+    // winner's `allocated > 32` and skips init.
+    this.mf.lockExclusive();
+    try {
+      this.mf.refresh();
+      const stats = this.mf.stats();
+      // A fresh memfile has allocated = 32 (just the memfile header).
+      // If anything has been allocated, the file was previously initialized.
+      if (stats.allocated <= 32n) {
+        this.headerOffset = this.initHeader();
+        this.mf.sync();
+      } else {
+        // The first allocation in the file is always our header block.
+        // It's at the first allocatable position after the memfile header.
+        // memfile_alloc returns the offset past the alloc_t header (8 bytes),
+        // so the first allocation is at offset 32 (memfile header) + 8 (alloc_t) = 40.
+        this.headerOffset = 40n;
+      }
+    } finally {
+      this.mf.unlock();
     }
   }
 

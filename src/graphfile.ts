@@ -237,20 +237,34 @@ export class GraphFile {
     this.mf = new MemoryFile(graphPath, initialSize);
     this.st = stringTable;
 
-    const stats = this.mf.stats();
-    if (stats.allocated <= 32n) {
-      // Fresh DB — initialize with current version
-      this.graphHeaderOffset = this.initGraphHeader();
-      this.mf.setVersion(CURRENT_GRAPH_VERSION);
-    } else {
-      // Existing DB — check version and migrate if needed
-      this.graphHeaderOffset = 40n;
-      const version = this.mf.getVersion();
-      if (version === GRAPH_VERSION_V1) {
-        this.migrateV1toV2(graphPath);
-      } else if (version !== CURRENT_GRAPH_VERSION) {
-        throw new Error(`GraphFile: unknown version ${version} (expected ${GRAPH_VERSION_V1} or ${CURRENT_GRAPH_VERSION})`);
+    // Hold an exclusive flock on the graph fd while we decide whether to
+    // initialize / migrate, mirroring StringTable. Without it, two processes
+    // opening the same fresh file race in `initGraphHeader()` (double-alloc
+    // of the graph header) or in `migrateV1toV2` (clobbered backup file).
+    // We don't need to lock the strings fd here — StringTable already
+    // serialized its own init in its constructor, and we don't touch
+    // strings during graph init or migration.
+    this.mf.lockExclusive();
+    try {
+      this.mf.refresh();
+      const stats = this.mf.stats();
+      if (stats.allocated <= 32n) {
+        // Fresh DB — initialize with current version
+        this.graphHeaderOffset = this.initGraphHeader();
+        this.mf.setVersion(CURRENT_GRAPH_VERSION);
+        this.mf.sync();
+      } else {
+        // Existing DB — check version and migrate if needed
+        this.graphHeaderOffset = 40n;
+        const version = this.mf.getVersion();
+        if (version === GRAPH_VERSION_V1) {
+          this.migrateV1toV2(graphPath);
+        } else if (version !== CURRENT_GRAPH_VERSION) {
+          throw new Error(`GraphFile: unknown version ${version} (expected ${GRAPH_VERSION_V1} or ${CURRENT_GRAPH_VERSION})`);
+        }
       }
+    } finally {
+      this.mf.unlock();
     }
   }
 
@@ -769,18 +783,32 @@ export class GraphFile {
 
   // --- Lifecycle & Concurrency ---
 
-  /** Acquire a shared (read) lock on the graph file. */
+  /**
+   * Acquire a shared (read) lock on BOTH the graph file and the string-table
+   * file. flock(2) is per-fd; the two files have independent fds, so a single
+   * flock on the graph fd does not serialize strings-file mutations. We
+   * always acquire graph first, then strings, to make deadlock impossible
+   * across callers (every caller uses the same order).
+   */
   lockShared(): void {
     this.mf.lockShared();
+    this.st.mf.lockShared();
   }
 
-  /** Acquire an exclusive (write) lock on the graph file. */
+  /**
+   * Acquire an exclusive (write) lock on BOTH files. Same ordering invariant
+   * as {@link lockShared}: graph then strings.
+   */
   lockExclusive(): void {
     this.mf.lockExclusive();
+    this.st.mf.lockExclusive();
   }
 
-  /** Release the lock on the graph file. */
+  /**
+   * Release the locks in reverse acquisition order: strings first, then graph.
+   */
   unlock(): void {
+    this.st.mf.unlock();
     this.mf.unlock();
   }
 
