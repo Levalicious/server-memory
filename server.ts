@@ -238,10 +238,8 @@ function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relation
 export class KnowledgeGraphManager {
   private gf: GraphFile;
   private st: StringTable;
-  /** In-memory name→offset index, rebuilt from node log on open */
+  /** In-memory name→offset index, rebuilt from node log on every lock acquisition */
   private nameIndex: Map<string, bigint>;
-  /** Generation counter from last rebuildNameIndex — avoids redundant rebuilds */
-  private cachedEntityCount: number = -1;
 
   constructor(memoryFilePath: string = DEFAULT_MEMORY_FILE_PATH) {
     // Derive binary file paths from the base path
@@ -250,22 +248,37 @@ export class KnowledgeGraphManager {
     const graphPath = path.join(dir, `${base}.graph`);
     const strPath = path.join(dir, `${base}.strings`);
 
+    // Subobject constructors self-lock around their own init/migration paths
+    // (see StringTable / GraphFile constructors). They may grow the underlying
+    // files, so we cannot hold an outer lock across these calls.
     this.st = new StringTable(strPath);
     this.gf = new GraphFile(graphPath, this.st);
     this.nameIndex = new Map();
-    this.rebuildNameIndex();
 
-    // Run initial structural sampling and MERW if graph is non-empty
-    if (this.nameIndex.size > 0) {
-      structuralSample(this.gf, 1, 0.85);
-      computeMerwPsi(this.gf);
-      this.gf.sync();
-    }
+    // Build the in-memory name index and run initial structural sampling +
+    // MERW under an exclusive lock that covers BOTH the graph and strings
+    // files. withWriteLock's prelude calls rebuildNameIndex() unconditionally,
+    // so the name map is populated by the time the callback runs.
+    // structuralSample + computeMerwPsi mutate the graph file; withWriteLock
+    // syncs both files on exit.
+    this.withWriteLock(() => {
+      if (this.nameIndex.size > 0) {
+        structuralSample(this.gf, 1, 0.85);
+        computeMerwPsi(this.gf);
+      }
+    });
   }
 
   /**
-   * Run the loadDocument pipeline under a shared (read) lock,
-   * so the StringTable is consistent during IDF derivation.
+   * Run the loadDocument pipeline under an exclusive (write) lock.
+   *
+   * `loadDocument` calls `st.intern(...)` for every word it sees, which
+   * invokes `mf.alloc()` on the strings file whenever a new string is added.
+   * That is a write to shared state, so we need an exclusive lock — a shared
+   * (read) lock would let multiple processes hammer the strings allocator
+   * simultaneously and corrupt its free list (manifesting as a SIGSEGV in
+   * `memfile_alloc`). The lock now covers BOTH files (see
+   * {@link GraphFile.lockExclusive}).
    *
    * The full pipeline is wrapped in a `kb.load_document` span; the inner
    * `loadDocument` emits per-stage child spans (normalize → chunking →
@@ -280,7 +293,7 @@ export class KnowledgeGraphManager {
         'kb.load.input_chars': text.length,
         'kb.load.top_k': topK,
       },
-      (span) => this.withReadLock(() => {
+      (span) => this.withWriteLock(() => {
         const result = loadDocument(text, title, this.st, topK);
         span.setAttribute('kb.load.chunks', result.stats.chunks);
         span.setAttribute('kb.load.sentences', result.stats.sentences);
@@ -296,9 +309,19 @@ export class KnowledgeGraphManager {
   // --- Locking helpers ---
 
   /**
-   * Acquire a shared (read) lock, refresh mappings (in case another process
-   * grew the files), rebuild the name index if the entity count changed,
-   * run the callback, then release the lock.
+   * Acquire a shared (read) lock on BOTH the graph and string-table files
+   * (via {@link GraphFile.lockShared}), refresh mappings (in case another
+   * process grew the files), rebuild the name index, run the callback, then
+   * release the lock.
+   *
+   * The name index is rebuilt unconditionally on every acquisition. The
+   * previous "skip rebuild if entity count is unchanged" optimization was
+   * incorrect under multi-process load: if another process did
+   * delete-then-create, the entity count can be unchanged while the freed
+   * slot has been recycled to a different name. The stale nameIndex entry
+   * would then dereference into reused free-list memory and downstream
+   * derivations (e.g. {@link AdjEntry.targetOffset}) could yield wildly
+   * out-of-bounds offsets.
    *
    * Wrapped in a `kb.lock.read` span. The `kb.lock.wait_ms` attribute records
    * how long we blocked acquiring the OS-level shared lock — useful for
@@ -313,7 +336,7 @@ export class KnowledgeGraphManager {
       try {
         this.gf.refresh();
         this.st.refresh();
-        this.maybeRebuildNameIndex();
+        this.rebuildNameIndex();
         span.setAttribute('kb.entity_count', this.nameIndex.size);
         return fn();
       } finally {
@@ -323,8 +346,18 @@ export class KnowledgeGraphManager {
   }
 
   /**
-   * Acquire an exclusive (write) lock, refresh mappings, rebuild name index,
-   * run the callback, sync both files, then release the lock.
+   * Acquire an exclusive (write) lock on BOTH the graph and string-table
+   * files (via {@link GraphFile.lockExclusive}), refresh mappings, rebuild
+   * name index, run the callback, sync both files, then release the lock.
+   *
+   * Required for any callback that mutates the strings file (allocation via
+   * `st.intern` of a previously-unseen string) as well as for graph
+   * mutations — withReadLock on the graph fd alone does NOT serialize
+   * strings-file mutations because flock(2) is per-fd.
+   *
+   * Like {@link withReadLock}, the name index is rebuilt unconditionally to
+   * pick up any concurrent delete+create that another process may have
+   * performed since this process last held a lock.
    *
    * Wrapped in a `kb.lock.write` span. The `kb.lock.wait_ms` attribute records
    * blocking time waiting for the exclusive lock.
@@ -338,13 +371,11 @@ export class KnowledgeGraphManager {
       try {
         this.gf.refresh();
         this.st.refresh();
-        this.maybeRebuildNameIndex();
+        this.rebuildNameIndex();
         span.setAttribute('kb.entity_count', this.nameIndex.size);
         const result = fn();
         this.gf.sync();
         this.st.sync();
-        // Update cached count after write
-        this.cachedEntityCount = this.gf.getEntityCount();
         return result;
       } finally {
         this.gf.unlock();
@@ -352,7 +383,7 @@ export class KnowledgeGraphManager {
     });
   }
 
-  /** Rebuild the in-memory name→offset index from the node log */
+  /** Rebuild the in-memory name→offset index from the node log. */
   private rebuildNameIndex(): void {
     this.nameIndex.clear();
     const offsets = this.gf.getAllEntityOffsets();
@@ -360,18 +391,6 @@ export class KnowledgeGraphManager {
       const rec = this.gf.readEntity(offset);
       const name = this.st.get(BigInt(rec.nameId));
       this.nameIndex.set(name, offset);
-    }
-    this.cachedEntityCount = this.gf.getEntityCount();
-  }
-
-  /**
-   * Rebuild nameIndex only if the entity count changed (another process wrote).
-   * This is cheap to check (single u32 read) and avoids a full scan on every lock.
-   */
-  private maybeRebuildNameIndex(): void {
-    const currentCount = this.gf.getEntityCount();
-    if (currentCount !== this.cachedEntityCount) {
-      this.rebuildNameIndex();
     }
   }
 
@@ -1283,7 +1302,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.22",
+    version: "0.0.23",
   }, {
     capabilities: {
       tools: {},
