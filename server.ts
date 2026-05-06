@@ -12,6 +12,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type EntityRecord, type AdjEntry } from './src/graphfile.js';
 import { StringTable } from './src/stringtable.js';
+import { TrigramIndex } from './src/trigram.js';
+import { buildTrigramQuery } from './src/regex_query.js';
 import { structuralSample } from './src/pagerank.js';
 import { computeMerwPsi } from './src/merw.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
@@ -191,31 +193,54 @@ function sortNeighbors(
 
 export const MAX_CHARS = 4096;
 
+/**
+ * Paginate `items` starting at `cursor`, producing a page no larger than
+ * `maxChars` (best-effort).
+ *
+ * Forward-progress invariant: every call advances the cursor by at least one
+ * item, even when that item's JSON exceeds `maxChars`. Without this guarantee,
+ * an oversized item at position `cursor` would cause `nextCursor === cursor`,
+ * which the model follows back into an identical call → infinite cycle. (See
+ * the obsMtime-desc / long-name regression we hit in production.)
+ *
+ * The byte budget is a soft cap, not a hard one: an oversized lead item is
+ * emitted alone, blowing past `maxChars` for that single page only. The
+ * alternative (skipping the item, or returning an error) hides data from the
+ * caller and makes downstream pagination inconsistent.
+ */
 function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
   const result: T[] = [];
   let i = cursor;
-  
+
   // Calculate overhead for wrapper: {"items":[],"nextCursor":null,"totalCount":123}
   const wrapperTemplate = { items: [] as T[], nextCursor: null as number | null, totalCount: items.length };
   const overhead = JSON.stringify(wrapperTemplate).length;
   let charCount = overhead;
-  
+
   while (i < items.length) {
     const itemJson = JSON.stringify(items[i]);
     const addedChars = itemJson.length + (result.length > 0 ? 1 : 0); // +1 for comma
-    
+
     if (charCount + addedChars > maxChars) {
+      // Forward-progress guarantee: if we have NOTHING in the page yet, emit
+      // this oversized item anyway and advance. Otherwise stop and let the
+      // next page (which now has a fresh budget) handle it.
+      if (result.length === 0) {
+        result.push(items[i]);
+        charCount += addedChars;
+        i++;
+      }
       break;
     }
-    
+
     result.push(items[i]);
     charCount += addedChars;
     i++;
   }
-  
+
   // Update nextCursor - recalculate if we stopped early (cursor digits may differ from null)
   const nextCursor = i < items.length ? i : null;
-  
+
   return {
     items: result,
     nextCursor,
@@ -241,6 +266,26 @@ export class KnowledgeGraphManager {
   /** In-memory name→offset index, rebuilt from node log on every lock acquisition */
   private nameIndex: Map<string, bigint>;
 
+  /**
+   * Trigram inverted index for fast `search_nodes` regex pre-filtering. Lazy:
+   * stays `null` until the first `searchNodes` call that supplies non-empty
+   * `literals` — sessions that never use literals never pay the build cost.
+   *
+   * Lifecycle:
+   *  - Built lazily under `withReadLock` / `withWriteLock` on demand.
+   *  - Maintained incrementally by every mutation method *in this process*
+   *    (createEntities, deleteEntities, addObservations, deleteObservations).
+   *  - Dropped to `null` whenever a cross-process change is detected on lock
+   *    acquisition. Next `searchNodes` with literals rebuilds.
+   *
+   * v1 limitation: cross-process invalidation is "drop and rebuild" —
+   * potentially several seconds on a 40K-entity KB. Single-process workloads
+   * (the common case) only pay the build cost once per process startup.
+   */
+  private trigramIndex: TrigramIndex | null;
+  /** Snapshot of (entityCount, stringsAllocated) at the time the trigram index was last (re)built. */
+  private trigramFingerprint: { entityCount: number; stringsAllocated: bigint };
+
   constructor(memoryFilePath: string = DEFAULT_MEMORY_FILE_PATH) {
     // Derive binary file paths from the base path
     const dir = path.dirname(memoryFilePath);
@@ -254,6 +299,8 @@ export class KnowledgeGraphManager {
     this.st = new StringTable(strPath);
     this.gf = new GraphFile(graphPath, this.st);
     this.nameIndex = new Map();
+    this.trigramIndex = null;
+    this.trigramFingerprint = { entityCount: -1, stringsAllocated: 0n };
 
     // Build the in-memory name index and run initial structural sampling +
     // MERW under an exclusive lock that covers BOTH the graph and strings
@@ -337,6 +384,7 @@ export class KnowledgeGraphManager {
         this.gf.refresh();
         this.st.refresh();
         this.rebuildNameIndex();
+        this.invalidateTrigramIndexIfStale();
         span.setAttribute('kb.entity_count', this.nameIndex.size);
         return fn();
       } finally {
@@ -372,10 +420,22 @@ export class KnowledgeGraphManager {
         this.gf.refresh();
         this.st.refresh();
         this.rebuildNameIndex();
+        this.invalidateTrigramIndexIfStale();
         span.setAttribute('kb.entity_count', this.nameIndex.size);
         const result = fn();
         this.gf.sync();
         this.st.sync();
+        // The mutation we just ran may have shifted entity count or strings
+        // allocated; refresh the trigram fingerprint so the *next* lock
+        // acquisition doesn't false-positive an "external" change. The
+        // mutation methods themselves keep the index hot via incremental
+        // updates; this is just bookkeeping.
+        if (this.trigramIndex !== null) {
+          this.trigramFingerprint = {
+            entityCount: this.gf.getEntityCount(),
+            stringsAllocated: this.st.mf.stats().allocated,
+          };
+        }
         return result;
       } finally {
         this.gf.unlock();
@@ -392,6 +452,94 @@ export class KnowledgeGraphManager {
       const name = this.st.get(BigInt(rec.nameId));
       this.nameIndex.set(name, offset);
     }
+  }
+
+  // --- Trigram index helpers ----------------------------------------------
+
+  /**
+   * Concatenate an entity's searchable strings (name + type + observations)
+   * into one indexed text. Same shape as `searchNodes` filters on, so a
+   * candidate hit means the regex *might* match somewhere on this entity.
+   */
+  private entityIndexedText(rec: EntityRecord): string {
+    const parts: string[] = [
+      this.st.get(BigInt(rec.nameId)),
+      this.st.get(BigInt(rec.typeId)),
+    ];
+    if (rec.obs0Id !== 0) parts.push(this.st.get(BigInt(rec.obs0Id)));
+    if (rec.obs1Id !== 0) parts.push(this.st.get(BigInt(rec.obs1Id)));
+    return parts.join('\n');
+  }
+
+  /**
+   * Lazy build of the trigram index. Called by `searchNodes` when literals
+   * are supplied and the index is null. Costs O(total chars) — on a 42 K
+   * entity KB with mostly-short observations, ~100 ms; bigger KBs scale
+   * roughly linearly.
+   *
+   * MUST be called inside a lock (the manager's withRead/WriteLock).
+   */
+  private buildTrigramIndex(): void {
+    return traced('kb.trigram.build', {}, (span) => {
+      const t0 = process.hrtime.bigint();
+      const idx = new TrigramIndex();
+      const offsets = this.gf.getAllEntityOffsets();
+      idx.rebuild((function* (this: KnowledgeGraphManager) {
+        for (const offset of offsets) {
+          const rec = this.gf.readEntity(offset);
+          yield [offset, this.entityIndexedText(rec)] as const;
+        }
+      }).call(this));
+      this.trigramIndex = idx;
+      this.trigramFingerprint = {
+        entityCount: this.gf.getEntityCount(),
+        stringsAllocated: this.st.mf.stats().allocated,
+      };
+      span.setAttribute('kb.entity_count', this.nameIndex.size);
+      span.setAttribute('kb.trigram.distinct', idx.distinctTrigrams);
+      span.setAttribute('kb.trigram.build_ms', Number(process.hrtime.bigint() - t0) / 1e6);
+    });
+  }
+
+  /**
+   * Drop the trigram index if a cross-process change is detected. Called at
+   * every lock acquisition. Single-process workloads keep the index across
+   * the entire session; multi-process workloads forfeit the speedup whenever
+   * another writer wins the race.
+   */
+  private invalidateTrigramIndexIfStale(): void {
+    if (this.trigramIndex === null) return;
+    const ec = this.gf.getEntityCount();
+    const sa = this.st.mf.stats().allocated;
+    if (ec !== this.trigramFingerprint.entityCount || sa !== this.trigramFingerprint.stringsAllocated) {
+      this.trigramIndex = null;
+    }
+  }
+
+  /**
+   * Add an entity to the trigram index, if the index is built. Idempotent.
+   * Called from mutation methods after the entity record is written.
+   */
+  private trigramAddEntity(offset: bigint, rec: EntityRecord): void {
+    if (this.trigramIndex === null) return;
+    this.trigramIndex.add(offset, this.entityIndexedText(rec));
+  }
+
+  /** Remove an entity from the trigram index, if the index is built. */
+  private trigramRemoveEntity(offset: bigint): void {
+    if (this.trigramIndex === null) return;
+    this.trigramIndex.remove(offset);
+  }
+
+  /**
+   * Replace an entity's contribution in the trigram index — needed when its
+   * observations change but the offset stays the same. Equivalent to remove
+   * + add but skips work if the index is null.
+   */
+  private trigramRefreshEntity(offset: bigint, rec: EntityRecord): void {
+    if (this.trigramIndex === null) return;
+    this.trigramIndex.remove(offset);
+    this.trigramIndex.add(offset, this.entityIndexedText(rec));
   }
 
   /** Build rank maps from the binary store for pagerank/llmrank sorting.
@@ -558,6 +706,11 @@ export class KnowledgeGraphManager {
 
         this.nameIndex.set(e.name, rec.offset);
 
+        // Keep the trigram index hot if it was already built. The index keys
+        // by entity offset and contains name + type + observations, so we
+        // index AFTER the observation writes have landed.
+        this.trigramAddEntity(rec.offset, this.gf.readEntity(rec.offset));
+
         const newEntity: Entity = {
           ...e,
           mtime: Number(now),
@@ -654,6 +807,11 @@ export class KnowledgeGraphManager {
           this.gf.addObservation(offset, obs, now);
         }
 
+        // Refresh trigram index entry — observations changed.
+        if (newObservations.length > 0) {
+          this.trigramRefreshEntity(offset, this.gf.readEntity(offset));
+        }
+
         results.push({ entityName: o.entityName, addedObservations: newObservations });
       }
 
@@ -674,6 +832,10 @@ export class KnowledgeGraphManager {
           this.st.release(BigInt(edge.relTypeId));
         }
 
+        // Drop the trigram entry BEFORE freeing — once the entity record is
+        // freed its strings may be released and the offset may be recycled.
+        this.trigramRemoveEntity(offset);
+
         this.gf.deleteEntity(offset);
         this.nameIndex.delete(name);
       }
@@ -690,6 +852,9 @@ export class KnowledgeGraphManager {
         for (const obs of d.observations) {
           this.gf.removeObservation(offset, obs, now);
         }
+
+        // Refresh trigram entry — observations may have changed.
+        this.trigramRefreshEntity(offset, this.gf.readEntity(offset));
       }
     });
   }
@@ -713,14 +878,33 @@ export class KnowledgeGraphManager {
     });
   }
 
-  // Regex-based search function
-  async searchNodes(query: string, sortBy?: EntitySortField, sortDir?: SortDirection, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
+  /**
+   * Regex-based entity search.
+   *
+   * Internally tries to extract a trigram filter from the regex source via
+   * {@link extractRequiredTrigramFilter}. If extraction succeeds we use the
+   * trigram index to narrow the candidate set before running the regex; if
+   * not (regex contains metacharacters we don't safely handle), we fall back
+   * to the linear scan. Same external contract — caller still passes a
+   * regex; the speedup is invisible.
+   */
+  async searchNodes(
+    query: string,
+    sortBy?: EntitySortField,
+    sortDir?: SortDirection,
+    direction: 'forward' | 'backward' | 'any' = 'forward',
+  ): Promise<KnowledgeGraph> {
     let regex: RegExp;
     try {
       regex = new RegExp(query, 'i');
     } catch {
       throw new Error(`Invalid regex pattern: ${query}`);
     }
+
+    // Cox-style trigram query extraction: parse the regex AST, propagate
+    // match-info bottom-up, produce a boolean trigram expression. Returns
+    // null when the regex collapses to no useful constraint (e.g., `.*`).
+    const trigramQuery = buildTrigramQuery(query);
 
     return traced(
       'kb.search_nodes',
@@ -730,13 +914,40 @@ export class KnowledgeGraphManager {
         ...(sortBy ? { 'kb.search.sort_by': sortBy } : {}),
       },
       (span) => this.withReadLock(() => {
-        const allEntities = this.getAllEntities();
+        let filteredEntities: Entity[];
+        let scannedCount: number;
+        let usedTrigram = false;
 
-        const filteredEntities = allEntities.filter(e =>
-          regex.test(e.name) ||
-          regex.test(e.entityType) ||
-          e.observations.some(o => regex.test(o))
-        );
+        if (trigramQuery !== null) {
+          if (this.trigramIndex === null) this.buildTrigramIndex();
+          const candidateOffsets = this.trigramIndex!.evaluateQuery(trigramQuery);
+          if (candidateOffsets !== null) {
+            usedTrigram = true;
+            const out: Entity[] = [];
+            for (const offset of candidateOffsets) {
+              const e = this.recordToEntity(this.gf.readEntity(offset));
+              if (regex.test(e.name) || regex.test(e.entityType) || e.observations.some(o => regex.test(o))) {
+                out.push(e);
+              }
+            }
+            filteredEntities = out;
+            scannedCount = candidateOffsets.length;
+          } else {
+            // Query collapsed to `all` after evaluation — full scan.
+            const allEntities = this.getAllEntities();
+            filteredEntities = allEntities.filter(e =>
+              regex.test(e.name) || regex.test(e.entityType) || e.observations.some(o => regex.test(o))
+            );
+            scannedCount = allEntities.length;
+          }
+        } else {
+          // Regex isn't trigram-extractable (e.g. `.*`, `\D+`) — full scan.
+          const allEntities = this.getAllEntities();
+          filteredEntities = allEntities.filter(e =>
+            regex.test(e.name) || regex.test(e.entityType) || e.observations.some(o => regex.test(o))
+          );
+          scannedCount = allEntities.length;
+        }
 
         const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
 
@@ -749,7 +960,8 @@ export class KnowledgeGraphManager {
 
         // Aggregate scan/match stats — the LLM-visible knobs that explain why
         // a query was slow: how big the haystack is and how big the result.
-        span.setAttribute('kb.search.scanned.entities', allEntities.length);
+        span.setAttribute('kb.search.used_trigram', usedTrigram);
+        span.setAttribute('kb.search.scanned.entities', scannedCount);
         span.setAttribute('kb.search.scanned.relations', allRelations.length);
         span.setAttribute('kb.search.matched.entities', filteredEntities.length);
         span.setAttribute('kb.search.matched.relations', filteredRelations.length);
@@ -1535,18 +1747,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_entity_types",
-        description: "Get all unique entity types in the knowledge graph",
+        description: "Get all unique entity types in the knowledge graph. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            cursor: { type: "number", description: "Cursor for pagination" },
+          },
         },
       },
       {
         name: "get_relation_types",
-        description: "Get all unique relation types in the knowledge graph",
+        description: "Get all unique relation types in the knowledge graph. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            cursor: { type: "number", description: "Cursor for pagination" },
+          },
         },
       },
       {
@@ -1572,10 +1788,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "validate_graph",
-        description: "Validate the knowledge graph. Returns missing entities referenced in relations and observation limit violations (>2 observations or >140 chars).",
+        description: "Validate the knowledge graph. Returns missing entities referenced in relations and observation limit violations (>2 observations or >140 chars). Each list is independently paginated (max 4096 chars per list).",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            entitiesCursor: { type: "number", description: "Cursor for the missingEntities list" },
+            violationsCursor: { type: "number", description: "Cursor for the observationViolations list" },
+          },
         },
       },
       {
@@ -1693,7 +1912,12 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         return { content: [{ type: "text", text: "Relations deleted successfully" }] };
       case "search_nodes": {
         const query = args.query as string;
-        const graph = await knowledgeGraphManager.searchNodes(query, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        const graph = await knowledgeGraphManager.searchNodes(
+          query,
+          args.sortBy as EntitySortField | undefined,
+          args.sortDir as SortDirection | undefined,
+          (args.direction as 'forward' | 'backward' | 'any') ?? 'forward',
+        );
 
         // Natural-language guard: literal queries (no regex metacharacters) that
         // produce zero matches are almost always the LLM mistaking this tool
@@ -1738,18 +1962,27 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
         return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
       }
-      case "get_entity_types":
-        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getEntityTypes(), null, 2) }] };
-      case "get_relation_types":
-        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getRelationTypes(), null, 2) }] };
+      case "get_entity_types": {
+        const types = await knowledgeGraphManager.getEntityTypes();
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, args.cursor as number ?? 0)) }] };
+      }
+      case "get_relation_types": {
+        const types = await knowledgeGraphManager.getRelationTypes();
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, args.cursor as number ?? 0)) }] };
+      }
       case "get_stats":
         return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
       case "get_orphaned_entities": {
         const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
         return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
       }
-      case "validate_graph":
-        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.validateGraph(), null, 2) }] };
+      case "validate_graph": {
+        const report = await knowledgeGraphManager.validateGraph();
+        return { content: [{ type: "text", text: JSON.stringify({
+          missingEntities: paginateItems(report.missingEntities, args.entitiesCursor as number ?? 0),
+          observationViolations: paginateItems(report.observationViolations, args.violationsCursor as number ?? 0),
+        }) }] };
+      }
       case "decode_timestamp":
         return { content: [{ type: "text", text: JSON.stringify(knowledgeGraphManager.decodeTimestamp(args.timestamp as number | undefined, args.relative as boolean ?? false)) }] };
       case "random_walk": {
