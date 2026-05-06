@@ -541,18 +541,20 @@ describe('MCP Memory Server E2E Tests', () => {
     });
 
     it('should get all entity types', async () => {
-      const result = await callTool(client, 'get_entity_types', {}) as string[];
+      const result = await callTool(client, 'get_entity_types', {}) as PaginatedResult<string>;
 
-      expect(result).toContain('Person');
-      expect(result).toContain('Company');
-      expect(result).toHaveLength(2);
+      expect(result.items).toContain('Person');
+      expect(result.items).toContain('Company');
+      expect(result.totalCount).toBe(2);
+      expect(result.items).toHaveLength(2);
     });
 
     it('should get all relation types', async () => {
-      const result = await callTool(client, 'get_relation_types', {}) as string[];
+      const result = await callTool(client, 'get_relation_types', {}) as PaginatedResult<string>;
 
-      expect(result).toContain('works_at');
-      expect(result).toHaveLength(1);
+      expect(result.items).toContain('works_at');
+      expect(result.totalCount).toBe(1);
+      expect(result.items).toHaveLength(1);
     });
   });
 
@@ -641,13 +643,15 @@ describe('MCP Memory Server E2E Tests', () => {
       });
 
       const result = await callTool(client, 'validate_graph', {}) as {
-        missingEntities: string[];
-        observationViolations: Array<{ entity: string; count: number; oversizedObservations: number[] }>;
+        missingEntities: PaginatedResult<string>;
+        observationViolations: PaginatedResult<{ entity: string; count: number; oversizedObservations: number[] }>;
       };
 
       // Binary store enforces referential integrity — no missing entities possible
-      expect(result.missingEntities).toHaveLength(0);
-      expect(result.observationViolations).toHaveLength(0);
+      expect(result.missingEntities.totalCount).toBe(0);
+      expect(result.missingEntities.items).toHaveLength(0);
+      expect(result.observationViolations.totalCount).toBe(0);
+      expect(result.observationViolations.items).toHaveLength(0);
     });
   });
 

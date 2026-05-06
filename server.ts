@@ -1535,18 +1535,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_entity_types",
-        description: "Get all unique entity types in the knowledge graph",
+        description: "Get all unique entity types in the knowledge graph. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            cursor: { type: "number", description: "Cursor for pagination" },
+          },
         },
       },
       {
         name: "get_relation_types",
-        description: "Get all unique relation types in the knowledge graph",
+        description: "Get all unique relation types in the knowledge graph. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            cursor: { type: "number", description: "Cursor for pagination" },
+          },
         },
       },
       {
@@ -1572,10 +1576,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "validate_graph",
-        description: "Validate the knowledge graph. Returns missing entities referenced in relations and observation limit violations (>2 observations or >140 chars).",
+        description: "Validate the knowledge graph. Returns missing entities referenced in relations and observation limit violations (>2 observations or >140 chars). Each list is independently paginated (max 4096 chars per list).",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            entitiesCursor: { type: "number", description: "Cursor for the missingEntities list" },
+            violationsCursor: { type: "number", description: "Cursor for the observationViolations list" },
+          },
         },
       },
       {
@@ -1738,18 +1745,27 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
         return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
       }
-      case "get_entity_types":
-        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getEntityTypes(), null, 2) }] };
-      case "get_relation_types":
-        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getRelationTypes(), null, 2) }] };
+      case "get_entity_types": {
+        const types = await knowledgeGraphManager.getEntityTypes();
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, args.cursor as number ?? 0)) }] };
+      }
+      case "get_relation_types": {
+        const types = await knowledgeGraphManager.getRelationTypes();
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, args.cursor as number ?? 0)) }] };
+      }
       case "get_stats":
         return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
       case "get_orphaned_entities": {
         const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
         return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
       }
-      case "validate_graph":
-        return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.validateGraph(), null, 2) }] };
+      case "validate_graph": {
+        const report = await knowledgeGraphManager.validateGraph();
+        return { content: [{ type: "text", text: JSON.stringify({
+          missingEntities: paginateItems(report.missingEntities, args.entitiesCursor as number ?? 0),
+          observationViolations: paginateItems(report.observationViolations, args.violationsCursor as number ?? 0),
+        }) }] };
+      }
       case "decode_timestamp":
         return { content: [{ type: "text", text: JSON.stringify(knowledgeGraphManager.decodeTimestamp(args.timestamp as number | undefined, args.relative as boolean ?? false)) }] };
       case "random_walk": {
