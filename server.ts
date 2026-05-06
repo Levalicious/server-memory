@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url';
 import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type EntityRecord, type AdjEntry } from './src/graphfile.js';
 import { StringTable } from './src/stringtable.js';
 import { TrigramIndex } from './src/trigram.js';
+import { buildTrigramQuery } from './src/regex_query.js';
 import { structuralSample } from './src/pagerank.js';
 import { computeMerwPsi } from './src/merw.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
@@ -880,25 +881,18 @@ export class KnowledgeGraphManager {
   /**
    * Regex-based entity search.
    *
-   * @param literals  Optional caller-supplied required substrings. If
-   *   provided AND each is ≥ 3 chars, we use the trigram index to narrow
-   *   candidates before running the regex. The candidate set is the *union*
-   *   of per-literal matches, so for an alternation regex like `foo|bar`
-   *   pass `['foo','bar']`. Soundness contract: every string actually
-   *   matched by `query` must contain at least one of `literals`. If you
-   *   can't guarantee this, omit `literals` and fall back to the linear
-   *   scan.
-   *
-   *   This is the v1 interface — Cox-style automatic literal extraction
-   *   from the regex AST is not yet implemented. See `bench/search-bench.ts`
-   *   for the speedup curve.
+   * Internally tries to extract a trigram filter from the regex source via
+   * {@link extractRequiredTrigramFilter}. If extraction succeeds we use the
+   * trigram index to narrow the candidate set before running the regex; if
+   * not (regex contains metacharacters we don't safely handle), we fall back
+   * to the linear scan. Same external contract — caller still passes a
+   * regex; the speedup is invisible.
    */
   async searchNodes(
     query: string,
     sortBy?: EntitySortField,
     sortDir?: SortDirection,
     direction: 'forward' | 'backward' | 'any' = 'forward',
-    literals?: readonly string[],
   ): Promise<KnowledgeGraph> {
     let regex: RegExp;
     try {
@@ -907,25 +901,26 @@ export class KnowledgeGraphManager {
       throw new Error(`Invalid regex pattern: ${query}`);
     }
 
+    // Cox-style trigram query extraction: parse the regex AST, propagate
+    // match-info bottom-up, produce a boolean trigram expression. Returns
+    // null when the regex collapses to no useful constraint (e.g., `.*`).
+    const trigramQuery = buildTrigramQuery(query);
+
     return traced(
       'kb.search_nodes',
       {
         'kb.search.direction': direction,
         'kb.search.query_length': query.length,
         ...(sortBy ? { 'kb.search.sort_by': sortBy } : {}),
-        'kb.search.literals_count': literals?.length ?? 0,
       },
       (span) => this.withReadLock(() => {
-        // Trigram fast path: caller supplied literals AND every literal is
-        // long enough to use the index. Falls back to a full scan
-        // (`candidates(...)` returning null) when any literal is < 3 chars.
         let filteredEntities: Entity[];
         let scannedCount: number;
         let usedTrigram = false;
 
-        if (literals && literals.length > 0) {
+        if (trigramQuery !== null) {
           if (this.trigramIndex === null) this.buildTrigramIndex();
-          const candidateOffsets = this.trigramIndex!.candidates(literals);
+          const candidateOffsets = this.trigramIndex!.evaluateQuery(trigramQuery);
           if (candidateOffsets !== null) {
             usedTrigram = true;
             const out: Entity[] = [];
@@ -938,7 +933,7 @@ export class KnowledgeGraphManager {
             filteredEntities = out;
             scannedCount = candidateOffsets.length;
           } else {
-            // unindexable literal — fall back to full scan
+            // Query collapsed to `all` after evaluation — full scan.
             const allEntities = this.getAllEntities();
             filteredEntities = allEntities.filter(e =>
               regex.test(e.name) || regex.test(e.entityType) || e.observations.some(o => regex.test(o))
@@ -946,7 +941,7 @@ export class KnowledgeGraphManager {
             scannedCount = allEntities.length;
           }
         } else {
-          // No literals supplied — full scan.
+          // Regex isn't trigram-extractable (e.g. `.*`, `\D+`) — full scan.
           const allEntities = this.getAllEntities();
           filteredEntities = allEntities.filter(e =>
             regex.test(e.name) || regex.test(e.entityType) || e.observations.some(o => regex.test(o))
@@ -1673,16 +1668,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_nodes",
-        description: "Search for nodes in the knowledge graph using a regex pattern. Results are paginated (max 4096 chars). Optionally pass `literals` (each ≥3 chars) to enable a trigram inverted index that makes selective queries dramatically faster on large KBs (often 10x–1000x). Soundness rule: every string actually matched by `query` must contain at least one of `literals`. For an alternation regex like `foo|bar`, pass [\"foo\",\"bar\"]; for a plain substring regex like `memory`, pass [\"memory\"]. Omit `literals` when you can't guarantee the rule (anchored regex with character classes, `.`, etc).",
+        description: "Search for nodes in the knowledge graph using a regex pattern. Results are paginated (max 4096 chars).",
         inputSchema: {
           type: "object",
           properties: {
             query: { type: "string", description: "Regex pattern to match against entity names, types, and observations." },
-            literals: {
-              type: "array",
-              items: { type: "string" },
-              description: "Optional required-substring set for the trigram index. Each must be ≥3 chars. The candidate set is the UNION of per-literal matches, so use this for alternation regexes. The result is post-filtered with `query`, so false positives in the index don't affect correctness — only false negatives would (skipping the field is always safe).",
-            },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction filter for returned relations. Default: forward" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
@@ -1922,15 +1912,11 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         return { content: [{ type: "text", text: "Relations deleted successfully" }] };
       case "search_nodes": {
         const query = args.query as string;
-        const literals = Array.isArray(args.literals)
-          ? (args.literals as unknown[]).filter((s): s is string => typeof s === 'string')
-          : undefined;
         const graph = await knowledgeGraphManager.searchNodes(
           query,
           args.sortBy as EntitySortField | undefined,
           args.sortDir as SortDirection | undefined,
           (args.direction as 'forward' | 'backward' | 'any') ?? 'forward',
-          literals,
         );
 
         // Natural-language guard: literal queries (no regex metacharacters) that

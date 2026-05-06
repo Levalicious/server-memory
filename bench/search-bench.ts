@@ -28,6 +28,7 @@ import path from 'path';
 import { GraphFile, type EntityRecord } from '../src/graphfile.js';
 import { StringTable } from '../src/stringtable.js';
 import { TrigramIndex } from '../src/trigram.js';
+import { buildTrigramQuery } from '../src/regex_query.js';
 
 interface Entity {
   name: string;
@@ -36,20 +37,10 @@ interface Entity {
 }
 
 interface BenchQuery {
-  /** Source for `new RegExp(source, 'i')`. */
+  /** Source for `new RegExp(source, 'i')`. The trigram filter is derived
+   *  from this string using the production extractor — same code path as
+   *  `searchNodes` takes in the integrated server. */
   regex: string;
-  /**
-   * Hand-supplied required-literal set the trigram impl will use to derive
-   * candidate trigrams. Each literal must be ≥ 3 chars or it adds no filter
-   * (and we'd fall back to scan). Empty array = "no trigram filter possible,
-   * scan all entities" (e.g. `.*`, single char, etc.).
-   *
-   * Cox semantics:
-   *  - one literal "foo" = REQUIRE all trigrams of "foo"
-   *  - multiple literals = OR — candidate is union of per-literal candidate sets
-   *    (this matches alternation regexes like `foo|bar`)
-   */
-  literals: string[];
   /** Human label for the report. */
   label: string;
 }
@@ -132,14 +123,19 @@ function baselineFilter(regex: RegExp, entities: Entity[]): number[] {
   return matches;
 }
 
-function trigramFilter(regex: RegExp, entities: Entity[], literals: string[], idx: TrigramIndex): number[] {
-  const candidateIds = idx.candidates(literals);
+function trigramFilter(regex: RegExp, regexSource: string, entities: Entity[], idx: TrigramIndex): number[] {
+  // Cox-style trigram-query extraction — same path the production server uses.
+  const query = buildTrigramQuery(regexSource);
   let candidates: Iterable<number>;
-  if (candidateIds === null) {
-    // Either no literals or an unindexable literal — must full-scan.
+  if (query === null) {
     candidates = (function* () { for (let i = 0; i < entities.length; i++) yield i; })();
   } else {
-    candidates = (function* () { for (const id of candidateIds) yield Number(id); })();
+    const candidateIds = idx.evaluateQuery(query);
+    if (candidateIds === null) {
+      candidates = (function* () { for (let i = 0; i < entities.length; i++) yield i; })();
+    } else {
+      candidates = (function* () { for (const id of candidateIds) yield Number(id); })();
+    }
   }
   const matches: number[] = [];
   for (const i of candidates) {
@@ -157,27 +153,35 @@ function trigramFilter(regex: RegExp, entities: Entity[], literals: string[], id
 
 const queries: BenchQuery[] = [
   // Common single-word substring queries — typical "find anything about X".
-  { label: 'memory',                  regex: 'memory',                 literals: ['memory'] },
-  { label: 'graph',                   regex: 'graph',                  literals: ['graph'] },
-  { label: 'pagerank',                regex: 'pagerank',               literals: ['pagerank'] },
-  { label: 'StringTable',             regex: 'StringTable',            literals: ['stringtable'] },
-  { label: 'lock',                    regex: 'lock',                   literals: ['lock'] },
-  { label: 'observation',             regex: 'observation',            literals: ['observation'] },
-  { label: 'concurrent',              regex: 'concurrent',             literals: ['concurrent'] },
-  { label: 'rebuildNameIndex',        regex: 'rebuildNameIndex',       literals: ['rebuildnameindex'] },
+  { label: 'memory',                  regex: 'memory'             },
+  { label: 'graph',                   regex: 'graph'              },
+  { label: 'pagerank',                regex: 'pagerank'           },
+  { label: 'StringTable',             regex: 'StringTable'        },
+  { label: 'lock',                    regex: 'lock'               },
+  { label: 'observation',             regex: 'observation'        },
+  { label: 'concurrent',              regex: 'concurrent'         },
+  { label: 'rebuildNameIndex',        regex: 'rebuildNameIndex'   },
 
-  // Anchored exact name queries — these should be highly selective.
-  { label: '^Self$',                  regex: '^Self$',                 literals: ['self'] },
-  { label: '^Lev$',                   regex: '^Lev$',                  literals: [] }, // 'Lev' is < 3 trigrams (length 3 → 1 trigram), still ok to filter
-  { label: '^Claude$',                regex: '^Claude$',               literals: ['claude'] },
+  // Anchored exact name queries — extractor strips ^/$ and uses the body.
+  { label: '^Self$',                  regex: '^Self$'             },
+  { label: '^Lev$',                   regex: '^Lev$'              },
+  { label: '^Claude$',                regex: '^Claude$'           },
 
   // Alternations — typical multi-term LLM query.
-  { label: 'memory|graph',            regex: 'memory|graph',           literals: ['memory', 'graph'] },
-  { label: 'foo|bar|baz|qux',         regex: 'foo|bar|baz|qux',        literals: ['foo', 'bar', 'baz', 'qux'] },
+  { label: 'memory|graph',            regex: 'memory|graph'       },
+  { label: 'foo|bar|baz|qux',         regex: 'foo|bar|baz|qux'    },
 
-  // Worst-case: no literals at all → must full-scan.
-  { label: '.*',                      regex: '.*',                     literals: [] },
-  { label: 'a.c',                     regex: 'a.c',                    literals: [] },
+  // Cox-only shapes that v1 string-walker would have punted on.
+  { label: 'memory.*concurrent',      regex: 'memory.*concurrent' },
+  { label: 'foo.bar',                 regex: 'foo.bar'            },
+  { label: '(memory|graph)file',      regex: '(memory|graph)file' },
+  { label: 'colou?r',                 regex: 'colou?r'            },
+  { label: '\\.com',                  regex: '\\.com'             },
+  { label: '\\bSelf\\b',              regex: '\\bSelf\\b'         },
+
+  // Worst-case: extractor returns null → full-scan fallback.
+  { label: '.*',                      regex: '.*'                 },
+  { label: 'a.c',                     regex: 'a.c'                },
 ];
 
 // -------------------------------------------------------------------------
@@ -204,7 +208,7 @@ for (const q of queries) {
   // Warmup
   for (let w = 0; w < WARMUP; w++) {
     baselineFilter(re, entities);
-    trigramFilter(re, entities, q.literals, idx);
+    trigramFilter(re, q.regex, entities, idx);
   }
 
   // Baseline timing
@@ -223,7 +227,7 @@ for (const q of queries) {
   let trigramCount = 0;
   for (let r = 0; r < ITERATIONS; r++) {
     const t0 = process.hrtime.bigint();
-    const matches = trigramFilter(re, entities, q.literals, idx);
+    const matches = trigramFilter(re, q.regex, entities, idx);
     const t1 = process.hrtime.bigint();
     trigramRuns.push(Number(t1 - t0));
     trigramCount = matches.length;

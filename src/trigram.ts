@@ -1,43 +1,36 @@
 /**
- * Trigram inverted index for fast regex pre-filtering.
+ * Trigram inverted index for regex pre-filtering.
  *
  * Maps each character trigram (3-byte lowercase substring) to the set of
- * string-IDs whose payload contains that trigram. Given a regex query and a
- * caller-supplied set of *required literals* (each ≥ 3 chars), we:
- *
- *   1. For every required literal `lit`, intersect the posting lists of each
- *      distinct trigram of `lit`. The result is the set of strings that
- *      *might* contain `lit`. Trigrams alone don't prove `lit` is present
- *      (a string could contain all of "fo", "oo", "oba" without containing
- *      "foobar"), so we always post-filter with the actual regex.
- *
- *   2. The candidate set across multiple literals is the *union* — this
- *      matches alternation regexes like `foo|bar`. ("If `R` is `foo|bar`,
- *      a string matching `R` must contain at least one of `foo`, `bar`.")
- *
- *   3. Run `regex.test()` on the candidates only. The literal-extraction
- *      step is the caller's responsibility in this v1 — see the design note
- *      in `searchNodes` for why we don't ship a regex-AST parser yet.
+ * string-IDs whose payload contains that trigram. Queries are expressed as
+ * a boolean expression over trigrams ({@link TrigramQuery}) — produced by
+ * the regex-AST analysis in `src/regex_query.ts` (Cox's algorithm) — and
+ * evaluated against the postings via {@link TrigramIndex.evaluateQuery}.
  *
  * Storage: process memory only. The class supports incremental add/remove,
  * so `intern` / `release` / `addObservation` etc. can keep it in sync within
  * a single process. Multi-process invalidation is the caller's problem;
  * `rebuild` reconstructs from a `(stringId, text)[]` iterator.
  *
- * Build cost: roughly O(total chars indexed). On the user's 42K-entity KB
- * that's ~50ms with the flat-array bulk-sort path used here (vs. ~6s with a
- * naive `Map<trigram, Set<id>>` builder).
+ * Build cost: roughly O(total chars indexed). On the active 42K-entity KB
+ * that's ~7s (the bulk-sort path here, vs. ~minutes with a naive
+ * `Map<trigram, Set<id>>` builder).
  */
+
+// =============================================================================
+// Trigram packing
+// =============================================================================
 
 /**
  * Encode a trigram as a 24-bit integer. Each byte gets 8 bits, little-endian.
- * Lowercased ASCII; non-ASCII bytes pass through (the index is lossy for
- * multibyte characters, which is fine — the post-filter regex catches them).
+ * Lowercased ASCII (only A–Z), with non-ASCII bytes truncated to their low
+ * byte. Multi-byte UTF-16 collisions are sound (they only produce false
+ * positives in the trigram filter, which the post-filter regex catches).
+ *
+ * Same packing used by both the index and the regex-side query builder, so
+ * the two agree on what counts as a "trigram".
  */
-function packTrigram(s: string, i: number): number {
-  // String#charCodeAt is per-UTF-16-code-unit. For ASCII paths (the vast
-  // majority of our keys) this is identical to the byte representation.
-  // Lowercase by ORing 0x20 only for A–Z so we don't smear digits/symbols.
+export function packTrigramAt(s: string, i: number): number {
   let a = s.charCodeAt(i);
   let b = s.charCodeAt(i + 1);
   let c = s.charCodeAt(i + 2);
@@ -55,13 +48,107 @@ function packTrigram(s: string, i: number): number {
 function collectTrigrams(text: string, out: Set<number>): void {
   if (text.length < 3) return;
   for (let i = 0; i + 3 <= text.length; i++) {
-    out.add(packTrigram(text, i));
+    out.add(packTrigramAt(text, i));
   }
 }
 
+// =============================================================================
+// TrigramQuery — boolean expression over trigrams
+// =============================================================================
+
 /**
- * Sorted-array intersection of two ascending lists. Returns a fresh array.
+ * A boolean expression over trigrams, produced by Cox's algorithm from a
+ * regex AST and evaluated against a {@link TrigramIndex}.
+ *
+ * Variants:
+ *   - `all`: anything matches; the index can't filter (caller must scan).
+ *   - `none`: nothing matches (zero candidates — sound short-circuit).
+ *   - `tri`: a single required trigram (a 24-bit packed int, see
+ *     {@link packTrigramAt}).
+ *   - `and`: every child must hold (intersection of postings).
+ *   - `or`:  some child must hold (union of postings).
+ *
+ * Construction is normalized via {@link tqAnd} / {@link tqOr} which flatten
+ * nested same-tag nodes and short-circuit `all`/`none` operands; consumers
+ * never need to handle pathological tree shapes.
  */
+export type TrigramQuery =
+  | { tag: 'all' }
+  | { tag: 'none' }
+  | { tag: 'tri'; t: number }
+  | { tag: 'and'; ks: TrigramQuery[] }
+  | { tag: 'or';  ks: TrigramQuery[] };
+
+export function allMatch(): TrigramQuery { return { tag: 'all' }; }
+export function noMatch():  TrigramQuery { return { tag: 'none' }; }
+export function tqTri(t: number): TrigramQuery { return { tag: 'tri', t }; }
+
+/**
+ * Build an AND query, simplifying:
+ *   - drop `all` operands (no constraint)
+ *   - any `none` operand → result is `none`
+ *   - flatten nested `and`
+ *   - dedupe `tri` leaves
+ *   - 0 surviving operands → `all`; 1 → that operand
+ */
+export function tqAnd(qs: TrigramQuery[]): TrigramQuery {
+  const flat: TrigramQuery[] = [];
+  for (const q of qs) {
+    if (q.tag === 'all') continue;
+    if (q.tag === 'none') return noMatch();
+    if (q.tag === 'and') flat.push(...q.ks);
+    else flat.push(q);
+  }
+  if (flat.length === 0) return allMatch();
+  // Dedupe trigram leaves (the same trigram appearing twice doesn't tighten).
+  const seenTris = new Set<number>();
+  const out: TrigramQuery[] = [];
+  for (const q of flat) {
+    if (q.tag === 'tri') {
+      if (seenTris.has(q.t)) continue;
+      seenTris.add(q.t);
+    }
+    out.push(q);
+  }
+  if (out.length === 1) return out[0];
+  return { tag: 'and', ks: out };
+}
+
+/**
+ * Build an OR query, simplifying:
+ *   - any `all` operand → result is `all`
+ *   - drop `none` operands
+ *   - flatten nested `or`
+ *   - dedupe `tri` leaves
+ *   - 0 surviving operands → `none`; 1 → that operand
+ */
+export function tqOr(qs: TrigramQuery[]): TrigramQuery {
+  const flat: TrigramQuery[] = [];
+  for (const q of qs) {
+    if (q.tag === 'all') return allMatch();
+    if (q.tag === 'none') continue;
+    if (q.tag === 'or') flat.push(...q.ks);
+    else flat.push(q);
+  }
+  if (flat.length === 0) return noMatch();
+  const seenTris = new Set<number>();
+  const out: TrigramQuery[] = [];
+  for (const q of flat) {
+    if (q.tag === 'tri') {
+      if (seenTris.has(q.t)) continue;
+      seenTris.add(q.t);
+    }
+    out.push(q);
+  }
+  if (out.length === 1) return out[0];
+  return { tag: 'or', ks: out };
+}
+
+// =============================================================================
+// Posting-list helpers (internal)
+// =============================================================================
+
+/** Sorted-array intersection of two ascending lists. Returns a fresh array. */
 function intersectSorted(a: bigint[], b: bigint[]): bigint[] {
   const out: bigint[] = [];
   let i = 0, j = 0;
@@ -73,9 +160,7 @@ function intersectSorted(a: bigint[], b: bigint[]): bigint[] {
   return out;
 }
 
-/**
- * Sorted-array union of k ascending lists. Returns a fresh deduped array.
- */
+/** Sorted-array union of k ascending lists. Returns a fresh deduped array. */
 function unionSorted(arrays: bigint[][]): bigint[] {
   if (arrays.length === 0) return [];
   if (arrays.length === 1) return arrays[0].slice();
@@ -90,17 +175,17 @@ function unionSorted(arrays: bigint[][]): bigint[] {
   return out;
 }
 
+// =============================================================================
+// TrigramIndex
+// =============================================================================
+
 export class TrigramIndex {
-  /**
-   * trigram (24-bit packed int) → sorted ascending list of string-IDs.
-   * Sorted to enable cheap merge-join intersection and union.
-   */
+  /** trigram (24-bit packed int) → sorted ascending list of string-IDs. */
   private postings: Map<number, bigint[]>;
 
   /**
    * Per string-ID, the set of trigrams it contributed. Needed so `remove`
-   * can reverse the contribution without rescanning the string. Memory cost
-   * is ~one Set per indexed string; not free, but bounded by total trigrams.
+   * can reverse the contribution without rescanning the string.
    */
   private trigramsByString: Map<bigint, Set<number>>;
 
@@ -114,22 +199,19 @@ export class TrigramIndex {
   }
 
   get size(): number { return this._size; }
-
   get distinctTrigrams(): number { return this.postings.size; }
 
   /**
    * Insert a string into the index. Idempotent for the same `(id, text)`
-   * pair — calling twice is a no-op. If `id` was previously indexed under
-   * a different `text`, the old contribution must be removed first by the
-   * caller (we don't store the original text to detect this).
+   * pair. If `id` was previously indexed under a different `text`, the
+   * caller must `remove(id)` first — the class doesn't store the original
+   * text to detect this.
    */
   add(id: bigint, text: string): void {
     if (this.trigramsByString.has(id)) return;
     const tris = new Set<number>();
     collectTrigrams(text.toLowerCase(), tris);
     if (tris.size === 0) {
-      // Empty contribution still counts as "indexed" so a future `add` for
-      // the same id is a no-op.
       this.trigramsByString.set(id, tris);
       this._size++;
       return;
@@ -137,13 +219,11 @@ export class TrigramIndex {
     for (const t of tris) {
       let list = this.postings.get(t);
       if (!list) { list = []; this.postings.set(t, list); }
-      // Insert in sorted order — list is ascending. Most appends will be
-      // to the end (ids monotonically increase as new strings are interned),
-      // so a fast-path tail-append is the common case.
+      // Tail-append fast path (entity offsets monotonically increase as new
+      // entities are interned). Otherwise, binary-search insertion.
       if (list.length === 0 || list[list.length - 1] < id) {
         list.push(id);
       } else {
-        // Binary search for insertion point.
         let lo = 0, hi = list.length;
         while (lo < hi) {
           const mid = (lo + hi) >>> 1;
@@ -156,16 +236,13 @@ export class TrigramIndex {
     this._size++;
   }
 
-  /**
-   * Remove a string from the index. Quietly no-ops if the id wasn't indexed.
-   */
+  /** Remove a string from the index. No-op if the id wasn't indexed. */
   remove(id: bigint): void {
     const tris = this.trigramsByString.get(id);
     if (!tris) return;
     for (const t of tris) {
       const list = this.postings.get(t);
       if (!list) continue;
-      // Binary search for the id in the sorted list.
       let lo = 0, hi = list.length;
       while (lo < hi) {
         const mid = (lo + hi) >>> 1;
@@ -188,13 +265,12 @@ export class TrigramIndex {
   }
 
   /**
-   * Bulk rebuild from an iterator of (id, text). Faster than calling
-   * `add()` N times because we sort once at the end instead of inserting
-   * into N already-sorted lists.
+   * Bulk rebuild from an iterator of (id, text). Faster than calling `add()`
+   * N times because we sort once at the end instead of inserting into N
+   * already-sorted lists.
    */
   rebuild(items: Iterable<readonly [bigint, string]>): void {
     this.clear();
-    // First pass: collect (trigram, id) pairs, deduped per-string.
     const pairs: { t: number; id: bigint }[] = [];
     for (const [id, text] of items) {
       const tris = new Set<number>();
@@ -203,7 +279,6 @@ export class TrigramIndex {
       this._size++;
       for (const t of tris) pairs.push({ t, id });
     }
-    // Sort by (trigram, id) ascending. Then group by trigram.
     pairs.sort((a, b) => {
       if (a.t !== b.t) return a.t - b.t;
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
@@ -221,56 +296,49 @@ export class TrigramIndex {
   }
 
   /**
-   * Return the candidate string-IDs whose strings *might* contain ANY of
-   * the supplied required literals. Each literal must be ≥ 3 chars to be
-   * useful; literals that are too short return null from
-   * {@link candidatesForLiteral} and force the caller to fall back to a
-   * full scan (we return the special value `null` to signal that).
+   * Evaluate a boolean trigram query against the index, returning a sorted
+   * ascending list of candidate string-IDs.
    *
-   * If `literals` is empty, returns null (no filter possible).
-   *
-   * On match, the result is a sorted ascending bigint[] of candidate IDs.
-   * The caller then runs the actual regex on the strings keyed by these IDs.
+   * Return values:
+   *   - `null`  — the query is `all` (no constraint); caller must full-scan.
+   *   - `[]`    — the query is `none` or short-circuited to empty (a required
+   *               trigram is missing from the index). Sound — no real string
+   *               can match. Caller can skip the post-filter entirely.
+   *   - `bigint[]` — sorted ascending list of candidate string-IDs.
    */
-  candidates(literals: readonly string[]): bigint[] | null {
-    if (literals.length === 0) return null;
-    const perLiteral: bigint[][] = [];
-    for (const lit of literals) {
-      const c = this.candidatesForLiteral(lit);
-      if (c === null) return null;   // any unindexable literal → fall back to scan
-      perLiteral.push(c);
+  evaluateQuery(q: TrigramQuery): bigint[] | null {
+    switch (q.tag) {
+      case 'all':  return null;
+      case 'none': return [];
+      case 'tri': {
+        const list = this.postings.get(q.t);
+        return list ? list.slice() : [];
+      }
+      case 'and': {
+        const lists: bigint[][] = [];
+        for (const child of q.ks) {
+          const r = this.evaluateQuery(child);
+          if (r === null) continue;          // 'all' contributes no constraint
+          if (r.length === 0) return [];     // any empty branch ⇒ empty AND
+          lists.push(r);
+        }
+        if (lists.length === 0) return null; // every child was 'all'
+        lists.sort((a, b) => a.length - b.length);
+        let acc = lists[0];
+        for (let k = 1; k < lists.length && acc.length > 0; k++) {
+          acc = intersectSorted(acc, lists[k]);
+        }
+        return acc;
+      }
+      case 'or': {
+        const lists: bigint[][] = [];
+        for (const child of q.ks) {
+          const r = this.evaluateQuery(child);
+          if (r === null) return null;       // OR with unfilterable ⇒ unfilterable
+          lists.push(r);
+        }
+        return unionSorted(lists);
+      }
     }
-    return unionSorted(perLiteral);
-  }
-
-  /**
-   * Candidate IDs for a single required literal. Returns the empty array if
-   * one of the literal's trigrams has no postings (zero-result short-circuit),
-   * or null if the literal itself is too short to use the index.
-   */
-  private candidatesForLiteral(literal: string): bigint[] | null {
-    if (literal.length < 3) return null;
-    const lower = literal.toLowerCase();
-    const seen = new Set<number>();
-    const tris: number[] = [];
-    for (let i = 0; i + 3 <= lower.length; i++) {
-      const t = packTrigram(lower, i);
-      if (seen.has(t)) continue;
-      seen.add(t);
-      tris.push(t);
-    }
-    const postings: bigint[][] = [];
-    for (const t of tris) {
-      const p = this.postings.get(t);
-      if (!p || p.length === 0) return [];   // a missing trigram ⇒ no candidates
-      postings.push(p);
-    }
-    // Intersect smallest-first to keep the running set tight.
-    postings.sort((a, b) => a.length - b.length);
-    let acc = postings[0];
-    for (let k = 1; k < postings.length && acc.length > 0; k++) {
-      acc = intersectSorted(acc, postings[k]);
-    }
-    return acc;
   }
 }
