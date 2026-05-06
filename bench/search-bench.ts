@@ -252,7 +252,7 @@ for (const q of queries) {
 // Report
 // -------------------------------------------------------------------------
 
-const pad = (s: string | number, n: number, right = false) => {
+const pad = (s: string | number, n: number, right = false): string => {
   const str = String(s);
   return right ? str.padStart(n) : str.padEnd(n);
 };

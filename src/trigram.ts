@@ -18,37 +18,45 @@
  */
 
 // =============================================================================
-// Trigram packing
+// Trigram packing — byte-level (UTF-8)
 // =============================================================================
 
 /**
- * Encode a trigram as a 24-bit integer. Each byte gets 8 bits, little-endian.
- * Lowercased ASCII (only A–Z), with non-ASCII bytes truncated to their low
- * byte. Multi-byte UTF-16 collisions are sound (they only produce false
- * positives in the trigram filter, which the post-filter regex catches).
- *
- * Same packing used by both the index and the regex-side query builder, so
- * the two agree on what counts as a "trigram".
+ * Reusable encoder. `TextEncoder.encode` produces a fresh `Uint8Array`, so
+ * we don't share buffers — only the encoder instance.
  */
-export function packTrigramAt(s: string, i: number): number {
-  let a = s.charCodeAt(i);
-  let b = s.charCodeAt(i + 1);
-  let c = s.charCodeAt(i + 2);
-  if (a >= 0x41 && a <= 0x5a) a |= 0x20;
-  if (b >= 0x41 && b <= 0x5a) b |= 0x20;
-  if (c >= 0x41 && c <= 0x5a) c |= 0x20;
-  return (a & 0xff) | ((b & 0xff) << 8) | ((c & 0xff) << 16);
+const UTF8 = new TextEncoder();
+
+/**
+ * Encode a string to its UTF-8 byte sequence. Multi-byte chars (non-ASCII)
+ * become 2-4 bytes each, so each non-ASCII char contributes its own internal
+ * trigrams to the index — much better selectivity than the prior 24-bit
+ * UTF-16-byte-truncated packing (which collapsed all chars > 0xff into the
+ * 256-byte alphabet via bitwise mask).
+ */
+export function encodeUtf8(s: string): Uint8Array {
+  return UTF8.encode(s);
 }
 
 /**
- * Collect the distinct trigrams of `text` into `out`. We dedupe per-string
+ * Pack 3 consecutive bytes into a 24-bit integer. Bytes are taken verbatim
+ * — no case folding here; that's handled upstream via `String#toLowerCase`
+ * before encoding (Unicode-aware). Same packing used on both index and
+ * regex-query sides.
+ */
+export function packTrigramAt(bytes: Uint8Array, i: number): number {
+  return bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16);
+}
+
+/**
+ * Collect the distinct trigrams of `bytes` into `out`. We dedupe per-string
  * because the index granularity is "string-ID contains this trigram" — a
  * string having `foo` ten times doesn't change the candidate set.
  */
-function collectTrigrams(text: string, out: Set<number>): void {
-  if (text.length < 3) return;
-  for (let i = 0; i + 3 <= text.length; i++) {
-    out.add(packTrigramAt(text, i));
+function collectTrigrams(bytes: Uint8Array, out: Set<number>): void {
+  if (bytes.length < 3) return;
+  for (let i = 0; i + 3 <= bytes.length; i++) {
+    out.add(packTrigramAt(bytes, i));
   }
 }
 
@@ -210,7 +218,9 @@ export class TrigramIndex {
   add(id: bigint, text: string): void {
     if (this.trigramsByString.has(id)) return;
     const tris = new Set<number>();
-    collectTrigrams(text.toLowerCase(), tris);
+    // Lowercase first (Unicode-aware), then UTF-8 encode. Same path the
+    // regex side uses, so query trigrams agree with index trigrams.
+    collectTrigrams(encodeUtf8(text.toLowerCase()), tris);
     if (tris.size === 0) {
       this.trigramsByString.set(id, tris);
       this._size++;
@@ -274,7 +284,7 @@ export class TrigramIndex {
     const pairs: { t: number; id: bigint }[] = [];
     for (const [id, text] of items) {
       const tris = new Set<number>();
-      collectTrigrams(text.toLowerCase(), tris);
+      collectTrigrams(encodeUtf8(text.toLowerCase()), tris);
       this.trigramsByString.set(id, tris);
       this._size++;
       for (const t of tris) pairs.push({ t, id });

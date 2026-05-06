@@ -40,7 +40,7 @@
  * shapes our v1 string-walker punted on.
  */
 
-import { TrigramQuery, packTrigramAt, allMatch, noMatch, tqAnd, tqOr, tqTri } from './trigram.js';
+import { type TrigramQuery, packTrigramAt, allMatch, tqAnd, tqOr, tqTri, encodeUtf8 } from './trigram.js';
 
 // =============================================================================
 // AST
@@ -303,8 +303,18 @@ export function parseRegex(source: string): Re {
 // Info propagation (Cox's algorithm)
 // =============================================================================
 
-/** Bounded string set; null means "open" (unbounded or unknown). */
-type SS = string[] | null;
+/**
+ * Bounded set of byte sequences; null means "open" (unbounded or unknown).
+ *
+ * The byte representation is the canonical form throughout the regex →
+ * trigram pipeline. Every literal char from the regex source is encoded to
+ * UTF-8 at info creation; all downstream cross / union / boundary
+ * operations work on byte arrays. This is the same model `codesearch` /
+ * `livegrep` / `zoekt` use, and it gives multi-byte Unicode chars (Greek
+ * `α`, math `≤`, CJK, etc.) full per-byte selectivity instead of folding
+ * everything above 0x7F into a single 256-byte alphabet.
+ */
+type SS = Uint8Array[] | null;
 
 interface Info {
   emptyable: boolean;
@@ -317,31 +327,15 @@ interface Info {
 /**
  * Cap for exact / prefix / suffix sets — past this, collapse to null.
  *
- * Sized so that single-wildcard 3-char patterns (`a.c`, `\d.b`, etc.) keep
- * their full enumerated exact set: with `.`'s 255-char alphabet, `a.c`
- * produces a 255-element exact set with one trigram each, evaluated as
- * `OR` of 255 distinct trigrams. Multi-wildcard patterns blow past this
- * (e.g. `..` cross is 65 K) and degrade to the non-exact path.
+ * Sized large enough that practical concatenations of small char-classes
+ * (`\d{4}` = 10⁴ = 10 K is over; `\d{3}` = 1000 is also over but the
+ * single-element cross of a 3-digit literal sequence stays linear) keep
+ * useful info. Multi-wildcard regexes blow past this and degrade to the
+ * non-exact path via the cross-fallback in {@link infoConcat}.
  */
 const SS_LIMIT = 256;
 
-/**
- * Alphabet that `.` enumerates over. JS regex `.` matches any code unit
- * except `\n` (no /s flag). Includes only LOWERCASE ASCII A–Z (uppercase
- * folds to lowercase via index-side toLowerCase) — but every byte ≥ 0x80
- * still matters because non-ASCII chars truncate to those bytes. Dropping
- * 0x41–0x5a from the alphabet shrinks the OR by 26 trigram lookups per
- * dot wildcard at no cost.
- */
-const DOT_ALPHABET: string[] = (() => {
-  const out: string[] = [];
-  for (let i = 0; i < 256; i++) {
-    if (i === 0x0a) continue;                  // exclude \n per JS dot semantics
-    if (i >= 0x41 && i <= 0x5a) continue;       // skip A-Z; they fold to a-z which is also in the alphabet
-    out.push(String.fromCharCode(i));
-  }
-  return out;
-})();
+const EMPTY_BYTES = new Uint8Array(0);
 
 const ENUM_DIGIT: string[] = '0123456789'.split('');
 /**
@@ -357,87 +351,122 @@ const ENUM_WORD:  string[] = (() => {
 })();
 const ENUM_WHITESPACE: string[] = [' ', '\t', '\n', '\r', '\f', '\v'];
 
-function ssOk(set: string[] | null): SS {
+/** Stable string key for a byte sequence — usable as a Set/Map key. */
+function bytesKey(b: Uint8Array): string {
+  // String of code units in 0..255. 1-1 mapping with bytes; same byte
+  // sequence ⇒ same string. We DON'T use this for trigram packing; only as
+  // a dedupe key.
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return s;
+}
+
+function bytesConcat(a: Uint8Array, b: Uint8Array): Uint8Array {
+  if (a.length === 0) return b;
+  if (b.length === 0) return a;
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+function ssOk(set: Uint8Array[] | null): SS {
   return set !== null && set.length <= SS_LIMIT ? set : null;
 }
 
-function ssCross(a: string[], b: string[]): SS {
+function ssCross(a: Uint8Array[], b: Uint8Array[]): SS {
   if (a.length * b.length > SS_LIMIT) return null;
-  const out = new Set<string>();
+  const seen = new Set<string>();
+  const out: Uint8Array[] = [];
   for (const x of a) for (const y of b) {
-    out.add(x + y);
-    if (out.size > SS_LIMIT) return null;
+    const c = bytesConcat(x, y);
+    const k = bytesKey(c);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(c);
+    if (out.length > SS_LIMIT) return null;
   }
-  return [...out];
+  return out;
 }
 
-function ssUnion(a: string[], b: string[]): SS {
-  const out = new Set([...a, ...b]);
-  if (out.size > SS_LIMIT) return null;
-  return [...out];
+function ssUnion(a: Uint8Array[], b: Uint8Array[]): SS {
+  const seen = new Set<string>();
+  const out: Uint8Array[] = [];
+  for (const arr of [a, b]) for (const x of arr) {
+    const k = bytesKey(x);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  if (out.length > SS_LIMIT) return null;
+  return out;
 }
 
 function infoEmpty(): Info {
-  return { emptyable: true, exact: [''], prefix: [''], suffix: [''], match: allMatch() };
+  return { emptyable: true, exact: [EMPTY_BYTES], prefix: [EMPTY_BYTES], suffix: [EMPTY_BYTES], match: allMatch() };
 }
 
 function infoLiteral(ch: string): Info {
-  // Lowercase at info-creation time so every downstream set (exact / prefix /
-  // suffix) and every boundary-trigram window operates on case-folded data.
-  // Required for soundness with non-ASCII case-foldable chars (`Ä`, Greek
-  // `Α/α`, etc.) — the packTrigramAt bitwise-lowercase only handles ASCII
-  // A–Z, but the index runs `text.toLowerCase()` (Unicode-aware) on insert.
-  // Without this, queries containing non-ASCII case-foldable chars near
-  // boundary windows produce trigram packings that mismatch the index's,
-  // causing false negatives.
-  const lower = ch.toLowerCase();
-  return { emptyable: false, exact: [lower], prefix: [lower], suffix: [lower], match: allMatch() };
+  // Unicode-aware case fold, then UTF-8 encode. Same path the index takes
+  // on insert (`text.toLowerCase()` then `encodeUtf8`), so the resulting
+  // byte sequences agree with the index's. Multi-byte chars become 2-4
+  // bytes each — every byte contributes to trigram selectivity.
+  const bytes = encodeUtf8(ch.toLowerCase());
+  return { emptyable: false, exact: [bytes], prefix: [bytes], suffix: [bytes], match: allMatch() };
 }
 
-function infoOpen(): Info {  // unsupported / unenumerated class (negated, \D, \W, \S, etc.)
+function infoOpen(): Info {  // unsupported / unenumerated class (negated, \D, \W, \S, etc.) AND dot.
   return { emptyable: false, exact: null, prefix: null, suffix: null, match: allMatch() };
 }
 
 /**
- * `.` enumerates over {@link DOT_ALPHABET}. With small concatenations this
- * drives the exact-derived query into an OR of trigrams, recovering speedup
- * on `a.c`-shaped patterns. Multi-wildcard regexes blow past `SS_LIMIT` and
- * gracefully degrade to the non-exact path.
+ * In a byte-level model, JS regex `.` matches one code unit which is 1-2
+ * bytes for BMP code points (and 2 code units for surrogate pairs ⇒ 4
+ * bytes total). Enumerating "any single byte" is unsound — the trigram
+ * filter would miss matches where `.` corresponds to a multi-byte char.
+ * Enumerating all valid UTF-8 byte sequences is too large (~1.1 M for
+ * 4-byte code points). So `.` collapses to open: `a.c`-style queries fall
+ * back to the linear scan, but the speedup on every other query shape
+ * (literals, classes, anchors, alternation, quantifiers over enumerable
+ * atoms) is fully preserved.
  */
 function infoDot(): Info {
-  return {
-    emptyable: false,
-    exact: DOT_ALPHABET,
-    prefix: DOT_ALPHABET,
-    suffix: DOT_ALPHABET,
-    match: allMatch(),
-  };
+  return infoOpen();
 }
 
 function infoAnchor(): Info {
-  return { emptyable: true, exact: [''], prefix: [''], suffix: [''], match: allMatch() };
+  return { emptyable: true, exact: [EMPTY_BYTES], prefix: [EMPTY_BYTES], suffix: [EMPTY_BYTES], match: allMatch() };
 }
 
 function infoClass(chars: string[] | null): Info {
   if (chars === null || chars.length === 0) return infoOpen();
-  // Lowercase + dedupe — `[Aa]` collapses to `[a]` for case-insensitive
-  // matching, matching the index's lowercased view.
-  const folded = [...new Set(chars.map(c => c.toLowerCase()))];
+  // Lowercase + UTF-8 encode + dedupe. Each entry is one byte-sequence
+  // (multi-byte chars expand here, just like literals).
+  const seen = new Set<string>();
+  const folded: Uint8Array[] = [];
+  for (const c of chars) {
+    const b = encodeUtf8(c.toLowerCase());
+    const k = bytesKey(b);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    folded.push(b);
+  }
+  if (folded.length === 0) return infoOpen();
   return { emptyable: false, exact: ssOk(folded), prefix: ssOk(folded), suffix: ssOk(folded), match: allMatch() };
 }
 
 /**
- * Produce the trigram query for a boundary between `xSuffix` and `yPrefix`:
- * for every (s, p) pair, the trigrams that span the boundary in s+p must
- * appear. With multiple (s, p) pairs we OR over them (any pair is allowed).
+ * Produce the trigram query for a boundary between `xSuffix` and `yPrefix`.
+ * For every (s, p) pair, the trigrams that span the boundary in s+p must
+ * appear. With multiple (s, p) pairs we OR over them.
  */
 function boundaryQuery(xSuffix: SS, yPrefix: SS): TrigramQuery {
   if (xSuffix === null || yPrefix === null) return allMatch();
   const branches: TrigramQuery[] = [];
   for (const s of xSuffix) {
     for (const p of yPrefix) {
-      const combined = s + p;
-      // Trigrams strictly spanning the boundary: positions i in
+      const combined = bytesConcat(s, p);
+      // Trigrams strictly spanning the boundary: byte positions i in
       //   max(0, |s|-2) .. min(|combined|-3, |s|-1)
       const lo = Math.max(0, s.length - 2);
       const hi = Math.min(combined.length - 3, s.length - 1);
@@ -586,10 +615,12 @@ function computeInfo(re: Re): Info {
  * too short, the exact-derived path is unsound; return null and let the
  * caller fall back to `info.match`.
  */
-function tqFromExact(exact: string[]): TrigramQuery | null {
-  // `exact` strings are already lowercased — infoLiteral / infoClass fold
-  // chars at info-creation time, so anything that flowed into the exact set
-  // is in the index's canonical case. No second toLowerCase needed.
+function tqFromExact(exact: Uint8Array[]): TrigramQuery | null {
+  // `exact` byte sequences are already lowercased + UTF-8 encoded —
+  // infoLiteral / infoClass fold + encode at info-creation time, so each
+  // member is in the index's canonical byte form. We measure trigram
+  // boundaries in BYTES, not code units, so multi-byte chars produce
+  // multiple internal trigrams.
   const branches: TrigramQuery[] = [];
   for (const e of exact) {
     if (e.length < 3) return null;

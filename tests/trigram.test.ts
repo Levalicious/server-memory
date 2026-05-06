@@ -17,6 +17,7 @@ import { describe, it, expect } from '@jest/globals';
 import {
   TrigramIndex,
   packTrigramAt,
+  encodeUtf8,
   tqAnd,
   tqOr,
   tqTri,
@@ -26,8 +27,11 @@ import {
 } from '../src/trigram.js';
 import { buildTrigramQuery, parseRegex } from '../src/regex_query.js';
 
-// Helper: build a `tri` leaf from a 3-char string.
-const tri = (s: string): TrigramQuery => tqTri(packTrigramAt(s, 0));
+/**
+ * Helper: build a `tri` leaf from a 3-byte ASCII string. Byte-level
+ * indexing means we test in the same canonical form the index uses.
+ */
+const tri = (s: string): TrigramQuery => tqTri(packTrigramAt(encodeUtf8(s.toLowerCase()), 0));
 
 describe('TrigramIndex', () => {
   describe('add / remove / size', () => {
@@ -387,32 +391,21 @@ describe('buildTrigramQuery — Cox-style trigram extraction', () => {
 
   it('returns null for queries with no useful constraint', () => {
     expect(buildTrigramQuery('.*')).toBeNull();
-    expect(buildTrigramQuery('.')).toBeNull();        // single char — too short
-    expect(buildTrigramQuery('\\d+')).toBeNull();      // emptyable repeat over a class
+    expect(buildTrigramQuery('.')).toBeNull();         // single char — too short
+    expect(buildTrigramQuery('\\d+')).toBeNull();       // emptyable repeat over a class
+    // `a.c` returns null in the byte-level model. JS regex `.` matches one
+    // code unit which is 1-2 bytes for BMP chars (or a 4-byte surrogate
+    // pair) — enumerating "any single byte" would produce false negatives
+    // on multi-byte content. We treat `.` as open and fall back to scan.
+    // The soundness check below still guards correctness.
+    expect(buildTrigramQuery('a.c')).toBeNull();
   });
 
-  it('DOT ENUMERATION: a.c becomes OR of trigrams over the wildcard', () => {
-    // `a.c` is a length-3 pattern with one wildcard. `dot` enumerates over
-    // its alphabet (255 chars, no \n), producing OR of 255 trigrams `a?c`.
-    const q = buildTrigramQuery('a.c');
-    expect(q).not.toBeNull();
-    // Every actually-matching string must be admitted.
-    assertSound('a.c', [
-      'abc here',          // matches
-      'aXc somewhere',     // matches
-      'a c with space',    // matches (space is in DOT_ALPHABET)
-      'aac aac aac',       // matches
-      'ac here',           // does NOT match (no middle char)
-      'unrelated stuff',   // no match
-    ]);
-  });
-
-  it('DOT ENUMERATION: \\d.b enumerates digits at the first slot', () => {
-    // \\d (10 chars) cross . (255 chars) cross b → 10*255 = 2550 → exceeds
-    // SS_LIMIT, so the prefix step falls back to x.prefix and we lose the
-    // exact-set path. But the boundary computation still extracts useful
-    // trigrams when the cross fits. Either way, soundness must hold.
-    assertSound('\\d.b', ['1xb here', '5 b okay', 'no digit before b', 'digit but no b: 5']);
+  it('DOT-CONTAINING SHORT REGEXES: a.c falls back to scan, soundly', () => {
+    // `a.c` has only 1-byte literals around a single open `.`, so no
+    // byte-trigram boundary can be formed. The extractor returns null and
+    // the linear scan handles correctness.
+    assertSound('a.c', ['abc here', 'aXc somewhere', 'aαc unicode', 'ac short', 'unrelated']);
   });
 
   it('case-insensitive at the trigram level', () => {
@@ -422,6 +415,37 @@ describe('buildTrigramQuery — Cox-style trigram extraction', () => {
     const idx = new TrigramIndex();
     idx.add(1n, 'foo here');
     expect(idx.evaluateQuery(q!)).toContain(1n);
+  });
+
+  it('UTF-8 BYTE-LEVEL: multi-byte literals produce internal trigrams', () => {
+    // `αβγ` is 6 UTF-8 bytes (each Greek letter is 2 bytes: 0xCE-0xCF
+    // lead). With byte-level trigrams, this is 4 trigrams of length 3
+    // bytes each, vs the old "char" model where 3 code units gave only 1
+    // trigram (and 3 collisions onto bytes 0xB1, 0xB2, 0xB3).
+    //
+    // We verify by building a small index of Greek strings, querying for a
+    // multi-byte literal, and asserting selectivity > what 1-char-per-
+    // trigram would give. The strict check is that the candidate set
+    // includes only strings actually containing the literal.
+    const idx = new TrigramIndex();
+    idx.add(1n, 'the equation αβγ holds');
+    idx.add(2n, 'no greek here at all');
+    idx.add(3n, 'αβ but no γ');
+    idx.add(4n, 'just γ on its own');
+    idx.add(5n, 'mixed αβγδ epsilon');
+
+    const q = buildTrigramQuery('αβγ');
+    expect(q).not.toBeNull();
+    const candidates = idx.evaluateQuery(q!);
+    expect(candidates).not.toBeNull();
+    // Strings 1 and 5 contain "αβγ"; 2/3/4 don't.
+    expect(new Set(candidates!.map(b => Number(b)))).toEqual(new Set([1, 5]));
+  });
+
+  it('UTF-8 BYTE-LEVEL: ASCII-only queries unchanged', () => {
+    // Soundness on a representative ASCII query — same as before, just
+    // routed through the byte path now.
+    assertSound('memory', ['memory leak', 'no match', 'memorial']);
   });
 
   it('case-folds non-ASCII characters consistently between regex source and index', () => {
