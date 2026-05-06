@@ -305,6 +305,147 @@ describe('MCP Memory Server E2E Tests', () => {
         callTool(client, 'search_nodes', { query: '[invalid' })
       ).rejects.toThrow(/Invalid regex pattern/);
     });
+
+    it('trigram path: results match the regex-only path', async () => {
+      // Soundness check: passing `literals` should never change the result
+      // set vs. omitting it. The trigram pre-filter is a candidate-narrowing
+      // optimization; the post-filter regex is the source of truth.
+      // Populate enough entities to actually exercise the index.
+      const entities = [];
+      for (let i = 0; i < 100; i++) {
+        entities.push({
+          name: `Trig_${i.toString().padStart(3, '0')}`,
+          entityType: i % 2 === 0 ? 'Concept' : 'Person',
+          observations: [`memory artefact ${i}`],
+        });
+      }
+      await callTool(client, 'create_entities', { entities });
+
+      const queries: { query: string; literals?: string[] }[] = [
+        { query: 'memory',                       literals: ['memory'] },
+        { query: 'Trig_0',                       literals: ['trig_'] },
+        { query: 'Trig_001|Trig_010',            literals: ['trig_001', 'trig_010'] },
+        { query: 'Concept',                      literals: ['concept'] },
+        { query: 'Concept|Person',               literals: ['concept', 'person'] },
+      ];
+
+      // Drain ALL pages with deterministic name-sort so we compare full
+      // result sets, not nondeterministic top-llmrank pages.
+      async function drainAll(query: string, literals?: string[]): Promise<Set<string>> {
+        const out = new Set<string>();
+        let cursor: number | null = 0;
+        while (cursor !== null) {
+          const args: Record<string, unknown> = { query, sortBy: 'name', sortDir: 'asc', entityCursor: cursor };
+          if (literals) args.literals = literals;
+          const r = await callTool(client, 'search_nodes', args) as PaginatedGraph;
+          for (const e of r.entities.items) out.add(e.name);
+          cursor = r.entities.nextCursor;
+        }
+        return out;
+      }
+
+      for (const q of queries) {
+        const without = await drainAll(q.query);
+        const withLits = await drainAll(q.query, q.literals);
+        expect(withLits.size).toBe(without.size);
+        for (const n of without) expect(withLits.has(n)).toBe(true);
+      }
+    });
+
+    it('trigram path: short literal falls back to scan and still returns correct results', async () => {
+      // Literals < 3 chars cannot use the index — the integration must fall
+      // back to the linear scan transparently and still return the right set.
+      // The graph from the parent suite's beforeEach is also present, so we
+      // count both paths and compare instead of asserting an absolute number.
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'AlphaUniqueXY', entityType: 'X', observations: [] },
+          { name: 'AlphaUniqueZW', entityType: 'X', observations: [] },
+        ],
+      });
+      const without = await callTool(client, 'search_nodes', { query: 'AlphaUniqueX' }) as PaginatedGraph;
+      const withLits = await callTool(client, 'search_nodes', { query: 'AlphaUniqueX', literals: ['XY'] }) as PaginatedGraph;
+      // 'XY' is < 3 chars so the index can't filter — must fall back to scan
+      // and produce the same result.
+      expect(withLits.entities.totalCount).toBe(without.entities.totalCount);
+      expect(withLits.entities.totalCount).toBe(1);
+    });
+
+    it('trigram path: index stays consistent across writes', async () => {
+      // Build the index by issuing one literal-search, then mutate, then
+      // re-search. Local writes should keep the index in sync (incremental
+      // update); deletes should remove their offsets from the index.
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'AlphaTango', entityType: 'Codename', observations: ['call sign alpha'] },
+          { name: 'BravoZulu',  entityType: 'Codename', observations: ['call sign bravo'] },
+        ],
+      });
+      // Warm the index
+      let r = await callTool(client, 'search_nodes', { query: 'alpha', literals: ['alpha'] }) as PaginatedGraph;
+      expect(r.entities.items.map(e => e.name)).toEqual(['AlphaTango']);
+
+      // Mutate: add a new entity. The trigram update must include it.
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'AlphaCharlie', entityType: 'Codename', observations: [] }],
+      });
+      r = await callTool(client, 'search_nodes', { query: 'alpha', literals: ['alpha'] }) as PaginatedGraph;
+      const names = new Set(r.entities.items.map(e => e.name));
+      expect(names.has('AlphaTango')).toBe(true);
+      expect(names.has('AlphaCharlie')).toBe(true);
+
+      // Mutate: delete one. The trigram update must drop it.
+      await callTool(client, 'delete_entities', { entityNames: ['AlphaTango'] });
+      r = await callTool(client, 'search_nodes', { query: 'alpha', literals: ['alpha'] }) as PaginatedGraph;
+      const after = r.entities.items.map(e => e.name);
+      expect(after).toContain('AlphaCharlie');
+      expect(after).not.toContain('AlphaTango');
+    });
+
+    it('paginates oversized entities without wedging the cursor', async () => {
+      // Regression test for an obsMtime-desc / long-name infinite loop:
+      // `paginateItems` previously returned `nextCursor === cursor` whenever
+      // the item at `cursor` was itself larger than MAX_CHARS=4096 (no other
+      // item could fit either, so the page came back empty). The model
+      // followed nextCursor back into the identical call, ad infinitum.
+      // The fix is the forward-progress invariant in paginateItems: when a
+      // page would otherwise be empty, emit the lead item anyway and advance.
+      //
+      // The cycle here is asserted indirectly: we drain the cursor to null
+      // in a while-loop with a hard iteration cap. Pre-fix, the loop never
+      // terminates and Jest's per-test timeout kills the suite.
+      const longName = 'L_' + 'x'.repeat(4500);  // single entity JSON > 4096 chars
+      await callTool(client, 'create_entities', {
+        entities: [{ name: longName, entityType: 'BigName', observations: ['recent'] }],
+      });
+
+      const allEntities: Entity[] = [];
+      let entityCursor: number | null = 0;
+      let iterations = 0;
+      const ITERATION_CAP = 50;  // any healthy graph fits in << 50 pages here
+
+      while (entityCursor !== null) {
+        if (++iterations > ITERATION_CAP) {
+          throw new Error(
+            `paginateItems forward-progress regression: drained ${iterations} ` +
+            `pages without nextCursor reaching null. Pre-fix this loops forever.`,
+          );
+        }
+        const result = await callTool(client, 'search_nodes', {
+          query: longName.slice(0, 40),  // unique substring → matches only the long-name entity
+          sortBy: 'obsMtime',
+          sortDir: 'desc',
+          entityCursor,
+        }) as PaginatedGraph;
+
+        allEntities.push(...result.entities.items);
+        entityCursor = result.entities.nextCursor;
+      }
+
+      // The long-name entity must have been emitted (forward-progress guarantees
+      // it's the only item on its page, in a single oversized response).
+      expect(allEntities.some(e => e.name === longName)).toBe(true);
+    });
   });
 
   describe('search_nodes natural-language guard', () => {
