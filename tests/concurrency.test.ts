@@ -5,6 +5,7 @@
  * one instance writes and the other reads.
  */
 
+import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 import { type Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { createServer, type Entity } from "../server.js";
 import { createTestClient, callTool, type PaginatedResult, type PaginatedGraph } from "./test-utils.js";
