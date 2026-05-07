@@ -56,6 +56,31 @@ const POOL: readonly string[] = Array.from(
   (_, i) => `Node${i.toString().padStart(2, '0')}`,
 );
 
+// Long-content pool — exercises the pagination forward-progress invariant.
+// A single entity with a very long name produces a JSON entry that exceeds
+// MAX_CHARS=4096, which used to wedge `paginateItems` into a fixed-cursor
+// loop. The fuzzer creates a small population of these so any read tool that
+// sorts them to the top of a page (e.g. obsMtime desc → most-recent
+// long-named entity) hits the wedge if the bug ever regresses.
+const LONG_POOL_SIZE = 4;
+const LONG_POOL: readonly string[] = Array.from(
+  { length: LONG_POOL_SIZE },
+  (_, i) => `LongNode${i.toString().padStart(2, '0')}_` + 'x'.repeat(4200),
+);
+const LONG_OBS_BANK: readonly string[] = [
+  'a'.repeat(140),
+  'b'.repeat(140),
+  'c'.repeat(140),
+];
+
+// Pagination cursor knobs we exercise. `entitiesCursor` / `relationCursor`
+// are graph-shape; `cursor` is the single-list shape; `entitiesCursor` /
+// `violationsCursor` are the validate_graph shape. We stuff all relevant
+// cursor names into args via `maybeCursors()` per tool.
+const READ_SORTS = [undefined, 'mtime', 'obsMtime', 'name', 'pagerank', 'llmrank'] as const;
+const READ_DIRS  = [undefined, 'asc',  'desc'] as const;
+const NEIGHBOR_DIRS = [undefined, 'forward', 'backward', 'any'] as const;
+
 // Mulberry32 — fast deterministic PRNG. Each agent gets its own stream.
 function mkRng(seed: number): () => number {
   let s = seed >>> 0;
@@ -77,18 +102,70 @@ interface FuzzOp {
   args: Record<string, unknown>;
 }
 
+/**
+ * Pick an entity name from the small short-name pool most of the time, and
+ * occasionally from the long-name pool. Long-name entities exist so a read
+ * tool that sorts them to the top of a page hits the pagination
+ * forward-progress invariant.
+ */
+function pickEntityName(rng: () => number): string {
+  return rng() < 0.85 ? pick(rng, POOL) : pick(rng, LONG_POOL);
+}
+
+/**
+ * Maybe-attach `sortBy` / `sortDir` to a read-tool args object. With prob
+ * 0.5 we leave both undefined (covers the "default sort" code path); with
+ * prob 0.5 we pick a random pair, including `obsMtime desc` which is the
+ * shape that surfaced the production cycle bug.
+ */
+function maybeSort(rng: () => number, args: Record<string, unknown>): void {
+  if (rng() < 0.5) return;
+  const sortBy  = pick(rng, READ_SORTS);
+  const sortDir = pick(rng, READ_DIRS);
+  if (sortBy  !== undefined) args.sortBy  = sortBy;
+  if (sortDir !== undefined) args.sortDir = sortDir;
+}
+
+/**
+ * Random cursor value to stress the pagination boundaries. Most calls use
+ * cursor=0 (fresh page), some use a value past the data (out-of-range), some
+ * use a small positive value (mid-list). The fuzzer is stateless per call so
+ * we don't follow `nextCursor` — but feeding arbitrary cursors is enough to
+ * surface a forward-progress regression: an LLM that follows a stuck cursor
+ * loops by re-issuing the same call, which here is equivalent to calling
+ * once with that cursor and asserting the response advanced (we can't assert
+ * it from inside fuzz, but the watchdog will fire on the *server* if the
+ * call doesn't terminate).
+ */
+function maybeCursor(rng: () => number, args: Record<string, unknown>, name: string): void {
+  if (rng() < 0.7) return;          // most calls: cursor=0 (default)
+  const v = rng();
+  if (v < 0.4)      args[name] = 0;
+  else if (v < 0.8) args[name] = Math.floor(rng() * 50);
+  else              args[name] = Math.floor(rng() * 100000); // way past end
+}
+
 function buildOp(rng: () => number): FuzzOp {
   const r = rng();
 
   // ---- writes (35%) -------------------------------------------------
   if (r < 0.10) {
+    // 15% of creates use long-name entities; the rest stay in the small
+    // short-name pool to keep the working set tractable.
+    const useLong = rng() < 0.15;
+    const name = useLong ? pick(rng, LONG_POOL) : pick(rng, POOL);
+    const obsRoll = rng();
+    let observations: string[];
+    if (obsRoll < 0.4)      observations = [];
+    else if (obsRoll < 0.8) observations = [`obs ${Math.floor(rng() * 1e6)}`];
+    else                    observations = [pick(rng, LONG_OBS_BANK)];
     return {
       tool: 'create_entities',
       args: {
         entities: [{
-          name: pick(rng, POOL),
+          name,
           entityType: pick(rng, ENTITY_TYPES),
-          observations: rng() < 0.5 ? [] : [`obs ${Math.floor(rng() * 1e6)}`],
+          observations,
         }],
       },
     };
@@ -98,20 +175,21 @@ function buildOp(rng: () => number): FuzzOp {
       tool: 'create_relations',
       args: {
         relations: [{
-          from: pick(rng, POOL),
-          to:   pick(rng, POOL),
+          from: pickEntityName(rng),
+          to:   pickEntityName(rng),
           relationType: pick(rng, RELATION_TYPES),
         }],
       },
     };
   }
   if (r < 0.22) {
+    const useMaxLenObs = rng() < 0.2;
     return {
       tool: 'add_observations',
       args: {
         observations: [{
-          entityName: pick(rng, POOL),
-          contents: [`add ${Math.floor(rng() * 1e6)}`],
+          entityName: pickEntityName(rng),
+          contents: [useMaxLenObs ? pick(rng, LONG_OBS_BANK) : `add ${Math.floor(rng() * 1e6)}`],
         }],
       },
     };
@@ -121,22 +199,22 @@ function buildOp(rng: () => number): FuzzOp {
       tool: 'delete_observations',
       args: {
         deletions: [{
-          entityName: pick(rng, POOL),
+          entityName: pickEntityName(rng),
           observations: [`add ${Math.floor(rng() * 1e6)}`],
         }],
       },
     };
   }
   if (r < 0.30) {
-    return { tool: 'delete_entities', args: { entityNames: [pick(rng, POOL)] } };
+    return { tool: 'delete_entities', args: { entityNames: [pickEntityName(rng)] } };
   }
   if (r < 0.35) {
     return {
       tool: 'delete_relations',
       args: {
         relations: [{
-          from: pick(rng, POOL),
-          to:   pick(rng, POOL),
+          from: pickEntityName(rng),
+          to:   pickEntityName(rng),
           relationType: pick(rng, RELATION_TYPES),
         }],
       },
@@ -148,42 +226,76 @@ function buildOp(rng: () => number): FuzzOp {
     const k = rng();
     let query: string;
     if (k < 0.30)      query = `find me a thing about ${pick(rng, ENTITY_TYPES)}`;
-    else if (k < 0.65) query = pick(rng, POOL);
+    else if (k < 0.65) query = pickEntityName(rng);
     else               query = `^${pick(rng, POOL)}|${pick(rng, ENTITY_TYPES)}$`;
-    return { tool: 'search_nodes', args: { query } };
+    const args: Record<string, unknown> = { query };
+    maybeSort(rng, args);
+    if (rng() < 0.3) args.direction = pick(rng, NEIGHBOR_DIRS) ?? 'forward';
+    maybeCursor(rng, args, 'entityCursor');
+    maybeCursor(rng, args, 'relationCursor');
+    return { tool: 'search_nodes', args };
   }
   if (r < 0.55) {
-    return { tool: 'open_nodes', args: { names: [pick(rng, POOL), pick(rng, POOL)] } };
+    const args: Record<string, unknown> = { names: [pickEntityName(rng), pickEntityName(rng)] };
+    if (rng() < 0.3) args.direction = pick(rng, NEIGHBOR_DIRS) ?? 'forward';
+    maybeCursor(rng, args, 'entityCursor');
+    maybeCursor(rng, args, 'relationCursor');
+    return { tool: 'open_nodes', args };
   }
   if (r < 0.65) {
-    return {
-      tool: 'get_neighbors',
-      args: { entityName: pick(rng, POOL), depth: 1 + Math.floor(rng() * 3) },
+    const args: Record<string, unknown> = {
+      entityName: pickEntityName(rng),
+      depth: 1 + Math.floor(rng() * 3),
     };
+    maybeSort(rng, args);
+    if (rng() < 0.3) args.direction = pick(rng, NEIGHBOR_DIRS) ?? 'forward';
+    maybeCursor(rng, args, 'cursor');
+    return { tool: 'get_neighbors', args };
   }
   if (r < 0.72) {
-    return {
-      tool: 'find_path',
-      args: {
-        fromEntity: pick(rng, POOL),
-        toEntity:   pick(rng, POOL),
-        maxDepth:   1 + Math.floor(rng() * 5),
-      },
+    const args: Record<string, unknown> = {
+      fromEntity: pickEntityName(rng),
+      toEntity:   pickEntityName(rng),
+      maxDepth:   1 + Math.floor(rng() * 5),
     };
+    if (rng() < 0.3) args.direction = pick(rng, NEIGHBOR_DIRS) ?? 'forward';
+    maybeCursor(rng, args, 'cursor');
+    return { tool: 'find_path', args };
   }
   if (r < 0.78) {
-    return { tool: 'get_entities_by_type', args: { entityType: pick(rng, ENTITY_TYPES) } };
+    const args: Record<string, unknown> = { entityType: pick(rng, ENTITY_TYPES) };
+    maybeSort(rng, args);
+    maybeCursor(rng, args, 'cursor');
+    return { tool: 'get_entities_by_type', args };
   }
-  if (r < 0.82) return { tool: 'get_entity_types',     args: {} };
-  if (r < 0.86) return { tool: 'get_relation_types',   args: {} };
-  if (r < 0.90) return { tool: 'get_stats',            args: {} };
-  if (r < 0.93) return { tool: 'validate_graph',       args: {} };
-  if (r < 0.96) return { tool: 'get_orphaned_entities', args: {} };
+  if (r < 0.82) {
+    const args: Record<string, unknown> = {};
+    maybeCursor(rng, args, 'cursor');
+    return { tool: 'get_entity_types', args };
+  }
+  if (r < 0.86) {
+    const args: Record<string, unknown> = {};
+    maybeCursor(rng, args, 'cursor');
+    return { tool: 'get_relation_types', args };
+  }
+  if (r < 0.90) return { tool: 'get_stats', args: {} };
+  if (r < 0.93) {
+    const args: Record<string, unknown> = {};
+    maybeCursor(rng, args, 'entitiesCursor');
+    maybeCursor(rng, args, 'violationsCursor');
+    return { tool: 'validate_graph', args };
+  }
+  if (r < 0.96) {
+    const args: Record<string, unknown> = { strict: rng() < 0.5 };
+    maybeSort(rng, args);
+    maybeCursor(rng, args, 'cursor');
+    return { tool: 'get_orphaned_entities', args };
+  }
 
   return {
     tool: 'random_walk',
     args: {
-      start: pick(rng, POOL),
+      start: pickEntityName(rng),
       depth: 1 + Math.floor(rng() * 10),
       mode:  rng() < 0.5 ? 'merw' : 'uniform',
     },

@@ -52,6 +52,15 @@ const PAGINATED_TOOLS = new Set([
   'get_orphaned_entities',
 ]);
 
+/**
+ * MAX_CHARS is a SOFT budget per page on the server. The forward-progress
+ * invariant in `paginateItems` allows a single oversized lead item to blow
+ * past the budget — that's by design (otherwise the cursor would never
+ * advance past such an item and the model would loop). So the test helper's
+ * cap is a sanity ceiling, not the production budget.
+ */
+const RESPONSE_SANITY_CAP = MAX_CHARS * 16;
+
 export async function callTool(
   client: Client,
   name: string,
@@ -73,9 +82,12 @@ export async function callTool(
 
   const first = content[0];
   if (first.type === 'text' && first.text) {
-    // Only enforce char limit on paginated read operations
-    if (PAGINATED_TOOLS.has(name) && first.text.length > MAX_CHARS) {
-      throw new Error(`Response exceeds ${MAX_CHARS} char limit: got ${first.text.length} chars`);
+    // The cap is a sanity ceiling — way larger than the server's per-page
+    // budget — to catch a real algorithmic regression (e.g. paginateItems
+    // emitting the entire list in one page). It must NOT be MAX_CHARS,
+    // because the forward-progress invariant allows single oversized items.
+    if (PAGINATED_TOOLS.has(name) && first.text.length > RESPONSE_SANITY_CAP) {
+      throw new Error(`Response exceeds sanity cap (${RESPONSE_SANITY_CAP} chars): got ${first.text.length} chars`);
     }
     try {
       return JSON.parse(first.text);
