@@ -33,9 +33,55 @@ import {
   type Span,
   type Tracer,
 } from '@opentelemetry/api';
+import { existsSync, readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 
 const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? 'memory-server';
-const SERVICE_VERSION = '0.0.20';
+
+/**
+ * Resolve our own package version at module-load by walking up from this
+ * file to the nearest `package.json`. Works in both dev (running from
+ * `src/`) and the published shape (running from `dist/src/`), because in
+ * both cases the closest ancestor `package.json` is ours (subsequent
+ * ancestors would belong to a consumer project, which is also fine —
+ * if our `package.json` is somehow missing we'd accidentally report the
+ * consumer's version; covered by the existsSync at the closest level).
+ *
+ * Previously this was a hardcoded `'0.0.20'` literal that nobody
+ * remembered to bump, so every span and metric for v0.0.21 .. 0.0.24
+ * carried a four-version-old `service.version` attribute. Tooling that
+ * filters or rolls up by service version was silently misled.
+ */
+function resolveServiceVersion(): string {
+  try {
+    let dir = dirname(fileURLToPath(import.meta.url));
+    const { root } = (function parseRoot(): { root: string } {
+      // Mirrors the pattern in src/memoryfile.ts:findNative — avoid
+      // pulling in `path.parse` at the top of the module just for this.
+      const m = /^([A-Z]:\\|\/)/.exec(dir);
+      return { root: m ? m[1] : '/' };
+    })();
+    while (dir !== root) {
+      const candidate = join(dir, 'package.json');
+      if (existsSync(candidate)) {
+        const pkg = JSON.parse(readFileSync(candidate, 'utf-8')) as { name?: string; version?: string };
+        if (typeof pkg.version === 'string') return pkg.version;
+      }
+      dir = dirname(dir);
+    }
+  } catch {
+    // Best-effort — see fallback below. Tracing must never throw at init.
+  }
+  return 'unknown';
+}
+
+/**
+ * Version of *this* package, used as `service.version` on every span and
+ * metric. Read once at module load from our `package.json` so OTel data
+ * doesn't lie about which build is emitting it.
+ */
+export const SERVICE_VERSION = resolveServiceVersion();
 
 /**
  * Stderr-only diag logger. Avoids contaminating the JSON-RPC stdout channel.
