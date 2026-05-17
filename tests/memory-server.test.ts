@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { createServer, type Entity, type Relation, type Neighbor } from '../server.js';
-import { createTestClient, callTool, callToolRaw, type PaginatedGraph, type PaginatedResult } from './test-utils.js';
+import { createTestClient, callTool, callToolRaw, type PaginatedGraph, type PaginatedResult, type FindPathResult } from './test-utils.js';
 
 describe('MCP Memory Server E2E Tests', () => {
   let testDir: string;
@@ -647,14 +647,16 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'find_path', {
         fromEntity: 'Root',
         toEntity: 'Grandchild'
-      }) as PaginatedResult<Relation>;
+      }) as FindPathResult;
 
+      expect(result.targetReached).toBe(true);
+      expect(result.budgetExhausted).toBe(false);
       expect(result.items).toHaveLength(2);
       expect(result.items[0].from).toBe('Root');
       expect(result.items[1].to).toBe('Grandchild');
     });
 
-    it('should return empty path when no path exists', async () => {
+    it('returns a best-effort exploration path with targetReached=false when target is unreachable', async () => {
       await callTool(client, 'create_entities', {
         entities: [{ name: 'Isolated', entityType: 'Node', observations: [] }]
       });
@@ -662,9 +664,336 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'find_path', {
         fromEntity: 'Root',
         toEntity: 'Isolated'
-      }) as PaginatedResult<Relation>;
+      }) as FindPathResult;
 
+      // β-contract: BFS expanded Root + its connected component but
+      // never reached Isolated. We expect a partial path to whatever
+      // node the BFS got deepest into, NOT an empty list. The flag is
+      // the source of truth for "did we find the asked-for target."
+      expect(result.targetReached).toBe(false);
+      expect(result.budgetExhausted).toBe(false);
+      expect(result.farthestDiscovered).toBeDefined();
+      // Path must NOT end at Isolated — confirms it's an exploration
+      // path, not a fake "we found it" answer.
+      if (result.items.length > 0) {
+        expect(result.items[result.items.length - 1].to).not.toBe('Isolated');
+      }
+      // Note exists and mentions the actual target.
+      expect(result.note).toBeDefined();
+      expect(result.note).toMatch(/Isolated/);
+    });
+  });
+
+  describe('find_path BFS regression suite', () => {
+    // These tests pin the post-2026-05-16 BFS rewrite against the prior
+    // DFS-with-backtrack-deletion implementation, which enumerated every
+    // simple path of length ≤ maxDepth (O(b^d) on hub nodes) and pinned a
+    // production memory-server at 91% CPU for 27 minutes before being
+    // killed. Each test below would either hang or return a wrong-length
+    // path under that implementation.
+
+    it('returns the SHORTEST path when multiple paths exist', async () => {
+      // Topology:
+      //   A → B → D          (length 2)
+      //   A → C → D          (length 2, alternate)
+      //   A → X → Y → Z → D  (length 4, distractor)
+      //
+      // Build the distractor edge A→X FIRST so DFS would discover it on
+      // its first descent and (without the backtrack-deletion bug)
+      // return the length-4 path. BFS must return one of the length-2
+      // paths regardless of insertion order.
+      await callTool(client, 'create_entities', {
+        entities: ['A','B','C','D','X','Y','Z'].map(n => ({
+          name: n, entityType: 'Node', observations: [],
+        })),
+      });
+      await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'A', to: 'X', relationType: 'r' },
+          { from: 'X', to: 'Y', relationType: 'r' },
+          { from: 'Y', to: 'Z', relationType: 'r' },
+          { from: 'Z', to: 'D', relationType: 'r' },
+          { from: 'A', to: 'B', relationType: 'r' },
+          { from: 'B', to: 'D', relationType: 'r' },
+          { from: 'A', to: 'C', relationType: 'r' },
+          { from: 'C', to: 'D', relationType: 'r' },
+        ],
+      });
+
+      const result = await callTool(client, 'find_path', {
+        fromEntity: 'A', toEntity: 'D',
+      }) as FindPathResult;
+
+      expect(result.targetReached).toBe(true);
+      expect(result.items).toHaveLength(2);   // not 4
+      expect(result.items[0].from).toBe('A');
+      expect(result.items[1].to).toBe('D');
+    });
+
+    it('returns best-effort exploration within milliseconds when target is unreachable from a high-branching hub (regression: would hang DFS)', async () => {
+      // The production hang: a hub with branching factor b ≈ 50, target
+      // in a disconnected island. DFS-with-backtrack-deletion expands
+      // b^maxDepth path-suffixes before concluding. We build a hub of
+      // 40 outbound edges with a 2-deep tail per branch (so the
+      // pathological subgraph has ~40 * 40 = 1600 length-2 paths, and
+      // depth=5 would explore on the order of 40^5 = 100M paths under
+      // the old code) and a completely separate target node.
+      const HUB_DEGREE = 40;
+      const TAIL_LEN = 2;
+      const entities: { name: string; entityType: string; observations: string[] }[] = [
+        { name: 'Hub', entityType: 'Hub', observations: [] },
+        { name: 'Unreachable', entityType: 'Node', observations: [] },
+      ];
+      const relations: { from: string; to: string; relationType: string }[] = [];
+      for (let i = 0; i < HUB_DEGREE; i++) {
+        let prev = 'Hub';
+        for (let d = 0; d < TAIL_LEN; d++) {
+          const n = `Hub_b${i}_d${d}`;
+          entities.push({ name: n, entityType: 'Node', observations: [] });
+          relations.push({ from: prev, to: n, relationType: 'r' });
+          prev = n;
+        }
+        // Cross-edges between branches at the leaf level — keeps the
+        // adversarial branching factor up at every level instead of
+        // narrowing as DFS descends.
+        if (i > 0) {
+          relations.push({ from: `Hub_b${i-1}_d${TAIL_LEN-1}`, to: `Hub_b${i}_d0`, relationType: 'x' });
+        }
+      }
+      await callTool(client, 'create_entities', { entities });
+      await callTool(client, 'create_relations', { relations });
+
+      const t0 = Date.now();
+      const result = await callTool(client, 'find_path', {
+        fromEntity: 'Hub', toEntity: 'Unreachable', maxDepth: 5,
+      }) as FindPathResult;
+      const elapsed = Date.now() - t0;
+
+      // β-contract: target unreachable → targetReached=false and a
+      // best-effort path is returned (not the empty list the pre-β
+      // contract would have produced). The bug being regressed against
+      // is the exponential DFS, not the response shape.
+      expect(result.targetReached).toBe(false);
+      expect(result.farthestDiscovered).toBeDefined();
+      // Under the old DFS this completes in minutes-to-hours, not ms. 5s
+      // is a generous ceiling that any reasonable BFS comfortably clears
+      // (production typical: < 50ms for graphs of this size). A
+      // regression that restores the old behavior fails here long before
+      // the per-call watchdog or the test runner timeout intervenes.
+      expect(elapsed).toBeLessThan(5000);
+    });
+
+    it('tolerates cycles and does not loop', async () => {
+      // Triangle plus a separate target on the far side.
+      await callTool(client, 'create_entities', {
+        entities: ['P','Q','R','Target'].map(n => ({
+          name: n, entityType: 'Node', observations: [],
+        })),
+      });
+      await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'P', to: 'Q', relationType: 'r' },
+          { from: 'Q', to: 'R', relationType: 'r' },
+          { from: 'R', to: 'P', relationType: 'r' },     // closes the cycle
+          { from: 'R', to: 'Target', relationType: 'r' },
+        ],
+      });
+
+      const result = await callTool(client, 'find_path', {
+        fromEntity: 'P', toEntity: 'Target',
+      }) as FindPathResult;
+
+      expect(result.targetReached).toBe(true);
+      expect(result.items).toHaveLength(3);              // P→Q→R→Target
+      expect(result.items[0].from).toBe('P');
+      expect(result.items[result.items.length - 1].to).toBe('Target');
+    });
+
+    it('maxDepth boundary: path of length N is found when maxDepth=N; rejected when maxDepth=N-1', async () => {
+      // Chain A → B → C → D → E (4 hops). maxDepth=4 must find it;
+      // maxDepth=3 must return [].
+      await callTool(client, 'create_entities', {
+        entities: ['A','B','C','D','E'].map(n => ({
+          name: n, entityType: 'Node', observations: [],
+        })),
+      });
+      await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'A', to: 'B', relationType: 'r' },
+          { from: 'B', to: 'C', relationType: 'r' },
+          { from: 'C', to: 'D', relationType: 'r' },
+          { from: 'D', to: 'E', relationType: 'r' },
+        ],
+      });
+
+      const accepted = await callTool(client, 'find_path', {
+        fromEntity: 'A', toEntity: 'E', maxDepth: 4,
+      }) as FindPathResult;
+      expect(accepted.targetReached).toBe(true);
+      expect(accepted.items).toHaveLength(4);
+
+      // β-contract: depth was too small to reach E, so targetReached=false
+      // and the returned path is a best-effort exploration ending at the
+      // deepest node BFS expanded (D, after 3 hops). Caller can chain a
+      // follow-up call with fromEntity='D' to continue.
+      const rejected = await callTool(client, 'find_path', {
+        fromEntity: 'A', toEntity: 'E', maxDepth: 3,
+      }) as FindPathResult;
+      expect(rejected.targetReached).toBe(false);
+      expect(rejected.budgetExhausted).toBe(false);
+      expect(rejected.farthestDiscovered).toBe('D');
+      expect(rejected.items).toHaveLength(3);            // A→B→C→D, the best-effort partial
+      expect(rejected.items[rejected.items.length - 1].to).toBe('D');
+    });
+
+    it('returns empty path with targetReached=true when fromEntity equals toEntity (no-op path)', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'Solo', entityType: 'Node', observations: [] }],
+      });
+      const result = await callTool(client, 'find_path', {
+        fromEntity: 'Solo', toEntity: 'Solo',
+      }) as FindPathResult;
+      // Trivial: 0 hops needed, target reached.
+      expect(result.targetReached).toBe(true);
+      expect(result.budgetExhausted).toBe(false);
       expect(result.items).toHaveLength(0);
+    });
+
+    it('memory budget: a tiny KB_FIND_PATH_BUDGET_BYTES forces budget exhaustion and bounded time', async () => {
+      // Build a long-enough chain that BFS materializes several names
+      // before reaching the target. With a budget low enough to admit
+      // only the start node + a couple discoveries, BFS must terminate
+      // mid-search and return []. Same graph with the default budget
+      // (next sub-test) returns the full path — proves the budget is
+      // what's limiting, not the topology.
+      await callTool(client, 'create_entities', {
+        entities: ['n0','n1','n2','n3','n4','n5','n6','n7'].map(n => ({
+          name: n, entityType: 'Node', observations: [],
+        })),
+      });
+      await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'n0', to: 'n1', relationType: 'r' },
+          { from: 'n1', to: 'n2', relationType: 'r' },
+          { from: 'n2', to: 'n3', relationType: 'r' },
+          { from: 'n3', to: 'n4', relationType: 'r' },
+          { from: 'n4', to: 'n5', relationType: 'r' },
+          { from: 'n5', to: 'n6', relationType: 'r' },
+          { from: 'n6', to: 'n7', relationType: 'r' },
+        ],
+      });
+
+      // 100 bytes only covers ~1 discovery (~120 B per BFS step under
+      // our V8 layout constants), so BFS must trip the cap before
+      // crossing the chain. Set/unset around the call so other tests
+      // are unaffected. We rely on `findPathBudgetBytes` reading
+      // `process.env` per-call (it does), so the in-process server
+      // observes the override exactly on this call.
+      process.env.KB_FIND_PATH_BUDGET_BYTES = '100';
+      let constrained: FindPathResult;
+      const t0 = Date.now();
+      try {
+        constrained = await callTool(client, 'find_path', {
+          fromEntity: 'n0', toEntity: 'n7', maxDepth: 10,
+        }) as FindPathResult;
+      } finally {
+        delete process.env.KB_FIND_PATH_BUDGET_BYTES;
+      }
+      const elapsed = Date.now() - t0;
+
+      // β-contract: budget tripped before reaching n7. We get:
+      //   - targetReached=false (the asked-for target was NOT n0)
+      //   - budgetExhausted=true (the reason the search stopped)
+      //   - farthestDiscovered=some name BFS got to before the cap
+      //   - items: a best-effort partial path to farthestDiscovered
+      //   - note: contains both "memory budget" wording and the target name
+      expect(constrained.targetReached).toBe(false);
+      expect(constrained.budgetExhausted).toBe(true);
+      expect(constrained.farthestDiscovered).toBeDefined();
+      expect(constrained.note).toMatch(/budget/);
+      expect(constrained.note).toMatch(/n7/);
+      // The partial path ends at farthestDiscovered, not at the target.
+      if (constrained.items.length > 0) {
+        expect(constrained.items[constrained.items.length - 1].to).toBe(constrained.farthestDiscovered);
+      }
+      expect(elapsed).toBeLessThan(1000);
+
+      // Same call without the override finds the 7-hop path. This sub-
+      // assertion is what nails "the budget is the limiting factor" —
+      // without it, the test could pass by simply never finding paths.
+      const unconstrained = await callTool(client, 'find_path', {
+        fromEntity: 'n0', toEntity: 'n7', maxDepth: 10,
+      }) as FindPathResult;
+      expect(unconstrained.targetReached).toBe(true);
+      expect(unconstrained.budgetExhausted).toBe(false);
+      expect(unconstrained.items).toHaveLength(7);
+      expect(unconstrained.items[0].from).toBe('n0');
+      expect(unconstrained.items[unconstrained.items.length - 1].to).toBe('n7');
+    });
+
+    it('memory budget: env override of zero bytes terminates after the first discovery (target unreached)', async () => {
+      // Edge case: budget=0 means *any* discovery trips the cap. The
+      // budget check fires AFTER the "is this nextName the target?"
+      // check, by design — we never want to fail a search that
+      // succeeded. So budget=0 returns [] whenever the target is more
+      // than one BFS hop away, and returns the path when the target is
+      // exactly one hop (the found check short-circuits the budget
+      // check). Here we use a 2-hop graph p→q→r asking for r, and
+      // expect []: BFS discovers q, checks the budget, trips, exits.
+      await callTool(client, 'create_entities', {
+        entities: ['p', 'q', 'r'].map(n => ({ name: n, entityType: 'Node', observations: [] })),
+      });
+      await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'p', to: 'q', relationType: 'r' },
+          { from: 'q', to: 'r', relationType: 'r' },
+        ],
+      });
+
+      process.env.KB_FIND_PATH_BUDGET_BYTES = '0';
+      let result: FindPathResult;
+      try {
+        result = await callTool(client, 'find_path', {
+          fromEntity: 'p', toEntity: 'r', maxDepth: 5,
+        }) as FindPathResult;
+      } finally {
+        delete process.env.KB_FIND_PATH_BUDGET_BYTES;
+      }
+      // β-contract under budget=0: q gets discovered (one discovery
+      // is admissible because the cap is checked after the
+      // found-vs-target check, by design), then the budget trips.
+      // farthestDiscovered=q, partial path = [p→q].
+      expect(result.targetReached).toBe(false);
+      expect(result.budgetExhausted).toBe(true);
+      expect(result.farthestDiscovered).toBe('q');
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].from).toBe('p');
+      expect(result.items[0].to).toBe('q');
+    });
+
+    it("direction='backward' walks the predecessor side of edges", async () => {
+      // X → Y → Z (forward edges only). 'backward' from Z should reach X.
+      await callTool(client, 'create_entities', {
+        entities: ['X','Y','Z'].map(n => ({ name: n, entityType: 'Node', observations: [] })),
+      });
+      await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'X', to: 'Y', relationType: 'r' },
+          { from: 'Y', to: 'Z', relationType: 'r' },
+        ],
+      });
+
+      const result = await callTool(client, 'find_path', {
+        fromEntity: 'Z', toEntity: 'X', direction: 'backward',
+      }) as FindPathResult;
+
+      expect(result.targetReached).toBe(true);
+      expect(result.items).toHaveLength(2);
+      // Path reconstruction emits relations in the underlying graph's
+      // (from, to) shape — Y→Z first, then X→Y — because the BFS walked
+      // backward along forward edges.
+      expect(result.items.map(r => r.from + '→' + r.to))
+        .toEqual(['Y→Z', 'X→Y']);
     });
   });
 

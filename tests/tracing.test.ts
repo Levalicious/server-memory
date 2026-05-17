@@ -119,3 +119,24 @@ describe('tracing — stdio purity', () => {
     }
   }, 15000);
 });
+
+/**
+ * Regression: the OTel `service.version` resource attribute used to be a
+ * hardcoded `'0.0.20'` literal in `src/tracing.ts`. Four version bumps
+ * (0.0.21 → 0.0.24) all shipped with the stale value, silently misleading
+ * any tooling that filtered or rolled up traces/metrics by version. The
+ * fix reads the package version dynamically from `package.json`. This
+ * test pins that behavior: if anyone ever puts a literal back in
+ * `tracing.ts`, this fails the moment the next `npm version bump` lands.
+ */
+describe('tracing — service.version reflects package.json', () => {
+  it("SERVICE_VERSION equals the package's declared version", async () => {
+    const { SERVICE_VERSION } = await import('../src/tracing.js');
+    const pkgPath = path.resolve(__dirname, '..', 'package.json');
+    const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf-8')) as { version: string };
+    expect(SERVICE_VERSION).toBe(pkg.version);
+    // And specifically not the historical wrong value, so a fresh-eyes
+    // reviewer can grep this exact string when debugging.
+    expect(SERVICE_VERSION).not.toBe('0.0.20');
+  });
+});

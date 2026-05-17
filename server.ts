@@ -8,6 +8,7 @@ import {
 import { context, propagation, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { randomBytes } from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type EntityRecord, type AdjEntry } from './src/graphfile.js';
@@ -38,6 +39,100 @@ type ToolDispatchResult = {
  * match nothing.
  */
 const HAS_REGEX_META = /[\\^$.*+?()[\]{}|]/;
+
+// =============================================================================
+// find_path memory budget
+//
+// `findPath` runs a BFS whose state size scales with reachable-within-maxDepth.
+// To keep it bounded as the KB grows (or as adversarial maxDepth values come
+// in), we cap the BFS at a real byte budget derived from the host's available
+// RAM at call time. Hard upper bound by request: never claim more than 80%
+// of available memory.
+//
+// We count ONLY what this BFS puts into its own data structures — never
+// `process.memoryUsage()` (which conflates with OTel spans, request handler
+// state, JIT, anything else allocating in the same isolate). The summed
+// cost has two parts, both exact (no per-entry heuristic):
+//
+//   1. String payload bytes. Every name + relationType we materialize into
+//      `visited` / `parent` is decoded out of the mmap'd strings file. We
+//      measure that string with `Buffer.byteLength(s, 'utf-8')` at the
+//      point of insertion. UTF-8 length is the wire size; V8 internally
+//      stores Latin-1 (1 B/char) or UCS-2 (2 B/char), and either way the
+//      payload cost is bounded between 1× and 2× the UTF-8 length. We
+//      count UTF-8 length and accept the ≤2× ceiling on this term.
+//
+//   2. V8 container-slot overhead. The Set/Map/Object wrappers V8 puts
+//      around our payload have fixed per-entry sizes derived from V8's
+//      OrderedHashSet / OrderedHashMap / JSObject layouts (64-bit, no
+//      pointer compression). The constants below are structural — they
+//      came from v8/src/objects/{ordered-hash-table,js-objects}.h, not
+//      from "let's add a safety factor." If Node's V8 is updated with
+//      different layouts, re-derive from those headers.
+//
+// Both terms are summed into `bytesUsed` as we go; when it crosses
+// `budgetBytes = 0.80 * MemAvailable`, the BFS terminates and the call
+// returns `path=[]` with `kb.traversal.budget_exhausted=true`.
+//
+// `KB_FIND_PATH_BUDGET_BYTES` env override replaces the live RAM
+// calculation — used by tests to force exhaustion in deterministic
+// graphs, and by ops to hard-cap on constrained machines.
+// =============================================================================
+
+const FIND_PATH_MEMORY_FRACTION = 0.80;
+
+// V8 container-slot sizes, 64-bit, no pointer compression. Each constant
+// is a fixed structural cost V8 imposes on top of the user-payload bytes;
+// they are NOT empirical fudge factors.
+//
+//   V8_SET_ENTRY:    OrderedHashSet hash-table slot — 1 ptr (key) + 1 ptr
+//                    (chain) + 1 word (hash + tags). 3 × 8 B.
+//   V8_MAP_ENTRY:    OrderedHashMap slot — 1 ptr (key) + 1 ptr (value)
+//                    + 1 ptr (chain) + 1 word (hash + tags). 4 × 8 B.
+//   V8_OBJECT_HEADER: JSObject header — Map ptr + properties ptr +
+//                     elements ptr + 1 in-object slot for our (small)
+//                     plain-object payloads. 4 × 8 B.
+const V8_SET_ENTRY = 24;
+const V8_MAP_ENTRY = 32;
+const V8_OBJECT_HEADER = 32;
+
+/**
+ * Bytes of RAM the host considers "available" — i.e., free + reclaimable
+ * cache, the right number for "how much can I grow into without forcing
+ * swap." On Linux this is `MemAvailable` from /proc/meminfo, which is the
+ * kernel's own answer. On other platforms we fall back to `os.freemem()`,
+ * which under-counts (it's `MemFree`, no reclaimable accounting) but is
+ * portable. Under-counting is safe — we'll just budget less than we could.
+ */
+function availableMemoryBytes(): number {
+  try {
+    const text = fs.readFileSync('/proc/meminfo', 'utf-8');
+    const m = /^MemAvailable:\s+(\d+)\s+kB/m.exec(text);
+    if (m) return Number(m[1]) * 1024;
+  } catch {
+    // /proc/meminfo unavailable (macOS, Windows, weird container) — fall through.
+  }
+  return os.freemem();
+}
+
+/**
+ * Byte budget for a single `findPath` BFS call. Either:
+ *   - `KB_FIND_PATH_BUDGET_BYTES` env override (used by tests + ops), or
+ *   - `0.80 * available_memory` from {@link availableMemoryBytes}.
+ *
+ * Floor of 1 byte to keep arithmetic well-defined; in practice
+ * `availableMemoryBytes` is at least tens of MB on any host that can
+ * actually run V8.
+ */
+function findPathBudgetBytes(): number {
+  const override = Number(process.env.KB_FIND_PATH_BUDGET_BYTES);
+  if (Number.isFinite(override) && override >= 0) {
+    return Math.floor(override);
+  }
+  const bytes = availableMemoryBytes();
+  if (!Number.isFinite(bytes) || bytes <= 0) return 1;
+  return Math.max(1, Math.floor(bytes * FIND_PATH_MEMORY_FRACTION));
+}
 
 // Define memory file path using environment variable with fallback
 const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.json');
@@ -1094,61 +1189,233 @@ export class KnowledgeGraphManager {
     );
   }
 
-  async findPath(fromEntity: string, toEntity: string, maxDepth: number = 5, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<Relation[]> {
+  /**
+   * Search result for `findPath`.
+   *
+   *   - `path`: the relation sequence the call returns. When
+   *     `targetReached` is true this is the (shortest) path from
+   *     `fromEntity` to `toEntity`. When `targetReached` is false it is
+   *     a best-effort exploration path ending at `farthestDiscovered`
+   *     — see contract notes on {@link KnowledgeGraphManager#findPath}.
+   *
+   *   - `targetReached`: did BFS actually arrive at `toEntity`? When
+   *     false the caller must NOT treat `path` as a path to `toEntity`;
+   *     it is a path to `farthestDiscovered` instead.
+   *
+   *   - `budgetExhausted`: did we stop because we hit the per-call
+   *     memory cap (vs. because the frontier emptied within `maxDepth`)?
+   *     Disambiguates the two `targetReached === false` modes.
+   *
+   *   - `farthestDiscovered`: the deepest node BFS expanded toward, in
+   *     BFS-order tie-breaking — natural anchor for a follow-up
+   *     `find_path(farthestDiscovered, toEntity, …)` retry from the
+   *     LLM's side.
+   *
+   *   - `budgetBytes`: the byte budget that was in effect on this call,
+   *     for the response message and OTel attribute.
+   */
+  async findPath(fromEntity: string, toEntity: string, maxDepth: number = 5, direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<{
+    path: Relation[];
+    targetReached: boolean;
+    budgetExhausted: boolean;
+    farthestDiscovered?: string;
+    budgetBytes: number;
+  }> {
     return traced(
       'kb.find_path',
       {
         'kb.traversal.max_depth': maxDepth,
         'kb.traversal.direction': direction,
       },
+      // Shortest-path search via BFS, parent-pointer reconstruction.
+      //
+      // Predecessor was a DFS that called `visited.delete(current)` on
+      // backtrack — that turned `visited` into a per-path no-revisit guard
+      // instead of a global one, so a `find_path` against an unreachable
+      // (or far-away) target enumerated EVERY simple path of length
+      // ≤ maxDepth before giving up. On a hub node (b ≈ 30-100), depth=5
+      // is `b^5` = 10^7..10^10 path-expansions, each doing a `st.get()`
+      // deserialization → minutes-to-hours of pure JS holding the read
+      // lock. Caught in production 2026-05-16 (PID 2282706, 27 min,
+      // 91% CPU, stack rooted at `findPath → dfs → dfs → …`).
+      //
+      // BFS by design enqueues every reachable node at most once, so
+      // total work is O(N+E) capped by the BFS frontier reaching
+      // maxDepth. As a bonus, BFS returns the *shortest* path — which is
+      // what users expect from a tool literally called `find_path` with a
+      // `maxDepth` arg. DFS gave the first path the recursion discovered,
+      // not the shortest.
       (span) => this.withReadLock(() => {
-        const visited = new Set<string>();
         let edgesScanned = 0;
         let nodesExpanded = 0;
 
-        const dfs = (current: string, target: string, pathSoFar: Relation[], depth: number): Relation[] | null => {
-          if (depth > maxDepth || visited.has(current)) return null;
-          if (current === target) return pathSoFar;
+        // from === to: trivial 0-hop path; no edges to report. Matches
+        // the pre-rewrite behavior of `dfs(from, from, [], 0) → []` and
+        // is the only path-length-zero case that counts as
+        // `targetReached`.
+        if (fromEntity === toEntity) {
+          span.setAttribute('kb.traversal.nodes_expanded', 0);
+          span.setAttribute('kb.traversal.edges_scanned', 0);
+          span.setAttribute('kb.traversal.path_length', 0);
+          span.setAttribute('kb.traversal.path_found', true);
+          span.setAttribute('kb.traversal.target_reached', true);
+          span.setAttribute('kb.traversal.budget_bytes', findPathBudgetBytes());
+          span.setAttribute('kb.traversal.bytes_used', 0);
+          span.setAttribute('kb.traversal.budget_exhausted', false);
+          return { path: [], targetReached: true, budgetExhausted: false, budgetBytes: findPathBudgetBytes() };
+        }
 
-          visited.add(current);
-          nodesExpanded++;
+        // Per-call memory budget. We track `bytesUsed` as the exact sum
+        // of *our* allocations into BFS data structures: UTF-8 payload
+        // bytes of strings we materialize, plus V8's documented
+        // container-slot overhead. No `process.memoryUsage()` — that
+        // would conflate this BFS's footprint with OTel spans, request
+        // handler state, GC fluctuations, anything else in the isolate.
+        // See the FIND_PATH_MEMORY_FRACTION block above for the recipe.
+        const budgetBytes = findPathBudgetBytes();
+        let bytesUsed = Buffer.byteLength(fromEntity, 'utf-8') + V8_SET_ENTRY; // `visited` start
+        let budgetExhausted = false;
 
-          const offset = this.nameIndex.get(current);
-          if (offset === undefined) { visited.delete(current); return null; }
+        // BFS bookkeeping. `parent` maps each discovered node to the
+        // (predecessor, edge) we discovered it through, used to
+        // reconstruct the path on success. `visited` is populated *on
+        // enqueue* (not on dequeue) so each node enters the queue at
+        // most once — eliminates the O(b^d) backtrack explosion.
+        const parent = new Map<string, { fromName: string; edge: Relation }>();
+        const visited = new Set<string>([fromEntity]);
+        let frontier: string[] = [fromEntity];
+        let depth = 0;
+        let found = false;
+        // Tracked alongside `parent`: the most-recent name added. Because
+        // BFS expands layer-by-layer, the last entry recorded into
+        // `parent` is at the deepest layer reached. This is our anchor
+        // for the SMA*-style best-effort return when target isn't
+        // reached (β contract): with no heuristic on graph distance,
+        // "deepest BFS-reached" is the defensible "farthest progress
+        // toward target" — and the natural retry-from anchor.
+        let farthestDiscovered: string | undefined;
 
-          const edges = this.gf.getEdges(offset);
-          for (const edge of edges) {
-            edgesScanned++;
-            if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-            if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+        // We expand nodes at distance `depth` to discover nodes at
+        // distance `depth + 1`. The loop runs while `depth < maxDepth`
+        // so the deepest discovery is at level `maxDepth` (i.e. a
+        // path of `maxDepth` relations). This matches the predecessor:
+        // pre-rewrite DFS pruned with `depth > maxDepth`, so paths of
+        // exactly `maxDepth` hops were accepted.
+        outer: while (frontier.length > 0 && depth < maxDepth) {
+          const nextFrontier: string[] = [];
+          for (const current of frontier) {
+            nodesExpanded++;
+            const offset = this.nameIndex.get(current);
+            if (offset === undefined) continue;
 
-            const targetRec = this.gf.readEntity(edge.targetOffset);
-            const nextName = this.st.get(BigInt(targetRec.nameId));
-            const relationType = this.st.get(BigInt(edge.relTypeId));
-            const mtime = Number(edge.mtime);
+            const edges = this.gf.getEdges(offset);
+            for (const edge of edges) {
+              edgesScanned++;
+              if (direction === 'forward'  && edge.direction !== DIR_FORWARD)  continue;
+              if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
 
-            let rel: Relation;
-            if (edge.direction === DIR_FORWARD) {
-              rel = { from: current, to: nextName, relationType };
-            } else {
-              rel = { from: nextName, to: current, relationType };
+              const targetRec = this.gf.readEntity(edge.targetOffset);
+              const nextName = this.st.get(BigInt(targetRec.nameId));
+              if (visited.has(nextName)) continue;
+
+              const relationType = this.st.get(BigInt(edge.relTypeId));
+              const mtime = Number(edge.mtime);
+              const rel: Relation = edge.direction === DIR_FORWARD
+                ? { from: current, to: nextName, relationType }
+                : { from: nextName, to: current, relationType };
+              if (mtime > 0) rel.mtime = mtime;
+
+              visited.add(nextName);
+              parent.set(nextName, { fromName: current, edge: rel });
+              farthestDiscovered = nextName;   // see β-contract notes above
+
+              // Exact accounting for this discovery, no estimates:
+              //   visited.add(nextName):
+              //     + UTF-8 bytes of nextName + V8_SET_ENTRY
+              //   parent.set(nextName, {fromName: current, edge: rel}):
+              //     + V8_MAP_ENTRY                           (map slot)
+              //     + V8_OBJECT_HEADER                       ({fromName,edge} wrapper)
+              //     + V8_OBJECT_HEADER                       (Relation object rel)
+              //     + UTF-8 bytes of relationType            (rel.relationType is a new string)
+              //   Aliased: rel.from / rel.to / fromName reference strings
+              //   already counted in `visited` — not double-counted.
+              bytesUsed += Buffer.byteLength(nextName, 'utf-8')
+                         + V8_SET_ENTRY
+                         + V8_MAP_ENTRY
+                         + V8_OBJECT_HEADER
+                         + V8_OBJECT_HEADER
+                         + Buffer.byteLength(relationType, 'utf-8');
+
+              if (nextName === toEntity) {
+                found = true;
+                break outer;
+              }
+              nextFrontier.push(nextName);
+
+              if (bytesUsed >= budgetBytes) {
+                budgetExhausted = true;
+                break outer;
+              }
             }
-            if (mtime > 0) rel.mtime = mtime;
-
-            const result = dfs(nextName, target, [...pathSoFar, rel], depth + 1);
-            if (result) return result;
           }
+          depth++;
+          frontier = nextFrontier;
+        }
 
-          visited.delete(current);
-          return null;
-        };
+        // Path reconstruction. Two cases:
+        //
+        //   found=true  → walk parent-pointers back from `toEntity`,
+        //                 producing the (shortest) path BFS found.
+        //
+        //   found=false → β-contract best-effort: walk parent-pointers
+        //                 back from `farthestDiscovered` (the deepest
+        //                 node BFS expanded). This is the path the
+        //                 caller can use as an anchor to continue from.
+        //                 If `farthestDiscovered` is undefined the BFS
+        //                 expanded no edges at all — `fromEntity` was
+        //                 missing from the name index or had no
+        //                 direction-matching outgoing edges. Return an
+        //                 empty path with `targetReached=false` in that
+        //                 case; nothing useful to anchor on.
+        let path: Relation[] = [];
+        const reconstructFrom = found ? toEntity : farthestDiscovered;
+        if (reconstructFrom !== undefined) {
+          const rels: Relation[] = [];
+          let cur = reconstructFrom;
+          while (cur !== fromEntity) {
+            const p = parent.get(cur);
+            if (!p) break;  // unreachable defensively; parent chain is total under BFS invariant
+            rels.push(p.edge);
+            cur = p.fromName;
+          }
+          path = rels.reverse();
+        }
 
-        const path = dfs(fromEntity, toEntity, [], 0) || [];
         span.setAttribute('kb.traversal.nodes_expanded', nodesExpanded);
         span.setAttribute('kb.traversal.edges_scanned', edgesScanned);
         span.setAttribute('kb.traversal.path_length', path.length);
-        span.setAttribute('kb.traversal.path_found', path.length > 0);
-        return path;
+        span.setAttribute('kb.traversal.path_found', found);
+        span.setAttribute('kb.traversal.target_reached', found);
+        // `budget_bytes` is the per-call cap derived from RAM (or env override).
+        // `bytes_used` is the *exact* sum we computed during BFS — string
+        // payload (UTF-8) + V8 container-slot overhead derived from V8's
+        // OrderedHashSet/OrderedHashMap/JSObject layouts. No estimate
+        // multiplier; if these don't match the V8 footprint within tens of
+        // percent we adjust the structural constants, not a fudge factor.
+        // `budget_exhausted` lights up on the rare call that hit the cap.
+        span.setAttribute('kb.traversal.budget_bytes', budgetBytes);
+        span.setAttribute('kb.traversal.bytes_used', bytesUsed);
+        span.setAttribute('kb.traversal.budget_exhausted', budgetExhausted);
+        if (!found && farthestDiscovered !== undefined) {
+          span.setAttribute('kb.traversal.farthest_discovered', farthestDiscovered);
+        }
+        return {
+          path,
+          targetReached: found,
+          budgetExhausted,
+          farthestDiscovered: !found ? farthestDiscovered : undefined,
+          budgetBytes,
+        };
       }),
     );
   }
@@ -1514,7 +1781,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.24",
+    version: "0.0.25",
   }, {
     capabilities: {
       tools: {},
@@ -1955,8 +2222,40 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
       }
       case "find_path": {
-        const found = await knowledgeGraphManager.findPath(args.fromEntity as string, args.toEntity as string, args.maxDepth as number, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(found, args.cursor as number ?? 0)) }] };
+        const toEntityName = args.toEntity as string;
+        const result = await knowledgeGraphManager.findPath(args.fromEntity as string, toEntityName, args.maxDepth as number, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        const paginated = paginateItems(result.path, args.cursor as number ?? 0);
+        // β-contract response. Pagination of `path` is unchanged; the
+        // result wrapper additionally carries `targetReached` (did we
+        // actually reach `toEntity`?), `budgetExhausted` (did we stop
+        // because of memory pressure?), and `farthestDiscovered` (the
+        // deepest node BFS expanded — anchor for a retry). A `note`
+        // string explains the situation in natural language when the
+        // search didn't reach the asked-for target, so the LLM can
+        // adapt without needing to understand the schema beyond
+        // reading the message.
+        let note: string | undefined;
+        if (result.budgetExhausted) {
+          note = `find_path memory budget (${result.budgetBytes} bytes) was exhausted before reaching '${toEntityName}'. ` +
+                 `The returned 'path' is a best-effort exploration that ended at ` +
+                 `'${result.farthestDiscovered ?? '(no expansion)'}' — call find_path again with ` +
+                 `fromEntity='${result.farthestDiscovered ?? args.fromEntity}' to continue the search, or set a smaller maxDepth.`;
+        } else if (!result.targetReached) {
+          note = result.farthestDiscovered === undefined
+            ? `find_path could not expand any edges from '${args.fromEntity}' in direction '${(args.direction as string) ?? 'forward'}'. ` +
+              `The 'path' is empty. Check the entity name and direction; the source may have no matching outgoing relations.`
+            : `find_path could not reach '${toEntityName}' within maxDepth=${args.maxDepth ?? 5}. ` +
+              `The returned 'path' is a best-effort exploration that ended at '${result.farthestDiscovered}'. ` +
+              `Call find_path again with fromEntity='${result.farthestDiscovered}' to continue toward the target, ` +
+              `or increase maxDepth.`;
+        }
+        return { content: [{ type: "text", text: JSON.stringify({
+          ...paginated,
+          targetReached: result.targetReached,
+          budgetExhausted: result.budgetExhausted,
+          ...(result.farthestDiscovered !== undefined && { farthestDiscovered: result.farthestDiscovered }),
+          ...(note !== undefined && { note }),
+        }) }] };
       }
       case "get_entities_by_type": {
         const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);

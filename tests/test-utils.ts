@@ -16,6 +16,26 @@ export interface PaginatedGraph {
   relations: PaginatedResult<Relation>;
 }
 
+/**
+ * `find_path` returns a paginated relation list (the path) plus β-contract
+ * status fields letting the caller distinguish:
+ *   - `targetReached`: did BFS arrive at `toEntity`? When false, `items` is
+ *     a best-effort exploration path to `farthestDiscovered`, not to
+ *     `toEntity`.
+ *   - `budgetExhausted`: did we stop due to the per-call byte budget (vs.
+ *     hitting `maxDepth` or exhausting the reachable subgraph)?
+ *   - `farthestDiscovered`: the deepest BFS-reached node, present whenever
+ *     BFS expanded any edge at all. Anchor for a follow-up retry.
+ *   - `note`: natural-language explanation when the target wasn't reached;
+ *     intended for the LLM to read directly.
+ */
+export interface FindPathResult extends PaginatedResult<Relation> {
+  targetReached: boolean;
+  budgetExhausted: boolean;
+  farthestDiscovered?: string;
+  note?: string;
+}
+
 export async function createTestClient(server: Server): Promise<{
   client: Client;
   cleanup: () => Promise<void>;
