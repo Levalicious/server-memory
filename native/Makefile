@@ -11,7 +11,7 @@ CFLAGS = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 LIBS = -lm
 OUT = /tmp/mf_test
 
-.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity bench clean
+.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity bench proofs proofs-eva clean
 
 # `make test` = prove the detector fires, then run every harness with it active.
 test: verify-detector test_memfile test_stringtable test_graph test_entity
@@ -39,6 +39,23 @@ test_entity: test_entity.c
 BENCH_CFLAGS = -std=c11 -O2 -march=native -Wall -D_GNU_SOURCE -I.
 bench: op_bench.c graph.c stringtable.c memoryfile.c
 	$(CC) $(BENCH_CFLAGS) $^ -lm -o $(OUT)_bench && $(OUT)_bench
+
+# ---- Frama-C/WP + EVA proofs ----------------------------------------------
+# Memory-model-clean abstractions in fc_*.c (NEVER compiled into the build):
+# allocator size-quantization + open-addressing probe (fc_proofs), name-index
+# traversal bounds (fc_index), free-list descent safety (fc_tree), adjacency
+# edge encoding + edge-iteration bounds (fc_graph), and an EVA pass over the
+# real allocator (fc_harness). frama-c + alt-ergo + z3 (CI installs via opam).
+FRAMAC ?= frama-c
+
+# frama-c exits 0 even with unproved goals, so the gate (scripts/run-proofs.sh)
+# parses the "Proved goals: P / T" summary: clean files must be 100%, fc_tree is
+# safety-only (termination = documented acyclicity frontier).
+proofs:
+	@FRAMAC="$(FRAMAC)" bash ../scripts/run-proofs.sh
+
+proofs-eva: fc_harness.c memoryfile.c
+	$(FRAMAC) -eva -main fc_main -cpp-extra-args="-include fc_stubs.h -I." $^
 
 clean:
 	rm -f $(OUT)_*
