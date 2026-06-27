@@ -11,12 +11,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GraphFile, DIR_FORWARD, DIR_BACKWARD, type EntityRecord, type AdjEntry } from './src/graphfile.js';
-import { StringTable } from './src/stringtable.js';
-import { TrigramIndex } from './src/trigram.js';
-import { buildTrigramQuery } from './src/regex_query.js';
-import { structuralSample } from './src/pagerank.js';
-import { computeMerwPsi } from './src/merw.js';
+import { Store, DIR_FORWARD, DIR_BACKWARD, type NativeEntity } from './src/store.js';
+import { ensureV3 } from './src/migrate.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
 import { toolDurationHistogram, traced, tracer } from './src/tracing.js';
 
@@ -356,30 +352,7 @@ function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relation
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 export class KnowledgeGraphManager {
-  private gf: GraphFile;
-  private st: StringTable;
-  /** In-memory name→offset index, rebuilt from node log on every lock acquisition */
-  private nameIndex: Map<string, bigint>;
-
-  /**
-   * Trigram inverted index for fast `search_nodes` regex pre-filtering. Lazy:
-   * stays `null` until the first `searchNodes` call that supplies non-empty
-   * `literals` — sessions that never use literals never pay the build cost.
-   *
-   * Lifecycle:
-   *  - Built lazily under `withReadLock` / `withWriteLock` on demand.
-   *  - Maintained incrementally by every mutation method *in this process*
-   *    (createEntities, deleteEntities, addObservations, deleteObservations).
-   *  - Dropped to `null` whenever a cross-process change is detected on lock
-   *    acquisition. Next `searchNodes` with literals rebuilds.
-   *
-   * v1 limitation: cross-process invalidation is "drop and rebuild" —
-   * potentially several seconds on a 40K-entity KB. Single-process workloads
-   * (the common case) only pay the build cost once per process startup.
-   */
-  private trigramIndex: TrigramIndex | null;
-  /** Snapshot of (entityCount, stringsAllocated) at the time the trigram index was last (re)built. */
-  private trigramFingerprint: { entityCount: number; stringsAllocated: bigint };
+  private db: Store;
 
   constructor(memoryFilePath: string = DEFAULT_MEMORY_FILE_PATH) {
     // Derive binary file paths from the base path
@@ -388,25 +361,23 @@ export class KnowledgeGraphManager {
     const graphPath = path.join(dir, `${base}.graph`);
     const strPath = path.join(dir, `${base}.strings`);
 
-    // Subobject constructors self-lock around their own init/migration paths
-    // (see StringTable / GraphFile constructors). They may grow the underlying
-    // files, so we cannot hold an outer lock across these calls.
-    this.st = new StringTable(strPath);
-    this.gf = new GraphFile(graphPath, this.st);
-    this.nameIndex = new Map();
-    this.trigramIndex = null;
-    this.trigramFingerprint = { entityCount: -1, stringsAllocated: 0n };
+    // Auto-migrate an old (v1/v2) KB to v3 in place before opening — the same
+    // transparent-on-open contract the old code used for v1->v2. ensureV3 holds
+    // a migration flock across detection AND migration, so concurrent startups
+    // serialize (no empty-clobber, no double-migrate). The migrator and the old
+    // addon load only if a migration actually fires.
+    ensureV3(graphPath, strPath);
 
-    // Build the in-memory name index and run initial structural sampling +
-    // MERW under an exclusive lock that covers BOTH the graph and strings
-    // files. withWriteLock's prelude calls rebuildNameIndex() unconditionally,
-    // so the name map is populated by the time the callback runs.
-    // structuralSample + computeMerwPsi mutate the graph file; withWriteLock
-    // syncs both files on exit.
+    // The C store opens both files and self-locks around its own init. It owns
+    // the memfile, string table, and name index.
+    this.db = new Store(graphPath, strPath);
+
+    // Initial structural sampling + MERW under an exclusive lock (the C ops
+    // mutate the graph file; withWriteLock syncs on exit).
     this.withWriteLock(() => {
-      if (this.nameIndex.size > 0) {
-        structuralSample(this.gf, 1, 0.85);
-        computeMerwPsi(this.gf);
+      if (this.db.entityCount() > 0) {
+        this.db.structuralSample(1, 0.85);
+        this.db.computeMerwPsi(0.85, 200, 1e-8);
       }
     });
   }
@@ -436,7 +407,7 @@ export class KnowledgeGraphManager {
         'kb.load.top_k': topK,
       },
       (span) => this.withWriteLock(() => {
-        const result = loadDocument(text, title, this.st, topK);
+        const result = loadDocument(text, title, this.corpusShim() as never, topK);
         span.setAttribute('kb.load.chunks', result.stats.chunks);
         span.setAttribute('kb.load.sentences', result.stats.sentences);
         span.setAttribute('kb.load.unique_words', result.stats.uniqueWords);
@@ -472,18 +443,15 @@ export class KnowledgeGraphManager {
   private withReadLock<T>(fn: () => T): T {
     return traced('kb.lock.read', {}, (span) => {
       const acquireStart = process.hrtime.bigint();
-      this.gf.lockShared();
+      this.db.lockShared();
       const waitMs = Number(process.hrtime.bigint() - acquireStart) / 1e6;
       span.setAttribute('kb.lock.wait_ms', waitMs);
       try {
-        this.gf.refresh();
-        this.st.refresh();
-        this.rebuildNameIndex();
-        this.invalidateTrigramIndexIfStale();
-        span.setAttribute('kb.entity_count', this.nameIndex.size);
+        this.db.refresh();
+        span.setAttribute('kb.entity_count', this.db.entityCount());
         return fn();
       } finally {
-        this.gf.unlock();
+        this.db.unlock();
       }
     });
   }
@@ -508,133 +476,40 @@ export class KnowledgeGraphManager {
   private withWriteLock<T>(fn: () => T): T {
     return traced('kb.lock.write', {}, (span) => {
       const acquireStart = process.hrtime.bigint();
-      this.gf.lockExclusive();
+      this.db.lockExclusive();
       const waitMs = Number(process.hrtime.bigint() - acquireStart) / 1e6;
       span.setAttribute('kb.lock.wait_ms', waitMs);
       try {
-        this.gf.refresh();
-        this.st.refresh();
-        this.rebuildNameIndex();
-        this.invalidateTrigramIndexIfStale();
-        span.setAttribute('kb.entity_count', this.nameIndex.size);
+        this.db.refresh();
+        span.setAttribute('kb.entity_count', this.db.entityCount());
         const result = fn();
-        this.gf.sync();
-        this.st.sync();
-        // The mutation we just ran may have shifted entity count or strings
-        // allocated; refresh the trigram fingerprint so the *next* lock
-        // acquisition doesn't false-positive an "external" change. The
-        // mutation methods themselves keep the index hot via incremental
-        // updates; this is just bookkeeping.
-        if (this.trigramIndex !== null) {
-          this.trigramFingerprint = {
-            entityCount: this.gf.getEntityCount(),
-            stringsAllocated: this.st.mf.stats().allocated,
-          };
-        }
+        this.db.sync();
         return result;
       } finally {
-        this.gf.unlock();
+        this.db.unlock();
       }
     });
   }
 
-  /** Rebuild the in-memory name→offset index from the node log. */
-  private rebuildNameIndex(): void {
-    this.nameIndex.clear();
-    const offsets = this.gf.getAllEntityOffsets();
-    for (const offset of offsets) {
-      const rec = this.gf.readEntity(offset);
-      const name = this.st.get(BigInt(rec.nameId));
-      this.nameIndex.set(name, offset);
-    }
-  }
-
-  // --- Trigram index helpers ----------------------------------------------
+  // --- kb_load corpus shim --------------------------------------------------
 
   /**
-   * Concatenate an entity's searchable strings (name + type + observations)
-   * into one indexed text. Same shape as `searchNodes` filters on, so a
-   * candidate hit means the regex *might* match somewhere on this entity.
+   * Minimal StringTable-shaped shim for loadDocument's IDF corpus pass: yields
+   * every entity's name/type/observation strings from the C store. The real
+   * string table now lives in C; loadDocument only consumes `entries()`.
    */
-  private entityIndexedText(rec: EntityRecord): string {
-    const parts: string[] = [
-      this.st.get(BigInt(rec.nameId)),
-      this.st.get(BigInt(rec.typeId)),
-    ];
-    if (rec.obs0Id !== 0) parts.push(this.st.get(BigInt(rec.obs0Id)));
-    if (rec.obs1Id !== 0) parts.push(this.st.get(BigInt(rec.obs1Id)));
-    return parts.join('\n');
-  }
-
-  /**
-   * Lazy build of the trigram index. Called by `searchNodes` when literals
-   * are supplied and the index is null. Costs O(total chars) — on a 42 K
-   * entity KB with mostly-short observations, ~100 ms; bigger KBs scale
-   * roughly linearly.
-   *
-   * MUST be called inside a lock (the manager's withRead/WriteLock).
-   */
-  private buildTrigramIndex(): void {
-    return traced('kb.trigram.build', {}, (span) => {
-      const t0 = process.hrtime.bigint();
-      const idx = new TrigramIndex();
-      const offsets = this.gf.getAllEntityOffsets();
-      idx.rebuild((function* (this: KnowledgeGraphManager) {
-        for (const offset of offsets) {
-          const rec = this.gf.readEntity(offset);
-          yield [offset, this.entityIndexedText(rec)] as const;
+  private corpusShim(): { entries: () => Generator<{ id: bigint; text: string; refcount: number }> } {
+    const db = this.db;
+    return {
+      *entries() {
+        for (const off of db.listEntities()) {
+          const r = db.readEntity(off);
+          yield { id: off, text: r.name, refcount: 1 };
+          yield { id: off, text: r.type, refcount: 1 };
+          for (const o of r.observations) yield { id: off, text: o, refcount: 1 };
         }
-      }).call(this));
-      this.trigramIndex = idx;
-      this.trigramFingerprint = {
-        entityCount: this.gf.getEntityCount(),
-        stringsAllocated: this.st.mf.stats().allocated,
-      };
-      span.setAttribute('kb.entity_count', this.nameIndex.size);
-      span.setAttribute('kb.trigram.distinct', idx.distinctTrigrams);
-      span.setAttribute('kb.trigram.build_ms', Number(process.hrtime.bigint() - t0) / 1e6);
-    });
-  }
-
-  /**
-   * Drop the trigram index if a cross-process change is detected. Called at
-   * every lock acquisition. Single-process workloads keep the index across
-   * the entire session; multi-process workloads forfeit the speedup whenever
-   * another writer wins the race.
-   */
-  private invalidateTrigramIndexIfStale(): void {
-    if (this.trigramIndex === null) return;
-    const ec = this.gf.getEntityCount();
-    const sa = this.st.mf.stats().allocated;
-    if (ec !== this.trigramFingerprint.entityCount || sa !== this.trigramFingerprint.stringsAllocated) {
-      this.trigramIndex = null;
-    }
-  }
-
-  /**
-   * Add an entity to the trigram index, if the index is built. Idempotent.
-   * Called from mutation methods after the entity record is written.
-   */
-  private trigramAddEntity(offset: bigint, rec: EntityRecord): void {
-    if (this.trigramIndex === null) return;
-    this.trigramIndex.add(offset, this.entityIndexedText(rec));
-  }
-
-  /** Remove an entity from the trigram index, if the index is built. */
-  private trigramRemoveEntity(offset: bigint): void {
-    if (this.trigramIndex === null) return;
-    this.trigramIndex.remove(offset);
-  }
-
-  /**
-   * Replace an entity's contribution in the trigram index — needed when its
-   * observations change but the offset stays the same. Equivalent to remove
-   * + add but skips work if the index is null.
-   */
-  private trigramRefreshEntity(offset: bigint, rec: EntityRecord): void {
-    if (this.trigramIndex === null) return;
-    this.trigramIndex.remove(offset);
-    this.trigramIndex.add(offset, this.entityIndexedText(rec));
+      },
+    };
   }
 
   /** Build rank maps from the binary store for pagerank/llmrank sorting.
@@ -645,16 +520,16 @@ export class KnowledgeGraphManager {
    *  per-entity rank fields under the active lock.
    */
   private getRankMapsUnlocked(): { structural: Map<string, number>; walker: Map<string, number> } {
-    return traced('kb.rank.read', { 'kb.entity_count': this.nameIndex.size }, () => {
+    return traced('kb.rank.read', { 'kb.entity_count': this.db.entityCount() }, () => {
       const structural = new Map<string, number>();
       const walker = new Map<string, number>();
-      const structTotal = this.gf.getStructuralTotal();
-      const walkerTotal = this.gf.getWalkerTotal();
+      const structTotal = this.db.structuralTotal();
+      const walkerTotal = this.db.walkerTotal();
 
-      for (const [name, offset] of this.nameIndex) {
-        const rec = this.gf.readEntity(offset);
-        structural.set(name, structTotal > 0n ? Number(rec.structuralVisits) / Number(structTotal) : 0);
-        walker.set(name, walkerTotal > 0n ? Number(rec.walkerVisits) / Number(walkerTotal) : 0);
+      for (const offset of this.db.listEntities()) {
+        const rec = this.db.readEntity(offset);
+        structural.set(rec.name, structTotal > 0n ? Number(rec.structuralVisits) / Number(structTotal) : 0);
+        walker.set(rec.name, walkerTotal > 0n ? Number(rec.walkerVisits) / Number(walkerTotal) : 0);
       }
 
       return { structural, walker };
@@ -671,9 +546,9 @@ export class KnowledgeGraphManager {
     traced('kb.walker.record', { 'kb.walker.count': names.length }, () => {
       this.withWriteLock(() => {
         for (const name of names) {
-          const offset = this.nameIndex.get(name);
-          if (offset !== undefined) {
-            this.gf.incrementWalkerVisit(offset);
+          const offset = this.db.lookup(name);
+          if (offset !== 0n) {
+            this.db.incWalkerVisit(offset);
           }
         }
       });
@@ -691,29 +566,23 @@ export class KnowledgeGraphManager {
    */
   resample(): void {
     this.withWriteLock(() => {
-      if (this.nameIndex.size === 0) return;
+      if (this.db.entityCount() === 0) return;
       traced(
         'kb.rank.pagerank',
-        { 'kb.entity_count': this.nameIndex.size },
-        () => structuralSample(this.gf, 1, 0.85),
+        { 'kb.entity_count': this.db.entityCount() },
+        () => this.db.structuralSample(1, 0.85),
       );
       traced(
         'kb.rank.merw',
-        { 'kb.entity_count': this.nameIndex.size },
-        () => computeMerwPsi(this.gf),
+        { 'kb.entity_count': this.db.entityCount() },
+        () => this.db.computeMerwPsi(0.85, 200, 1e-8),
       );
     });
   }
 
-  /** Convert an EntityRecord to the public Entity interface */
-  private recordToEntity(rec: EntityRecord): Entity {
-    const name = this.st.get(BigInt(rec.nameId));
-    const entityType = this.st.get(BigInt(rec.typeId));
-    const observations: string[] = [];
-    if (rec.obs0Id !== 0) observations.push(this.st.get(BigInt(rec.obs0Id)));
-    if (rec.obs1Id !== 0) observations.push(this.st.get(BigInt(rec.obs1Id)));
-
-    const entity: Entity = { name, entityType, observations };
+  /** Convert a native entity record to the public Entity interface */
+  private recordToEntity(rec: NativeEntity): Entity {
+    const entity: Entity = { name: rec.name, entityType: rec.type, observations: rec.observations };
     const mtime = Number(rec.mtime);
     const obsMtime = Number(rec.obsMtime);
     if (mtime > 0) entity.mtime = mtime;
@@ -723,24 +592,18 @@ export class KnowledgeGraphManager {
 
   /** Get all entities as Entity objects (preserves node log order = insertion order) */
   private getAllEntities(): Entity[] {
-    const offsets = this.gf.getAllEntityOffsets();
-    return offsets.map(o => this.recordToEntity(this.gf.readEntity(o)));
+    return this.db.listEntities().map(o => this.recordToEntity(this.db.readEntity(o)));
   }
 
   /** Get all relations by scanning adjacency lists (forward edges only to avoid duplication) */
   private getAllRelations(): Relation[] {
     const relations: Relation[] = [];
-    const offsets = this.gf.getAllEntityOffsets();
-    for (const offset of offsets) {
-      const rec = this.gf.readEntity(offset);
-      const fromName = this.st.get(BigInt(rec.nameId));
-      const edges = this.gf.getEdges(offset);
-      for (const edge of edges) {
+    for (const offset of this.db.listEntities()) {
+      const fromName = this.db.entityName(offset);
+      for (const edge of this.db.edges(offset)) {
         if (edge.direction !== DIR_FORWARD) continue;
-        const targetRec = this.gf.readEntity(edge.targetOffset);
-        const toName = this.st.get(BigInt(targetRec.nameId));
-        const relationType = this.st.get(BigInt(edge.relTypeId));
-        const r: Relation = { from: fromName, to: toName, relationType };
+        const toName = this.db.entityName(edge.target);
+        const r: Relation = { from: fromName, to: toName, relationType: edge.relType };
         const mtime = Number(edge.mtime);
         if (mtime > 0) r.mtime = mtime;
         relations.push(r);
@@ -775,9 +638,9 @@ export class KnowledgeGraphManager {
       const newEntities: Entity[] = [];
 
       for (const e of entities) {
-        const existingOffset = this.nameIndex.get(e.name);
-        if (existingOffset !== undefined) {
-          const existing = this.recordToEntity(this.gf.readEntity(existingOffset));
+        const existingOffset = this.db.lookup(e.name);
+        if (existingOffset !== 0n) {
+          const existing = this.recordToEntity(this.db.readEntity(existingOffset));
           const sameType = existing.entityType === e.entityType;
           const sameObs = existing.observations.length === e.observations.length &&
             existing.observations.every((o, i) => o === e.observations[i]);
@@ -785,26 +648,10 @@ export class KnowledgeGraphManager {
           throw new Error(`Entity "${e.name}" already exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`);
         }
 
-        const obsMtime = e.observations.length > 0 ? now : 0n;
-        const rec = this.gf.createEntity(e.name, e.entityType, now, obsMtime);
-
+        const offset = this.db.createEntity(e.name, e.entityType, now);
         for (const obs of e.observations) {
-          this.gf.addObservation(rec.offset, obs, now);
+          this.db.addObservation(offset, obs, now);
         }
-
-        if (e.observations.length > 0) {
-          const updated = this.gf.readEntity(rec.offset);
-          updated.mtime = now;
-          updated.obsMtime = now;
-          this.gf.updateEntity(updated);
-        }
-
-        this.nameIndex.set(e.name, rec.offset);
-
-        // Keep the trigram index hot if it was already built. The index keys
-        // by entity offset and contains name + type + observations, so we
-        // index AFTER the observation writes have landed.
-        this.trigramAddEntity(rec.offset, this.gf.readEntity(rec.offset));
 
         const newEntity: Entity = {
           ...e,
@@ -822,48 +669,20 @@ export class KnowledgeGraphManager {
     return this.withWriteLock(() => {
       const now = BigInt(Date.now());
       const newRelations: Relation[] = [];
-      const fromOffsets = new Set<bigint>();
 
       for (const r of relations) {
-        const fromOffset = this.nameIndex.get(r.from);
-        const toOffset = this.nameIndex.get(r.to);
-        if (fromOffset === undefined || toOffset === undefined) continue;
+        const fromOffset = this.db.lookup(r.from);
+        const toOffset = this.db.lookup(r.to);
+        if (fromOffset === 0n || toOffset === 0n) continue;
 
-        const existingEdges = this.gf.getEdges(fromOffset);
-        const relTypeId = Number(this.st.find(r.relationType) ?? -1n);
-        const isDuplicate = existingEdges.some(e =>
-          e.direction === DIR_FORWARD &&
-          e.targetOffset === toOffset &&
-          e.relTypeId === relTypeId
+        const isDuplicate = this.db.edges(fromOffset).some(e =>
+          e.direction === DIR_FORWARD && e.target === toOffset && e.relType === r.relationType
         );
         if (isDuplicate) continue;
 
-        const rTypeId = Number(this.st.intern(r.relationType));
-        const forwardEntry: AdjEntry = {
-          targetOffset: toOffset,
-          direction: DIR_FORWARD,
-          relTypeId: rTypeId,
-          mtime: now,
-        };
-        this.gf.addEdge(fromOffset, forwardEntry);
-
-        const rTypeId2 = Number(this.st.intern(r.relationType));
-        const backwardEntry: AdjEntry = {
-          targetOffset: fromOffset,
-          direction: DIR_BACKWARD,
-          relTypeId: rTypeId2,
-          mtime: now,
-        };
-        this.gf.addEdge(toOffset, backwardEntry);
-
-        fromOffsets.add(fromOffset);
+        // C owns the bidirectional edges + relType interning/refcounts.
+        this.db.createRelation(fromOffset, toOffset, r.relationType, now);
         newRelations.push({ ...r, mtime: Number(now) });
-      }
-
-      for (const offset of fromOffsets) {
-        const rec = this.gf.readEntity(offset);
-        rec.mtime = now;
-        this.gf.updateEntity(rec);
       }
 
       return newRelations;
@@ -875,8 +694,8 @@ export class KnowledgeGraphManager {
       const results: { entityName: string; addedObservations: string[] }[] = [];
 
       for (const o of observations) {
-        const offset = this.nameIndex.get(o.entityName);
-        if (offset === undefined) {
+        const offset = this.db.lookup(o.entityName);
+        if (offset === 0n) {
           throw new Error(`Entity with name ${o.entityName} not found`);
         }
 
@@ -886,11 +705,7 @@ export class KnowledgeGraphManager {
           }
         }
 
-        const rec = this.gf.readEntity(offset);
-        const existingObs: string[] = [];
-        if (rec.obs0Id !== 0) existingObs.push(this.st.get(BigInt(rec.obs0Id)));
-        if (rec.obs1Id !== 0) existingObs.push(this.st.get(BigInt(rec.obs1Id)));
-
+        const existingObs = this.db.readEntity(offset).observations;
         const newObservations = o.contents.filter(content => !existingObs.includes(content));
 
         if (existingObs.length + newObservations.length > 2) {
@@ -899,12 +714,7 @@ export class KnowledgeGraphManager {
 
         const now = BigInt(Date.now());
         for (const obs of newObservations) {
-          this.gf.addObservation(offset, obs, now);
-        }
-
-        // Refresh trigram index entry — observations changed.
-        if (newObservations.length > 0) {
-          this.trigramRefreshEntity(offset, this.gf.readEntity(offset));
+          this.db.addObservation(offset, obs, now);
         }
 
         results.push({ entityName: o.entityName, addedObservations: newObservations });
@@ -917,22 +727,11 @@ export class KnowledgeGraphManager {
   async deleteEntities(entityNames: string[]): Promise<void> {
     this.withWriteLock(() => {
       for (const name of entityNames) {
-        const offset = this.nameIndex.get(name);
-        if (offset === undefined) continue;
-
-        const edges = this.gf.getEdges(offset);
-        for (const edge of edges) {
-          const reverseDir = edge.direction === DIR_FORWARD ? DIR_BACKWARD : DIR_FORWARD;
-          this.gf.removeEdge(edge.targetOffset, offset, edge.relTypeId, reverseDir);
-          this.st.release(BigInt(edge.relTypeId));
-        }
-
-        // Drop the trigram entry BEFORE freeing — once the entity record is
-        // freed its strings may be released and the offset may be recycled.
-        this.trigramRemoveEntity(offset);
-
-        this.gf.deleteEntity(offset);
-        this.nameIndex.delete(name);
+        const offset = this.db.lookup(name);
+        if (offset === 0n) continue;
+        // C deletes the record + adjacency, drops mirror edges, and releases
+        // every string ref (name/type/obs + relType per edge + mirror).
+        this.db.deleteEntity(offset);
       }
     });
   }
@@ -941,15 +740,12 @@ export class KnowledgeGraphManager {
     this.withWriteLock(() => {
       const now = BigInt(Date.now());
       for (const d of deletions) {
-        const offset = this.nameIndex.get(d.entityName);
-        if (offset === undefined) continue;
+        const offset = this.db.lookup(d.entityName);
+        if (offset === 0n) continue;
 
         for (const obs of d.observations) {
-          this.gf.removeObservation(offset, obs, now);
+          this.db.removeObservation(offset, obs, now);
         }
-
-        // Refresh trigram entry — observations may have changed.
-        this.trigramRefreshEntity(offset, this.gf.readEntity(offset));
       }
     });
   }
@@ -957,18 +753,11 @@ export class KnowledgeGraphManager {
   async deleteRelations(relations: Relation[]): Promise<void> {
     this.withWriteLock(() => {
       for (const r of relations) {
-        const fromOffset = this.nameIndex.get(r.from);
-        const toOffset = this.nameIndex.get(r.to);
-        if (fromOffset === undefined || toOffset === undefined) continue;
-
-        const relTypeId = this.st.find(r.relationType);
-        if (relTypeId === null) continue;
-
-        const removedForward = this.gf.removeEdge(fromOffset, toOffset, Number(relTypeId), DIR_FORWARD);
-        if (removedForward) this.st.release(relTypeId);
-
-        const removedBackward = this.gf.removeEdge(toOffset, fromOffset, Number(relTypeId), DIR_BACKWARD);
-        if (removedBackward) this.st.release(relTypeId);
+        const fromOffset = this.db.lookup(r.from);
+        const toOffset = this.db.lookup(r.to);
+        if (fromOffset === 0n || toOffset === 0n) continue;
+        // C removes both directed edges and releases the two relType refs.
+        this.db.deleteRelation(fromOffset, toOffset, r.relationType);
       }
     });
   }
@@ -989,17 +778,13 @@ export class KnowledgeGraphManager {
     sortDir?: SortDirection,
     direction: 'forward' | 'backward' | 'any' = 'forward',
   ): Promise<KnowledgeGraph> {
-    let regex: RegExp;
+    // Validate the pattern with JS RegExp semantics so callers still get the
+    // "Invalid regex pattern" contract; the actual match runs in C (POSIX ERE).
     try {
-      regex = new RegExp(query, 'i');
+      new RegExp(query, 'i');
     } catch {
       throw new Error(`Invalid regex pattern: ${query}`);
     }
-
-    // Cox-style trigram query extraction: parse the regex AST, propagate
-    // match-info bottom-up, produce a boolean trigram expression. Returns
-    // null when the regex collapses to no useful constraint (e.g., `.*`).
-    const trigramQuery = buildTrigramQuery(query);
 
     return traced(
       'kb.search_nodes',
@@ -1009,41 +794,7 @@ export class KnowledgeGraphManager {
         ...(sortBy ? { 'kb.search.sort_by': sortBy } : {}),
       },
       (span) => this.withReadLock(() => {
-        let filteredEntities: Entity[];
-        let scannedCount: number;
-        let usedTrigram = false;
-
-        if (trigramQuery !== null) {
-          if (this.trigramIndex === null) this.buildTrigramIndex();
-          const candidateOffsets = this.trigramIndex!.evaluateQuery(trigramQuery);
-          if (candidateOffsets !== null) {
-            usedTrigram = true;
-            const out: Entity[] = [];
-            for (const offset of candidateOffsets) {
-              const e = this.recordToEntity(this.gf.readEntity(offset));
-              if (regex.test(e.name) || regex.test(e.entityType) || e.observations.some(o => regex.test(o))) {
-                out.push(e);
-              }
-            }
-            filteredEntities = out;
-            scannedCount = candidateOffsets.length;
-          } else {
-            // Query collapsed to `all` after evaluation — full scan.
-            const allEntities = this.getAllEntities();
-            filteredEntities = allEntities.filter(e =>
-              regex.test(e.name) || regex.test(e.entityType) || e.observations.some(o => regex.test(o))
-            );
-            scannedCount = allEntities.length;
-          }
-        } else {
-          // Regex isn't trigram-extractable (e.g. `.*`, `\D+`) — full scan.
-          const allEntities = this.getAllEntities();
-          filteredEntities = allEntities.filter(e =>
-            regex.test(e.name) || regex.test(e.entityType) || e.observations.some(o => regex.test(o))
-          );
-          scannedCount = allEntities.length;
-        }
-
+        const filteredEntities = this.db.search(query).map(o => this.recordToEntity(this.db.readEntity(o)));
         const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
 
         const allRelations = this.getAllRelations();
@@ -1053,10 +804,8 @@ export class KnowledgeGraphManager {
           return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to);
         });
 
-        // Aggregate scan/match stats — the LLM-visible knobs that explain why
-        // a query was slow: how big the haystack is and how big the result.
-        span.setAttribute('kb.search.used_trigram', usedTrigram);
-        span.setAttribute('kb.search.scanned.entities', scannedCount);
+        span.setAttribute('kb.search.used_trigram', false);
+        span.setAttribute('kb.search.scanned.entities', this.db.entityCount());
         span.setAttribute('kb.search.scanned.relations', allRelations.length);
         span.setAttribute('kb.search.matched.entities', filteredEntities.length);
         span.setAttribute('kb.search.matched.relations', filteredRelations.length);
@@ -1073,24 +822,24 @@ export class KnowledgeGraphManager {
   async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
     return this.withReadLock(() => {
       const filteredEntities: Entity[] = [];
+      const offsetByName = new Map<string, bigint>();
       for (const name of names) {
-        const offset = this.nameIndex.get(name);
-        if (offset === undefined) continue;
-        filteredEntities.push(this.recordToEntity(this.gf.readEntity(offset)));
+        const offset = this.db.lookup(name);
+        if (offset === 0n) continue;
+        filteredEntities.push(this.recordToEntity(this.db.readEntity(offset)));
+        offsetByName.set(name, offset);
       }
 
       const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
 
       const filteredRelations: Relation[] = [];
       for (const name of filteredEntityNames) {
-        const offset = this.nameIndex.get(name)!;
-        const edges = this.gf.getEdges(offset);
-        for (const edge of edges) {
+        const offset = offsetByName.get(name)!;
+        for (const edge of this.db.edges(offset)) {
           if (edge.direction !== DIR_FORWARD && edge.direction !== DIR_BACKWARD) continue;
 
-          const targetRec = this.gf.readEntity(edge.targetOffset);
-          const targetName = this.st.get(BigInt(targetRec.nameId));
-          const relationType = this.st.get(BigInt(edge.relTypeId));
+          const targetName = this.db.entityName(edge.target);
+          const relationType = edge.relType;
           const mtime = Number(edge.mtime);
 
           if (edge.direction === DIR_FORWARD) {
@@ -1127,61 +876,27 @@ export class KnowledgeGraphManager {
         ...(sortBy ? { 'kb.traversal.sort_by': sortBy } : {}),
       },
       (span) => this.withReadLock(() => {
-        const startOffset = this.nameIndex.get(entityName);
-        if (startOffset === undefined) {
+        const startOffset = this.db.lookup(entityName);
+        if (startOffset === 0n) {
           span.setAttribute('kb.traversal.start_found', false);
           return [];
         }
         span.setAttribute('kb.traversal.start_found', true);
 
-        const visited = new Set<string>();
-        const neighborNames = new Set<string>();
-        let edgesScanned = 0;
-
-        const traverse = (currentName: string, currentDepth: number): void => {
-          if (currentDepth > depth || visited.has(currentName)) return;
-          visited.add(currentName);
-
-          const offset = this.nameIndex.get(currentName);
-          if (offset === undefined) return;
-
-          const edges = this.gf.getEdges(offset);
-          for (const edge of edges) {
-            edgesScanned++;
-            if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-            if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
-
-            const targetRec = this.gf.readEntity(edge.targetOffset);
-            const neighborName = this.st.get(BigInt(targetRec.nameId));
-            neighborNames.add(neighborName);
-
-            if (currentDepth < depth) {
-              traverse(neighborName, currentDepth + 1);
-            }
-          }
-        };
-
-        traverse(entityName, 0);
-        neighborNames.delete(entityName);
-
-        const neighbors: Neighbor[] = Array.from(neighborNames).map(name => {
-          const offset = this.nameIndex.get(name);
-          if (!offset) return { name };
-          const rec = this.gf.readEntity(offset);
+        // C BFS returns neighbor offsets within `depth` hops, excluding start.
+        // The old TS semantics were one hop deeper (depth=0 returned immediate
+        // neighbors), so request depth+1 from C to match.
+        const neighbors: Neighbor[] = this.db.neighbors(startOffset, depth + 1, direction).map(off => {
+          const rec = this.db.readEntity(off);
           const mtime = Number(rec.mtime);
           const obsMtime = Number(rec.obsMtime);
-          const n: Neighbor = { name };
+          const n: Neighbor = { name: rec.name };
           if (mtime > 0) n.mtime = mtime;
           if (obsMtime > 0) n.obsMtime = obsMtime;
           return n;
         });
 
-        // Aggregate traversal stats: the size of the BFS frontier the
-        // resulting neighbor set, and how many edges we walked through. Cheap
-        // to compute and explains slow calls without per-step span fanout.
-        span.setAttribute('kb.traversal.visited_count', visited.size);
         span.setAttribute('kb.traversal.neighbor_count', neighbors.length);
-        span.setAttribute('kb.traversal.edges_scanned', edgesScanned);
 
         const rankMaps = this.getRankMapsUnlocked();
         return sortNeighbors(neighbors, sortBy, sortDir, rankMaps);
@@ -1246,174 +961,67 @@ export class KnowledgeGraphManager {
       // `maxDepth` arg. DFS gave the first path the recursion discovered,
       // not the shortest.
       (span) => this.withReadLock(() => {
-        let edgesScanned = 0;
-        let nodesExpanded = 0;
+        const budgetBytes = findPathBudgetBytes();
 
-        // from === to: trivial 0-hop path; no edges to report. Matches
-        // the pre-rewrite behavior of `dfs(from, from, [], 0) → []` and
-        // is the only path-length-zero case that counts as
-        // `targetReached`.
+        // from === to: trivial 0-hop path; no edges. Only path-length-zero
+        // case that counts as targetReached.
         if (fromEntity === toEntity) {
-          span.setAttribute('kb.traversal.nodes_expanded', 0);
-          span.setAttribute('kb.traversal.edges_scanned', 0);
           span.setAttribute('kb.traversal.path_length', 0);
           span.setAttribute('kb.traversal.path_found', true);
           span.setAttribute('kb.traversal.target_reached', true);
-          span.setAttribute('kb.traversal.budget_bytes', findPathBudgetBytes());
-          span.setAttribute('kb.traversal.bytes_used', 0);
-          span.setAttribute('kb.traversal.budget_exhausted', false);
-          return { path: [], targetReached: true, budgetExhausted: false, budgetBytes: findPathBudgetBytes() };
+          return { path: [], targetReached: true, budgetExhausted: false, budgetBytes };
         }
 
-        // Per-call memory budget. We track `bytesUsed` as the exact sum
-        // of *our* allocations into BFS data structures: UTF-8 payload
-        // bytes of strings we materialize, plus V8's documented
-        // container-slot overhead. No `process.memoryUsage()` — that
-        // would conflate this BFS's footprint with OTel spans, request
-        // handler state, GC fluctuations, anything else in the isolate.
-        // See the FIND_PATH_MEMORY_FRACTION block above for the recipe.
-        const budgetBytes = findPathBudgetBytes();
-        let bytesUsed = Buffer.byteLength(fromEntity, 'utf-8') + V8_SET_ENTRY; // `visited` start
-        let budgetExhausted = false;
-
-        // BFS bookkeeping. `parent` maps each discovered node to the
-        // (predecessor, edge) we discovered it through, used to
-        // reconstruct the path on success. `visited` is populated *on
-        // enqueue* (not on dequeue) so each node enters the queue at
-        // most once — eliminates the O(b^d) backtrack explosion.
-        const parent = new Map<string, { fromName: string; edge: Relation }>();
-        const visited = new Set<string>([fromEntity]);
-        let frontier: string[] = [fromEntity];
-        let depth = 0;
-        let found = false;
-        // Tracked alongside `parent`: the most-recent name added. Because
-        // BFS expands layer-by-layer, the last entry recorded into
-        // `parent` is at the deepest layer reached. This is our anchor
-        // for the SMA*-style best-effort return when target isn't
-        // reached (β contract): with no heuristic on graph distance,
-        // "deepest BFS-reached" is the defensible "farthest progress
-        // toward target" — and the natural retry-from anchor.
-        let farthestDiscovered: string | undefined;
-
-        // We expand nodes at distance `depth` to discover nodes at
-        // distance `depth + 1`. The loop runs while `depth < maxDepth`
-        // so the deepest discovery is at level `maxDepth` (i.e. a
-        // path of `maxDepth` relations). This matches the predecessor:
-        // pre-rewrite DFS pruned with `depth > maxDepth`, so paths of
-        // exactly `maxDepth` hops were accepted.
-        outer: while (frontier.length > 0 && depth < maxDepth) {
-          const nextFrontier: string[] = [];
-          for (const current of frontier) {
-            nodesExpanded++;
-            const offset = this.nameIndex.get(current);
-            if (offset === undefined) continue;
-
-            const edges = this.gf.getEdges(offset);
-            for (const edge of edges) {
-              edgesScanned++;
-              if (direction === 'forward'  && edge.direction !== DIR_FORWARD)  continue;
-              if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
-
-              const targetRec = this.gf.readEntity(edge.targetOffset);
-              const nextName = this.st.get(BigInt(targetRec.nameId));
-              if (visited.has(nextName)) continue;
-
-              const relationType = this.st.get(BigInt(edge.relTypeId));
-              const mtime = Number(edge.mtime);
-              const rel: Relation = edge.direction === DIR_FORWARD
-                ? { from: current, to: nextName, relationType }
-                : { from: nextName, to: current, relationType };
-              if (mtime > 0) rel.mtime = mtime;
-
-              visited.add(nextName);
-              parent.set(nextName, { fromName: current, edge: rel });
-              farthestDiscovered = nextName;   // see β-contract notes above
-
-              // Exact accounting for this discovery, no estimates:
-              //   visited.add(nextName):
-              //     + UTF-8 bytes of nextName + V8_SET_ENTRY
-              //   parent.set(nextName, {fromName: current, edge: rel}):
-              //     + V8_MAP_ENTRY                           (map slot)
-              //     + V8_OBJECT_HEADER                       ({fromName,edge} wrapper)
-              //     + V8_OBJECT_HEADER                       (Relation object rel)
-              //     + UTF-8 bytes of relationType            (rel.relationType is a new string)
-              //   Aliased: rel.from / rel.to / fromName reference strings
-              //   already counted in `visited` — not double-counted.
-              bytesUsed += Buffer.byteLength(nextName, 'utf-8')
-                         + V8_SET_ENTRY
-                         + V8_MAP_ENTRY
-                         + V8_OBJECT_HEADER
-                         + V8_OBJECT_HEADER
-                         + Buffer.byteLength(relationType, 'utf-8');
-
-              if (nextName === toEntity) {
-                found = true;
-                break outer;
-              }
-              nextFrontier.push(nextName);
-
-              if (bytesUsed >= budgetBytes) {
-                budgetExhausted = true;
-                break outer;
-              }
-            }
-          }
-          depth++;
-          frontier = nextFrontier;
+        const fromOffset = this.db.lookup(fromEntity);
+        const toOffset = this.db.lookup(toEntity);
+        if (fromOffset === 0n || toOffset === 0n) {
+          span.setAttribute('kb.traversal.path_found', false);
+          span.setAttribute('kb.traversal.target_reached', false);
+          return { path: [], targetReached: false, budgetExhausted: false, budgetBytes };
         }
 
-        // Path reconstruction. Two cases:
-        //
-        //   found=true  → walk parent-pointers back from `toEntity`,
-        //                 producing the (shortest) path BFS found.
-        //
-        //   found=false → β-contract best-effort: walk parent-pointers
-        //                 back from `farthestDiscovered` (the deepest
-        //                 node BFS expanded). This is the path the
-        //                 caller can use as an anchor to continue from.
-        //                 If `farthestDiscovered` is undefined the BFS
-        //                 expanded no edges at all — `fromEntity` was
-        //                 missing from the name index or had no
-        //                 direction-matching outgoing edges. Return an
-        //                 empty path with `targetReached=false` in that
-        //                 case; nothing useful to anchor on.
-        let path: Relation[] = [];
-        const reconstructFrom = found ? toEntity : farthestDiscovered;
-        if (reconstructFrom !== undefined) {
-          const rels: Relation[] = [];
-          let cur = reconstructFrom;
-          while (cur !== fromEntity) {
-            const p = parent.get(cur);
-            if (!p) break;  // unreachable defensively; parent chain is total under BFS invariant
-            rels.push(p.edge);
-            cur = p.fromName;
-          }
-          path = rels.reverse();
+        // C BFS: shortest path to target, or a best-effort path to the
+        // farthest-discovered node when the target isn't reached (β-contract).
+        // The byte budget bounds the C BFS just as it bounded the old JS BFS;
+        // KB_FIND_PATH_BUDGET_BYTES flows in via findPathBudgetBytes().
+        const res = this.db.findPath(fromOffset, toOffset, maxDepth, direction, BigInt(budgetBytes));
+        const found = res.targetReached;
+        const nodePath = res.path;
+
+        const path: Relation[] = [];
+        for (let i = 0; i + 1 < nodePath.length; i++) {
+          const cur = nodePath[i];
+          const next = nodePath[i + 1];
+          const e = this.db.edges(cur).find(ed => ed.target === next && (
+            direction === 'forward' ? ed.direction === DIR_FORWARD :
+            direction === 'backward' ? ed.direction === DIR_BACKWARD :
+            (ed.direction === DIR_FORWARD || ed.direction === DIR_BACKWARD)
+          ));
+          if (!e) continue;
+          const curName = this.db.entityName(cur);
+          const nextName = this.db.entityName(next);
+          const rel: Relation = e.direction === DIR_FORWARD
+            ? { from: curName, to: nextName, relationType: e.relType }
+            : { from: nextName, to: curName, relationType: e.relType };
+          const mtime = Number(e.mtime);
+          if (mtime > 0) rel.mtime = mtime;
+          path.push(rel);
         }
 
-        span.setAttribute('kb.traversal.nodes_expanded', nodesExpanded);
-        span.setAttribute('kb.traversal.edges_scanned', edgesScanned);
+        const farthestDiscovered = (!found && res.farthest !== 0n)
+          ? this.db.entityName(res.farthest) : undefined;
+
         span.setAttribute('kb.traversal.path_length', path.length);
         span.setAttribute('kb.traversal.path_found', found);
         span.setAttribute('kb.traversal.target_reached', found);
-        // `budget_bytes` is the per-call cap derived from RAM (or env override).
-        // `bytes_used` is the *exact* sum we computed during BFS — string
-        // payload (UTF-8) + V8 container-slot overhead derived from V8's
-        // OrderedHashSet/OrderedHashMap/JSObject layouts. No estimate
-        // multiplier; if these don't match the V8 footprint within tens of
-        // percent we adjust the structural constants, not a fudge factor.
-        // `budget_exhausted` lights up on the rare call that hit the cap.
         span.setAttribute('kb.traversal.budget_bytes', budgetBytes);
-        span.setAttribute('kb.traversal.bytes_used', bytesUsed);
-        span.setAttribute('kb.traversal.budget_exhausted', budgetExhausted);
-        if (!found && farthestDiscovered !== undefined) {
-          span.setAttribute('kb.traversal.farthest_discovered', farthestDiscovered);
-        }
+        span.setAttribute('kb.traversal.budget_exhausted', res.budgetExhausted);
+        if (farthestDiscovered !== undefined) span.setAttribute('kb.traversal.farthest_discovered', farthestDiscovered);
         return {
           path,
           targetReached: found,
-          budgetExhausted,
-          farthestDiscovered: !found ? farthestDiscovered : undefined,
+          budgetExhausted: res.budgetExhausted,
+          farthestDiscovered,
           budgetBytes,
         };
       }),
@@ -1565,96 +1173,21 @@ export class KnowledgeGraphManager {
         'kb.walker.seeded': seed !== undefined,
       },
       (span) => this.withReadLock(() => {
-        const startOffset = this.nameIndex.get(start);
-        if (!startOffset) {
+        const startOffset = this.db.lookup(start);
+        if (startOffset === 0n) {
           throw new Error(`Start entity not found: ${start}`);
         }
 
-        // Create seeded RNG if seed provided
-        let rngState = seed ? this.hashSeed(seed) : null;
-        const random = (): number => {
-          if (rngState !== null) {
-            rngState ^= rngState << 13;
-            rngState ^= rngState >>> 17;
-            rngState ^= rngState << 5;
-            return (rngState >>> 0) / 0xFFFFFFFF;
-          } else {
-            return randomBytes(4).readUInt32BE() / 0xFFFFFFFF;
-          }
-        };
-
-        const pathNames: string[] = [start];
-        let current = start;
-        let edgesScanned = 0;
-        let truncated = false;
-
-        for (let i = 0; i < depth; i++) {
-          const offset = this.nameIndex.get(current);
-          if (!offset) { truncated = true; break; }
-
-          const edges = this.gf.getEdges(offset);
-          const candidates: { name: string; psi: number }[] = [];
-
-          for (const edge of edges) {
-            edgesScanned++;
-            if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
-            if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
-
-            const targetRec = this.gf.readEntity(edge.targetOffset);
-            const neighborName = this.st.get(BigInt(targetRec.nameId));
-            if (neighborName !== current && this.nameIndex.has(neighborName)) {
-              candidates.push({ name: neighborName, psi: targetRec.psi });
-            }
-          }
-
-          // Deduplicate: keep max psi per name (multiple edge types to same target)
-          const byName = new Map<string, number>();
-          for (const c of candidates) {
-            const existing = byName.get(c.name);
-            if (existing === undefined || c.psi > existing) {
-              byName.set(c.name, c.psi);
-            }
-          }
-
-          if (byName.size === 0) { truncated = true; break; }
-
-          const neighborArr = Array.from(byName.entries());
-
-          // Compute total ψ once; both modes need it (uniform skips it, but
-          // we still want to know whether ψ is populated for telemetry).
-          let totalPsi = 0;
-          for (const [, psi] of neighborArr) totalPsi += psi;
-
-          let chosen: string;
-          if (mode === 'merw' && totalPsi > 0) {
-            // MERW-weighted sampling: probability proportional to ψ_j.
-            // (The ψ_i denominator is constant for all neighbors and
-            //  cancels in normalization.)
-            const r = random() * totalPsi;
-            let cumulative = 0;
-            chosen = neighborArr[neighborArr.length - 1][0]; // fallback
-            for (const [name, psi] of neighborArr) {
-              cumulative += psi;
-              if (r <= cumulative) {
-                chosen = name;
-                break;
-              }
-            }
-          } else {
-            // mode === 'uniform', or MERW with ψ not yet computed (all zero).
-            // Plain uniform sampling over the deduplicated neighbor set.
-            const idx = Math.floor(random() * neighborArr.length);
-            chosen = neighborArr[idx][0];
-          }
-
-          current = chosen;
-          pathNames.push(current);
-        }
+        // Seeded walk: hash the string seed to a u64 the C RNG can use. A
+        // seed of 0 means "use the global RNG" (unseeded), so hashSeed (never
+        // 0) keeps seeded walks reproducible.
+        const seedU64 = seed !== undefined ? BigInt(this.hashSeed(seed) >>> 0) : 0n;
+        const pathOffsets = this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64);
+        const pathNames = pathOffsets.map(o => this.db.entityName(o));
 
         span.setAttribute('kb.walker.steps_taken', pathNames.length - 1);
-        span.setAttribute('kb.walker.edges_scanned', edgesScanned);
-        span.setAttribute('kb.walker.truncated', truncated);
-        return { entity: current, path: pathNames };
+        span.setAttribute('kb.walker.truncated', pathNames.length - 1 < depth);
+        return { entity: pathNames[pathNames.length - 1], path: pathNames };
       }),
     );
   }
@@ -1723,35 +1256,18 @@ export class KnowledgeGraphManager {
       const now = BigInt(Date.now());
       const ctxId = randomBytes(12).toString('hex');
 
-      const obsMtime = observations.length > 0 ? now : 0n;
-      const rec = this.gf.createEntity(ctxId, 'Thought', now, obsMtime);
+      const offset = this.db.createEntity(ctxId, 'Thought', now);
       for (const obs of observations) {
-        this.gf.addObservation(rec.offset, obs, now);
+        this.db.addObservation(offset, obs, now);
       }
-      if (observations.length > 0) {
-        const updated = this.gf.readEntity(rec.offset);
-        updated.mtime = now;
-        updated.obsMtime = now;
-        this.gf.updateEntity(updated);
-      }
-      this.nameIndex.set(ctxId, rec.offset);
 
       if (previousCtxId) {
-        const prevOffset = this.nameIndex.get(previousCtxId);
-        if (prevOffset !== undefined) {
-          const prevRec = this.gf.readEntity(prevOffset);
-          prevRec.mtime = now;
-          this.gf.updateEntity(prevRec);
-
-          const followsTypeId = Number(this.st.intern('follows'));
-          this.gf.addEdge(prevOffset, { targetOffset: rec.offset, direction: DIR_FORWARD, relTypeId: followsTypeId, mtime: now });
-          const followsTypeId2 = Number(this.st.intern('follows'));
-          this.gf.addEdge(rec.offset, { targetOffset: prevOffset, direction: DIR_BACKWARD, relTypeId: followsTypeId2, mtime: now });
-
-          const precededByTypeId = Number(this.st.intern('preceded_by'));
-          this.gf.addEdge(rec.offset, { targetOffset: prevOffset, direction: DIR_FORWARD, relTypeId: precededByTypeId, mtime: now });
-          const precededByTypeId2 = Number(this.st.intern('preceded_by'));
-          this.gf.addEdge(prevOffset, { targetOffset: rec.offset, direction: DIR_BACKWARD, relTypeId: precededByTypeId2, mtime: now });
+        const prevOffset = this.db.lookup(previousCtxId);
+        if (prevOffset !== 0n) {
+          // prev --follows--> new, and new --preceded_by--> prev. C creates
+          // both directed edges per relation and owns the refcounts.
+          this.db.createRelation(prevOffset, offset, 'follows', now);
+          this.db.createRelation(offset, prevOffset, 'preceded_by', now);
         }
       }
 
@@ -1761,8 +1277,7 @@ export class KnowledgeGraphManager {
 
   /** Close the underlying binary store files */
   close(): void {
-    this.gf.close();
-    this.st.close();
+    this.db.close();
   }
 }
 
@@ -2199,7 +1714,7 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
           return {
             content: [{
               type: "text",
-              text: `No matches for ${JSON.stringify(query)}. search_nodes uses regex (case-insensitive), not natural language.${suggestion} You can also browse with get_entities_by_type, get_neighbors, or random_walk.`,
+              text: `No matches for ${JSON.stringify(query)}. search_nodes uses POSIX Extended Regular Expressions (ERE), case-sensitive — not natural language, and not JS/PCRE regex (use [0-9] not \\d, [[:alpha:]] not \\w; no lookahead or backreferences).${suggestion} You can also browse with get_entities_by_type, get_neighbors, or random_walk.`,
             }],
             isError: true,
           };

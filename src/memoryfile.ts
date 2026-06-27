@@ -42,7 +42,17 @@ function findNative(): string {
   throw new Error('Could not find native memoryfile.node — was the C addon built? Run: node-gyp rebuild');
 }
 
-const native: NativeMemoryFile = require(findNative());
+// Lazy-load the native addon: importing this module (e.g. transitively via the
+// migrator) must NOT require memoryfile.node to be present — only constructing
+// a MemoryFile does. This lets a fresh v3 deploy run without the old addon
+// unless an actual v1/v2 migration fires.
+let _native: NativeMemoryFile | undefined;
+const native: NativeMemoryFile = new Proxy({} as NativeMemoryFile, {
+  get(_t, prop: string) {
+    if (!_native) _native = require(findNative()) as NativeMemoryFile;
+    return (_native as unknown as Record<string, unknown>)[prop];
+  },
+});
 
 export class MemoryFile {
   private handle: unknown;
