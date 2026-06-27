@@ -11,7 +11,7 @@ CFLAGS = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 LIBS = -lm
 OUT = /tmp/mf_test
 
-.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity clean
+.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity bench clean
 
 # `make test` = prove the detector fires, then run every harness with it active.
 test: verify-detector test_memfile test_stringtable test_graph test_entity
@@ -33,6 +33,12 @@ test_graph: test_graph.c graph.c stringtable.c memoryfile.c
 
 test_entity: test_entity.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_entity && $(OUT)_entity
+
+# Per-op graph benchmark: optimized build (NO ASan / NO double-free-check — those
+# skew timing). Emits per-op rdtsc cycle stats as JSON; CI compares base vs head.
+BENCH_CFLAGS = -std=c11 -O2 -march=native -Wall -D_GNU_SOURCE -I.
+bench: op_bench.c graph.c stringtable.c memoryfile.c
+	$(CC) $(BENCH_CFLAGS) $^ -lm -o $(OUT)_bench && $(OUT)_bench
 
 clean:
 	rm -f $(OUT)_*

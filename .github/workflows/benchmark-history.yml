@@ -1,0 +1,88 @@
+name: benchmark-history
+
+# Accumulate a reference-normalized benchmark time-series so slow creep (which the
+# per-PR head-vs-base gate is blind to) becomes visible. On every push to master
+# we run the bench, append one sample to an append-only NDJSON on the ORPHAN
+# `bench-history` branch (isolated from master/PR history — no churn), and check
+# the new sample against a rolling baseline. Creep is a SOFT-fail + commit comment.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bench-history
+  cancel-in-progress: false
+
+jobs:
+  accumulate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build and run bench (interleaved)
+        run: |
+          make -C native bench >/dev/null 2>&1
+          cp /tmp/mf_test_bench /tmp/bench
+          for i in $(seq 1 7); do /tmp/bench > "/tmp/run_$i.json"; done
+
+      - name: Aggregate one normalized sample
+        run: |
+          R=$(ls /tmp/run_*.json | paste -sd,)
+          node scripts/bench-aggregate.mjs --runs "$R" \
+            --sha "$GITHUB_SHA" --date "$(date -u +%FT%TZ)" > /tmp/sample.ndjson
+          cat /tmp/sample.ndjson
+
+      - name: Append to bench-history + creep check
+        id: creep
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin bench-history || true
+          if git rev-parse --verify origin/bench-history >/dev/null 2>&1; then
+            git worktree add /tmp/hist origin/bench-history
+          else
+            git worktree add --detach /tmp/hist
+            git -C /tmp/hist checkout --orphan bench-history
+            git -C /tmp/hist rm -rf . >/dev/null 2>&1 || true
+          fi
+          touch /tmp/hist/history.ndjson
+          # creep check: new sample vs the EXISTING history (before appending)
+          set +e
+          node scripts/bench-creep.mjs --history /tmp/hist/history.ndjson --sample /tmp/sample.ndjson > /tmp/creep.md
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          cat /tmp/creep.md
+          # append + push (one retry if the branch advanced under us)
+          cat /tmp/sample.ndjson >> /tmp/hist/history.ndjson
+          git -C /tmp/hist add history.ndjson
+          git -C /tmp/hist commit -m "bench: sample for ${GITHUB_SHA}"
+          git -C /tmp/hist push origin HEAD:bench-history || {
+            git -C /tmp/hist fetch origin bench-history
+            git -C /tmp/hist reset --soft origin/bench-history
+            cat /tmp/sample.ndjson >> /tmp/hist/history.ndjson
+            git -C /tmp/hist add history.ndjson
+            git -C /tmp/hist commit -m "bench: sample for ${GITHUB_SHA} (retry)"
+            git -C /tmp/hist push origin HEAD:bench-history
+          }
+
+      - name: Comment creep on commit
+        if: steps.creep.outputs.rc != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = '<!-- bench-creep -->\n' + fs.readFileSync('/tmp/creep.md', 'utf8');
+            await github.rest.repos.createCommitComment({ ...context.repo, commit_sha: context.sha, body });
+
+      - name: Soft-fail on creep
+        if: steps.creep.outputs.rc != '0'
+        run: |
+          echo "::warning::Benchmark slow-creep detected vs rolling baseline — see the commit comment. (soft-fail)"
+          exit 1
