@@ -45,52 +45,12 @@ const HAS_REGEX_META = /[\\^$.*+?()[\]{}|]/;
 // RAM at call time. Hard upper bound by request: never claim more than 80%
 // of available memory.
 //
-// We count ONLY what this BFS puts into its own data structures — never
-// `process.memoryUsage()` (which conflates with OTel spans, request handler
-// state, JIT, anything else allocating in the same isolate). The summed
-// cost has two parts, both exact (no per-entry heuristic):
-//
-//   1. String payload bytes. Every name + relationType we materialize into
-//      `visited` / `parent` is decoded out of the mmap'd strings file. We
-//      measure that string with `Buffer.byteLength(s, 'utf-8')` at the
-//      point of insertion. UTF-8 length is the wire size; V8 internally
-//      stores Latin-1 (1 B/char) or UCS-2 (2 B/char), and either way the
-//      payload cost is bounded between 1× and 2× the UTF-8 length. We
-//      count UTF-8 length and accept the ≤2× ceiling on this term.
-//
-//   2. V8 container-slot overhead. The Set/Map/Object wrappers V8 puts
-//      around our payload have fixed per-entry sizes derived from V8's
-//      OrderedHashSet / OrderedHashMap / JSObject layouts (64-bit, no
-//      pointer compression). The constants below are structural — they
-//      came from v8/src/objects/{ordered-hash-table,js-objects}.h, not
-//      from "let's add a safety factor." If Node's V8 is updated with
-//      different layouts, re-derive from those headers.
-//
-// Both terms are summed into `bytesUsed` as we go; when it crosses
-// `budgetBytes = 0.80 * MemAvailable`, the BFS terminates and the call
-// returns `path=[]` with `kb.traversal.budget_exhausted=true`.
-//
-// `KB_FIND_PATH_BUDGET_BYTES` env override replaces the live RAM
-// calculation — used by tests to force exhaustion in deterministic
-// graphs, and by ops to hard-cap on constrained machines.
+// The budget VALUE is `0.80 * MemAvailable` (or the `KB_FIND_PATH_BUDGET_BYTES`
+// env override, used by tests to force exhaustion). It is passed to the C BFS,
+// which enforces it against its own per-node footprint (graph_find_path_ex).
 // =============================================================================
 
 const FIND_PATH_MEMORY_FRACTION = 0.80;
-
-// V8 container-slot sizes, 64-bit, no pointer compression. Each constant
-// is a fixed structural cost V8 imposes on top of the user-payload bytes;
-// they are NOT empirical fudge factors.
-//
-//   V8_SET_ENTRY:    OrderedHashSet hash-table slot — 1 ptr (key) + 1 ptr
-//                    (chain) + 1 word (hash + tags). 3 × 8 B.
-//   V8_MAP_ENTRY:    OrderedHashMap slot — 1 ptr (key) + 1 ptr (value)
-//                    + 1 ptr (chain) + 1 word (hash + tags). 4 × 8 B.
-//   V8_OBJECT_HEADER: JSObject header — Map ptr + properties ptr +
-//                     elements ptr + 1 in-object slot for our (small)
-//                     plain-object payloads. 4 × 8 B.
-const V8_SET_ENTRY = 24;
-const V8_MAP_ENTRY = 32;
-const V8_OBJECT_HEADER = 32;
 
 /**
  * Bytes of RAM the host considers "available" — i.e., free + reclaimable
