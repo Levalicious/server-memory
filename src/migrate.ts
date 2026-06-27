@@ -17,9 +17,7 @@
  * must stop old instances first. The `.premigrate` backup is kept for recovery.
  */
 import path from 'path';
-import { existsSync, openSync, readSync, closeSync, renameSync, rmSync } from 'fs';
-import { GraphFile, DIR_FORWARD } from './graphfile.js';
-import { StringTable } from './stringtable.js';
+import { existsSync, openSync, readSync, closeSync, renameSync, rmSync, readFileSync } from 'fs';
 import { Store, migrationLock, migrationUnlock } from './store.js';
 
 const MEMFILE_MAGIC = 0x4d454d46; // "MEMF" (native MEMFILE_MAGIC)
@@ -74,59 +72,81 @@ export function detectGraphFormat(graphPath: string): 'v3' | 'old' | 'fresh' {
   }
 }
 
-/** Read everything out of an old (v1/v2) KB into plain JS. */
-function readOld(p: PathPair): OldData {
-  const st = new StringTable(p.strings);
-  const gf = new GraphFile(p.graph, st);  // may migrate v1->v2 in place (on the copy/backup)
+/**
+ * Pure-TS reader for the old v1/v2 on-disk format — read-only, no native addon.
+ * The byte layout is fixed (see src/graphfile.ts / src/stringtable.ts):
+ *   graph header @40: u64 node_log_off, u64 structural_total, u64 walker_total
+ *   node log:        u32 count, u32 cap, u64 offsets[count]
+ *   entity record:   nameId@0 typeId@4 adjOff@8 mtime@16 obsMtime@24 obsCount@32
+ *                    obs0@36 obs1@40 sVisits@48 wVisits@56 psi@64 (v2 only; v1=64B)
+ *   adj entry (24B): (target<<2|dir)@0, relType@8, mtime@16
+ *   string entry @id: u32 refcount, u32 hash, u16 len, u8 data[len]
+ * This is why the migrator no longer needs the old addon (which can't be rebuilt
+ * anyway — its source became the v3 memoryfile.c).
+ */
+export function readOldRaw(p: PathPair): OldData {
+  const graph = readFileSync(p.graph);
+  const strings = readFileSync(p.strings);
+
+  const version = graph.readUInt32LE(4);   // memfile header version field
+  if (version !== 1 && version !== 2) {
+    throw new Error(`migrate: ${p.graph} is not an old v1/v2 graph (version ${version})`);
+  }
+  const hasPsi = version === 2;            // psi field only exists in v2
+
+  const getStr = (id: number): string => {
+    if (id === 0) return '';
+    const len = strings.readUInt16LE(id + 8);
+    return strings.toString('utf-8', id + 10, id + 10 + len);
+  };
+  const nameAt = (off: number): string => getStr(graph.readUInt32LE(off));
+
+  const GH = 40;
+  const nodeLogOff = Number(graph.readBigUInt64LE(GH));
+  const structuralTotal = graph.readBigUInt64LE(GH + 8);
+  const walkerTotal = graph.readBigUInt64LE(GH + 16);
+
+  const count = graph.readUInt32LE(nodeLogOff);
+  const offsets: number[] = [];
+  for (let i = 0; i < count; i++) offsets.push(Number(graph.readBigUInt64LE(nodeLogOff + 8 + i * 8)));
 
   const entities: OldEntity[] = [];
   const relations: OldRelation[] = [];
-  let structuralTotal = 0n;
-  let walkerTotal = 0n;
+  for (const off of offsets) {
+    const o0 = graph.readUInt32LE(off + 36);
+    const o1 = graph.readUInt32LE(off + 40);
+    const obs: string[] = [];
+    if (o0 !== 0) obs.push(getStr(o0));
+    if (o1 !== 0) obs.push(getStr(o1));
+    entities.push({
+      name: getStr(graph.readUInt32LE(off)),
+      type: getStr(graph.readUInt32LE(off + 4)),
+      obs,
+      mtime: graph.readBigUInt64LE(off + 16),
+      obsMtime: graph.readBigUInt64LE(off + 24),
+      sv: graph.readBigUInt64LE(off + 48),
+      wv: graph.readBigUInt64LE(off + 56),
+      psi: hasPsi ? graph.readDoubleLE(off + 64) : 0,
+    });
 
-  gf.lockShared();
-  try {
-    const offsets = gf.getAllEntityOffsets();
-    const nameOf = (off: bigint): string => st.get(BigInt(gf.readEntity(off).nameId));
-
-    for (const off of offsets) {
-      const r = gf.readEntity(off);
-      const obs: string[] = [];
-      if (r.obs0Id !== 0) obs.push(st.get(BigInt(r.obs0Id)));
-      if (r.obs1Id !== 0) obs.push(st.get(BigInt(r.obs1Id)));
-      entities.push({
-        name: st.get(BigInt(r.nameId)),
-        type: st.get(BigInt(r.typeId)),
-        obs,
-        mtime: r.mtime,
-        obsMtime: r.obsMtime,
-        sv: r.structuralVisits,
-        wv: r.walkerVisits,
-        psi: r.psi,
-      });
-    }
-
-    for (const off of offsets) {
-      const r = gf.readEntity(off);
-      const fromName = st.get(BigInt(r.nameId));
-      for (const e of gf.getEdges(off)) {
-        if (e.direction !== DIR_FORWARD) continue;  // forward edges only (each relation once)
+    const adjOff = Number(graph.readBigUInt64LE(off + 8));
+    if (adjOff !== 0) {
+      const fromName = getStr(graph.readUInt32LE(off));
+      const aCount = graph.readUInt32LE(adjOff);
+      for (let i = 0; i < aCount; i++) {
+        const base = adjOff + 8 + i * 24;
+        const packed = graph.readBigUInt64LE(base);
+        if (Number(packed & 3n) !== 0) continue;   // forward edges only (DIR_FORWARD = 0)
         relations.push({
           from: fromName,
-          to: nameOf(e.targetOffset),
-          relType: st.get(BigInt(e.relTypeId)),
-          mtime: e.mtime,
+          to: nameAt(Number(packed >> 2n)),
+          relType: getStr(graph.readUInt32LE(base + 8)),
+          mtime: graph.readBigUInt64LE(base + 16),
         });
       }
     }
-
-    structuralTotal = gf.getStructuralTotal();
-    walkerTotal = gf.getWalkerTotal();
-  } finally {
-    gf.unlock();
   }
-  gf.close();
-  st.close();
+
   return { entities, relations, structuralTotal, walkerTotal };
 }
 
@@ -206,7 +226,7 @@ function validate(store: Store, old: OldData): string[] {
 
 /** Migrate old files (`oldP`, MUST be a copy/backup) into fresh v3 files (`newP`). */
 export function migratePaths(oldP: PathPair, newP: PathPair): MigrateReport {
-  const old = readOld(oldP);
+  const old = readOldRaw(oldP);
   const store = writeV3(newP, old);
   const mismatches = validate(store, old);
   store.close();
