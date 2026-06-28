@@ -1,0 +1,88 @@
+name: benchmark
+
+# Per-op graph-store microbenchmark, base vs head, on ONE runner — no committed
+# baseline values (nothing for git to churn). Builds the SAME harness against the
+# base and head store sources, runs them interleaved, frequency-corrects head to
+# base via a fixed-work reference op, and diffs the medians. SOFT-fail: a
+# regression turns the check red and posts a PR comment, but this check is not
+# meant to be a required status, so it never hard-blocks a merge.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  op-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build head benchmark
+        run: |
+          make -C native bench >/dev/null 2>&1
+          cp /tmp/mf_test_bench /tmp/bench_head
+
+      - name: Build base benchmark (head harness, base store sources)
+        id: base
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          git worktree add --detach /tmp/base "$BASE_SHA"
+          mkdir -p /tmp/base/native
+          # Overlay the head harness so ONLY the measured store code differs.
+          cp native/op_bench.c /tmp/base/native/op_bench.c
+          cp native/Makefile  /tmp/base/native/Makefile
+          if make -C /tmp/base/native bench >/tmp/base_build.log 2>&1; then
+            cp /tmp/mf_test_bench /tmp/bench_base
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "Base build failed — base likely has no comparable benchmark/store. Skipping comparison."
+            tail -25 /tmp/base_build.log || true
+          fi
+
+      - name: Run interleaved and compare
+        if: steps.base.outputs.ok == '1'
+        id: cmp
+        run: |
+          for i in $(seq 1 5); do
+            /tmp/bench_head > "/tmp/head_$i.json"
+            /tmp/bench_base > "/tmp/base_$i.json"
+          done
+          H=$(ls /tmp/head_*.json | paste -sd,)
+          B=$(ls /tmp/base_*.json | paste -sd,)
+          set +e
+          node scripts/bench-compare.mjs --base "$B" --head "$H" > /tmp/report.md
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          cat /tmp/report.md
+
+      - name: Comment results on PR
+        if: steps.base.outputs.ok == '1'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = '<!-- op-bench -->\n' + fs.readFileSync('/tmp/report.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find((c) => c.body && c.body.includes('<!-- op-bench -->'));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Soft-fail on regression
+        if: steps.base.outputs.ok == '1' && steps.cmp.outputs.rc != '0'
+        run: |
+          echo "::warning::Per-op benchmark regression detected — see the op-bench PR comment. (soft-fail: not a required check)"
+          exit 1
