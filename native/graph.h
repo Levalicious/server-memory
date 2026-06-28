@@ -99,6 +99,8 @@ u32  graph_relation_types(graph_t *g, u32 *out, u32 max);   /* distinct relType 
 
 /* search: POSIX ERE over name + type + observations; returns all matches */
 u32  graph_search(graph_t *g, const char *pattern, u64 *out, u32 max);
+/* validity of a pattern under the SAME POSIX ERE engine used to match (1 = valid) */
+int  graph_regex_valid(const char *pattern);
 
 /* traversal */
 u32  graph_neighbors(graph_t *g, u64 start, u32 depth, u32 direction, u64 *out, u32 max);

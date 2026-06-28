@@ -575,6 +575,16 @@ u32 graph_search(graph_t *g, const char *pattern, u64 *out, u32 max) {
     return found;
 }
 
+/* Validity of a search pattern under the SAME engine that matches it (POSIX ERE),
+ * so the TS layer can surface "Invalid regex pattern" without a second, divergent
+ * regex dialect (JS RegExp). Returns 1 iff regcomp(REG_EXTENDED) accepts it. */
+int graph_regex_valid(const char *pattern) {
+    regex_t re;
+    if (regcomp(&re, pattern, REG_EXTENDED) != 0) return 0;
+    regfree(&re);
+    return 1;
+}
+
 /* ======================================================================
  * Traversal (BFS) — open-addressing u64->u64 map for visited / parent.
  * Entity offsets are never 0 (records live above the header), so 0 = empty slot.

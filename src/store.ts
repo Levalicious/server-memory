@@ -64,6 +64,7 @@ interface NativeStore {
   neighbors(h: unknown, start: bigint, depth: number, direction: number): bigint[];
   findPath(h: unknown, from: bigint, to: bigint, maxDepth: number, direction: number, budgetBytes: bigint): { path: bigint[]; targetReached: boolean; budgetExhausted: boolean; farthest: bigint };
   search(h: unknown, pattern: string): bigint[];
+  regexValid(pattern: string): boolean;
   entitiesByType(h: unknown, type: string): bigint[];
   orphaned(h: unknown): bigint[];
   listEntities(h: unknown): bigint[];
@@ -149,6 +150,8 @@ export class Store {
     return native.findPath(this.h, from, to, maxDepth, dirCode(direction), budgetBytes);
   }
   search(pattern: string): bigint[] { return native.search(this.h, pattern); }
+  /** True iff `pattern` compiles under the C POSIX ERE engine (same dialect as search). */
+  regexValid(pattern: string): boolean { return native.regexValid(pattern); }
   entitiesByType(type: string): bigint[] { return native.entitiesByType(this.h, type); }
   orphaned(): bigint[] { return native.orphaned(this.h); }
   listEntities(): bigint[] { return native.listEntities(this.h); }

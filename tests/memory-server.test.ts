@@ -306,6 +306,22 @@ describe('MCP Memory Server E2E Tests', () => {
       ).rejects.toThrow(/Invalid regex pattern/);
     });
 
+    it('accepts ERE-valid patterns that JS RegExp rejects (validator uses the C ERE engine)', async () => {
+      // 'a)b' is a SyntaxError in JS RegExp but valid POSIX ERE (a lone ) is literal).
+      // It must NOT be rejected — the validator now shares the C matcher's dialect.
+      await expect(
+        callTool(client, 'search_nodes', { query: 'a)b' })
+      ).resolves.toBeDefined();
+    });
+
+    it('rejects ERE-invalid patterns even when JS RegExp accepts them', async () => {
+      // '(?:x)' is a valid JS non-capturing group but invalid POSIX ERE — must throw,
+      // not silently return zero matches.
+      await expect(
+        callTool(client, 'search_nodes', { query: '(?:x)' })
+      ).rejects.toThrow(/Invalid regex pattern/);
+    });
+
     it('trigram path: regex-extractable queries return the same results as before', async () => {
       // Soundness check: enabling the trigram fast path is invisible to the
       // caller. The `search_nodes` API still accepts a regex; the speedup
