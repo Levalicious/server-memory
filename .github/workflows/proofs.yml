@@ -1,0 +1,49 @@
+name: proofs
+
+# Frama-C/WP proofs of the v3 store's tractable algorithms: allocator size
+# quantization + open-addressing probe (fc_proofs), name-index traversal bounds
+# (fc_index), free-list descent memory-safety (fc_tree), and the adjacency edge
+# encoding round-trip/injectivity + edge-iteration bounds (fc_graph). These prove
+# memory-model-clean abstractions of the real algorithms — no mmap region for WP
+# to reason about. Only runs when the proofs (or their build) change.
+on:
+  pull_request:
+    paths:
+      - 'native/fc_*.c'
+      - 'native/fc_stubs.h'
+      - 'native/Makefile'
+      - '.github/workflows/proofs.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'native/fc_*.c'
+      - 'native/fc_stubs.h'
+      - 'native/Makefile'
+      - '.github/workflows/proofs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  wp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.2"
+
+      - name: Install Frama-C + Alt-Ergo
+        run: opam install -y frama-c alt-ergo
+
+      - name: Detect provers
+        run: |
+          eval $(opam env)
+          why3 config detect
+
+      - name: Run WP proofs
+        run: |
+          eval $(opam env)
+          frama-c -version
+          make -C native proofs
