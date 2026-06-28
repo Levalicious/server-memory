@@ -188,6 +188,12 @@ static napi_value n_search(napi_env env, napi_callback_info info) {
     u32 n = graph_search(s->g, pat, out, cap);
     napi_value r = u64arr(env, out, n < cap ? n : cap); free(out); return r;
 }
+/* Pattern validity under the C POSIX ERE engine — the same dialect that matches, so
+ * the TS layer keeps its "Invalid regex pattern" contract without JS RegExp. */
+static napi_value n_regex_valid(napi_env env, napi_callback_info info) {
+    ARGS(1); char pat[8192]; getStr(env, argv[0], pat, sizeof pat);
+    napi_value r; napi_get_boolean(env, graph_regex_valid(pat) != 0, &r); return r;
+}
 static napi_value n_by_type(napi_env env, napi_callback_info info) {
     ARGS(2); STORE; char ty[4096]; u16 l = getStr(env, argv[1], ty, sizeof ty);
     u32 cap = graph_entity_count(s->g) + 1; u64 *out = malloc((size_t)cap * 8);
@@ -306,6 +312,7 @@ NAPI_MODULE_INIT() {
     EXPORT("addObservation", n_add_obs); EXPORT("removeObservation", n_remove_obs);
     EXPORT("createRelation", n_create_relation); EXPORT("deleteRelation", n_delete_relation); EXPORT("edges", n_edges);
     EXPORT("neighbors", n_neighbors); EXPORT("findPath", n_find_path); EXPORT("search", n_search);
+    EXPORT("regexValid", n_regex_valid);
     EXPORT("entitiesByType", n_by_type); EXPORT("orphaned", n_orphaned); EXPORT("listEntities", n_list_entities);
     EXPORT("entityTypes", n_entity_types); EXPORT("relationTypes", n_relation_types);
     EXPORT("entityCount", n_entity_count); EXPORT("relationCount", n_relation_count);
