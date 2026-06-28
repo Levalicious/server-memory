@@ -738,11 +738,10 @@ export class KnowledgeGraphManager {
     sortDir?: SortDirection,
     direction: 'forward' | 'backward' | 'any' = 'forward',
   ): Promise<KnowledgeGraph> {
-    // Validate the pattern with JS RegExp semantics so callers still get the
-    // "Invalid regex pattern" contract; the actual match runs in C (POSIX ERE).
-    try {
-      new RegExp(query, 'i');
-    } catch {
+    // Validate with the SAME engine that matches (C POSIX ERE), so a valid ERE
+    // query is never rejected by a divergent JS RegExp dialect, and an invalid one
+    // is rejected consistently. Preserves the "Invalid regex pattern" contract.
+    if (!this.db.regexValid(query)) {
       throw new Error(`Invalid regex pattern: ${query}`);
     }
 
@@ -1256,7 +1255,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.27",
+    version: "0.0.28",
   }, {
     capabilities: {
       tools: {},
