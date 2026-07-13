@@ -74,7 +74,7 @@ jobs:
 
       - name: Comment creep on commit
         if: steps.creep.outputs.rc != '0'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
