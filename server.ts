@@ -828,7 +828,7 @@ export class KnowledgeGraphManager {
     direction: 'forward' | 'backward' | 'any' = 'forward'
   ): Promise<Neighbor[]> {
     return traced(
-      'kb.get_neighbors',
+      'kb.',
       {
         'kb.traversal.depth': depth,
         'kb.traversal.direction': direction,
@@ -1448,7 +1448,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object",
           properties: {
             entityName: { type: "string", description: "The name of the entity to find neighbors for" },
-            depth: { type: "number", description: "Maximum depth to traverse (default: 1)", default: 1 },
+            depth: { type: "number", description: "Maximum depth to traverse (default: 0)", default: 0 },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for neighbors. Omit for arbitrary order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
