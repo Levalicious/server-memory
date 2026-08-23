@@ -83,12 +83,15 @@ typedef struct __attribute__((packed)) {
     u16 seg_id;               /* this segment's id in the store */
     u16 extent_pages_log2;    /* allocation cluster size = 2^n pages */
     u64 txid;                 /* transaction that wrote this meta */
-    u64 watermark;            /* page count: pages [0, watermark) are addressable */
-    u32 nameindex_root_pgno;  /* graph-layer roots; 0 = none */
-    u32 indirect_root_pgno;   /* node-id indirection table root */
-    u32 freelist_root_pgno;   /* retired-page list root */
-    u32 _reserved0;
-    u64 _reserved1[4];
+    u64 watermark;            /* PHYSICAL page count: file pages [0, watermark) */
+    u32 nameindex_root_pgno;  /* graph-layer roots (LOGICAL pgnos); 0 = none */
+    u32 indirect_root_pgno;   /* node-id indirection table root (LOGICAL) */
+    u32 freelist_root_pgno;   /* freelist snapshot page (PHYSICAL pgno) */
+    u32 ptable_root_pgno;     /* shadow page-table root (PHYSICAL pgno)
+                                 Decision_LogicalPgnoShadowTable: refs use
+                                 stable LOGICAL pgnos; this maps them */
+    u64 logical_pages;        /* logical pgno space: [0, logical_pages) */
+    u64 _reserved1[3];
     u32 _reserved2;
     u32 checksum;             /* crc32c, LAST field (offsetof used in tests) */
 } seg_meta_t;
@@ -308,5 +311,64 @@ int segfile_commit(segfile_t *sf, const u32 *pgnos, const u8 *const *bufs,
                    u32 ndirty, const seg_meta_t *next_meta);
 
 void segfile_close(segfile_t *sf);
+
+/* ------------------------------------------------------------------ *
+ * segstore txn layer (seg_txn.c) — COW transactions over segfile.
+ *
+ * Identity model (Decision_LogicalPgnoShadowTable): callers address LOGICAL
+ * pgnos, stable forever. A shadow page table (COW'd fixed-format pages:
+ * root -> table pages -> u32 physical pgno entries, PT_NONE = unmapped)
+ * maps them to physical file pages. Touch never relocates a logical page;
+ * it re-points its table entry at a fresh physical page at commit.
+ *
+ * COW discipline is ENFORCED here: physical targets come only from the
+ * freelist (retired, no blocking pin) or fresh watermark growth — never a
+ * physical page reachable from the last committed meta.
+ *
+ * Freelist persistence: one snapshot (chain of fixed-format pages) per
+ * commit holding the full {free[], pending[](txid,pgnos)} state; the meta
+ * points at it; reopening rebuilds allocator state exactly. Restart clears
+ * pins, so recovery promotes all pending groups with txid <= committed.
+ *
+ * Pins: seg_pin captures {txid, ptable copy}; physical pages retired at
+ * txid T are reusable only when every active pin has pin->txid >= T.
+ * Pinned reads therefore stay byte-stable regardless of later commits.
+ * Single-writer: at most one open txn; no locks anywhere.
+ * ------------------------------------------------------------------ */
+
+#define SEG_PT_NONE 0xFFFFFFFFu   /* unmapped logical page */
+
+typedef struct segstore segstore_t;
+typedef struct segpin { u64 txid; u32 *ptable; u64 logical_pages;
+                        struct segpin *next; } segpin_t;
+
+segstore_t *segstore_create(seg_io_t *io, u16 seg_id, u16 extent_pages_log2);
+segstore_t *segstore_open(seg_io_t *io);
+void        segstore_close(segstore_t *st);
+u64         segstore_txid(const segstore_t *st);
+u64         segstore_logical_pages(const segstore_t *st);
+
+/* committed read: RO pointer to logical page lpg, NULL if unmapped */
+const u8 *segstore_read(segstore_t *st, u32 lpg);
+
+/* snapshot pins */
+segpin_t *seg_pin(segstore_t *st);
+void      seg_unpin(segstore_t *st, segpin_t *pin);
+const u8 *seg_pin_read(segstore_t *st, const segpin_t *pin, u32 lpg);
+
+/* single open txn; all bufs are SEG_PAGE_SIZE heap pages owned by the txn */
+int  seg_txn_begin(segstore_t *st);
+/* COW touch: compacted working copy of lpg (stable across calls in-txn) */
+u8  *seg_txn_touch(segstore_t *st, u32 lpg);
+/* fresh logical page (seg_page_init'd, kind_hint applied); *lpg_out set */
+u8  *seg_txn_alloc(segstore_t *st, u16 kind_hint, u32 *lpg_out);
+/* unmap a logical page; its physical page retires at commit. 1 = ok */
+int  seg_txn_free(segstore_t *st, u32 lpg);
+/* set graph-layer roots recorded in the next meta (logical pgnos) */
+void seg_txn_set_roots(segstore_t *st, u32 nameindex_root, u32 indirect_root);
+/* publish: allocates physical pages (freelist/growth), writes data + ptable
+ * + freelist snapshot + meta via segfile_commit. 1 = committed. */
+int  seg_txn_commit(segstore_t *st);
+void seg_txn_abort(segstore_t *st);
 
 #endif /* SEGSTORE_H */
