@@ -83,3 +83,8 @@ test_segtxn: test_segtxn.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c
 
 test_mstore: test_mstore.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_mstore && $(OUT)_mstore
+
+SEGBENCH_SRC = bench_segstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c
+bench_segstore: $(SEGBENCH_SRC)
+	$(CC) $(BENCH_CFLAGS) $(SEGBENCH_SRC) -lm -o $(OUT)_segbench4k && $(OUT)_segbench4k
+	$(CC) $(BENCH_CFLAGS) -DSEG_PAGE_SIZE=16384u $(SEGBENCH_SRC) -lm -o $(OUT)_segbench16k && $(OUT)_segbench16k

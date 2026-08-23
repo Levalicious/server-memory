@@ -215,6 +215,21 @@ u8 *seg_io_sim_replay_prefix(const seg_io_t *io, u32 k, u64 *size_out) {
 
 u64 seg_io_sim_gseq_now(void) { return g_sim_gseq; }
 
+u64 seg_io_sim_bytes_written(const seg_io_t *io) {
+    const io_sim_t *s = (const io_sim_t *)io;
+    u64 total = 0;
+    for (u32 i = 0; i < s->nev; i++)
+        if (s->ev[i].kind == EV_WRITE) total += s->ev[i].len;
+    return total;
+}
+
+u32 seg_io_sim_sync_count(const seg_io_t *io) {
+    const io_sim_t *s = (const io_sim_t *)io;
+    u32 n = 0;
+    for (u32 i = 0; i < s->nev; i++) if (s->ev[i].kind == EV_SYNC) n++;
+    return n;
+}
+
 u8 *seg_io_sim_replay_gseq(const seg_io_t *io, u64 gseq, u64 *size_out) {
     const io_sim_t *s = (const io_sim_t *)io;
     /* find per-io prefix: events with gseq <= wanted */

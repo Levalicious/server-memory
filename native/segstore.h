@@ -43,7 +43,10 @@ typedef uint64_t u64;
 
 #define SEG_MAGIC        0x53454731u   /* "SEG1" */
 #define SEG_FORMAT_VER   1u
+#ifndef SEG_PAGE_SIZE                  /* overridable (-DSEG_PAGE_SIZE=16384u) for
+                                          the Q1 bench; default = the 4K prior */
 #define SEG_PAGE_SIZE    4096u         /* COW unit; recorded in meta (Q1 prior) */
+#endif
 #define SEG_META_PAGES   2u            /* pgno 0 and 1 */
 
 /* ------------------------------------------------------------------ *
@@ -267,6 +270,9 @@ u32 seg_io_sim_last_sync_before(const seg_io_t *io, u32 k);
  * harness cut one consistent point through several files' event logs */
 u64 seg_io_sim_gseq_now(void);
 u8 *seg_io_sim_replay_gseq(const seg_io_t *io, u64 gseq, u64 *size_out);
+/* bench accounting: total bytes written / sync count so far */
+u64 seg_io_sim_bytes_written(const seg_io_t *io);
+u32 seg_io_sim_sync_count(const seg_io_t *io);
 
 /* ------------------------------------------------------------------ *
  * segfile — one segment's lifecycle over a seg_io (seg_file.c).
