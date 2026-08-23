@@ -87,7 +87,7 @@ int main(void) {
         nm.txid = 1; nm.watermark = 3;
         assert(segfile_commit(sf, &bad_pgno, bufs, 1, &nm) == 0);
         u32 pgno = 2;
-        nm.txid = 2;                            /* txid gap: refused */
+        nm.txid = 0;                            /* not strictly forward: refused */
         assert(segfile_commit(sf, &pgno, bufs, 1, &nm) == 0);
         nm.txid = 1; nm.watermark = 1;          /* watermark shrink: refused */
         assert(segfile_commit(sf, &pgno, bufs, 1, &nm) == 0);

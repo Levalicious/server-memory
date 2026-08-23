@@ -44,7 +44,8 @@ segfile_t *segfile_create(seg_io_t *io, u16 seg_id, u16 extent_pages_log2) {
     return sf;
 }
 
-segfile_t *segfile_open(seg_io_t *io) {
+/* shared core: open selecting a slot; want_txid = (u64)-1 -> max valid */
+static segfile_t *open_select(seg_io_t *io, u64 want_txid) {
     u64 size = 0;
     const u8 *base = io->read_base(io, &size);
     if (!base || size < SEG_META_PAGES * SEG_PAGE_SIZE) return NULL;
@@ -59,7 +60,13 @@ segfile_t *segfile_open(seg_io_t *io) {
     int v0 = seg_meta_valid(&m0) && m0.watermark <= file_pages;
     int v1 = seg_meta_valid(&m1) && m1.watermark <= file_pages;
     int slot;
-    if (!v0 && !v1) return NULL;
+    if (want_txid != (u64)-1) {
+        /* manifest-directed open: exact-txid selection (cross-seg rollback
+         * of a segment that ran ahead of the store pivot) */
+        if (v0 && m0.txid == want_txid)      slot = 0;
+        else if (v1 && m1.txid == want_txid) slot = 1;
+        else return NULL;
+    } else if (!v0 && !v1) return NULL;
     else if (v0 && !v1) slot = 0;
     else if (!v0 && v1) slot = 1;
     else slot = (m1.txid > m0.txid) ? 1 : 0;
@@ -72,6 +79,9 @@ segfile_t *segfile_open(seg_io_t *io) {
     return sf;
 }
 
+segfile_t *segfile_open(seg_io_t *io)               { return open_select(io, (u64)-1); }
+segfile_t *segfile_open_at(seg_io_t *io, u64 txid)  { return open_select(io, txid); }
+
 const u8 *segfile_page(segfile_t *sf, u32 pgno) {
     if (pgno < SEG_META_PAGES || pgno >= sf->meta.watermark) return NULL;
     u64 size = 0;
@@ -83,7 +93,9 @@ const u8 *segfile_page(segfile_t *sf, u32 pgno) {
 int segfile_commit(segfile_t *sf, const u32 *pgnos, const u8 *const *bufs,
                    u32 ndirty, const seg_meta_t *next_meta) {
     if (!next_meta) return 0;
-    if (next_meta->txid != sf->meta.txid + 1) return 0;       /* txids are dense */
+    if (next_meta->txid <= sf->meta.txid) return 0;           /* strictly forward
+        (store txids are sparse per segment: a segment only advances when
+        dirtied by a store commit — mstore layer) */
     if (next_meta->watermark < sf->meta.watermark) return 0;  /* never shrinks (v1) */
     for (u32 i = 0; i < ndirty; i++) {
         if (pgnos[i] < SEG_META_PAGES) return 0;              /* meta pages sacred */

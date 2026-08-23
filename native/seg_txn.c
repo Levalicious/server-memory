@@ -184,8 +184,7 @@ bad:
     return 0;
 }
 
-segstore_t *segstore_open(seg_io_t *io) {
-    segfile_t *sf = segfile_open(io);
+static segstore_t *open_from(segfile_t *sf) {
     if (!sf) return NULL;
     segstore_t *st = st_new(sf);
     if (!st) { segfile_close(sf); return NULL; }
@@ -193,6 +192,20 @@ segstore_t *segstore_open(seg_io_t *io) {
     /* restart clears pins: everything pending is promotable */
     if (!promote_pending(st)) { segstore_close(st); return NULL; }
     return st;
+}
+
+/* NOTE: open consumes io on failure too (segfile_open* does not close io
+ * when it merely fails to select a meta, so do it here — uniform ownership) */
+segstore_t *segstore_open(seg_io_t *io) {
+    segfile_t *sf = segfile_open(io);
+    if (!sf) { io->close(io); return NULL; }
+    return open_from(sf);
+}
+
+segstore_t *segstore_open_at(seg_io_t *io, u64 txid) {
+    segfile_t *sf = segfile_open_at(io, txid);
+    if (!sf) { io->close(io); return NULL; }
+    return open_from(sf);
 }
 
 void segstore_close(segstore_t *st) {
@@ -353,6 +366,11 @@ static int wset_add(wset_t *w, u32 phys, const u8 *buf, u8 *owned) {
 }
 
 int seg_txn_commit(segstore_t *st) {
+    return seg_txn_commit_as(st, st->sf->meta.txid + 1);
+}
+
+int seg_txn_commit_as(segstore_t *st, u64 commit_txid) {
+    if (commit_txid <= st->sf->meta.txid) return 0;
     if (!st->txn_open) return 0;
     if (st->ndirty == 0 && st->nfreed == 0 &&
         st->txn_logical_pages == st->logical_pages &&
@@ -365,7 +383,7 @@ int seg_txn_commit(segstore_t *st) {
 
     int ok = 0;
     u64 wm = st->sf->meta.watermark;
-    u64 next_txid = st->sf->meta.txid + 1;
+    u64 next_txid = commit_txid;
     u32 *retire = NULL; u32 nretire = 0, retirecap = 0;
     u32 *newpt = NULL;
     wset_t w; memset(&w, 0, sizeof w);

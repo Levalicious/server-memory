@@ -100,9 +100,12 @@ typedef enum { EV_WRITE = 1, EV_SYNC = 2, EV_EXTEND = 3 } ev_kind_t;
 
 typedef struct {
     ev_kind_t kind;
+    u64       gseq;          /* global order across ALL sim ios (crash points) */
     u64       off, len;      /* WRITE: range; EXTEND: len = new size */
     u8       *bytes;         /* WRITE payload (owned) */
 } sim_ev_t;
+
+static u64 g_sim_gseq = 0;   /* process-global; single-threaded by design */
 
 typedef struct {
     seg_io_t  vt;
@@ -122,6 +125,7 @@ static sim_ev_t *sim_push(io_sim_t *s, ev_kind_t k) {
     sim_ev_t *e = &s->ev[s->nev++];
     memset(e, 0, sizeof *e);
     e->kind = k;
+    e->gseq = ++g_sim_gseq;
     return e;
 }
 
@@ -207,6 +211,16 @@ u8 *seg_io_sim_replay_prefix(const seg_io_t *io, u32 k, u64 *size_out) {
     }
     if (size_out) *size_out = size;
     return disk;
+}
+
+u64 seg_io_sim_gseq_now(void) { return g_sim_gseq; }
+
+u8 *seg_io_sim_replay_gseq(const seg_io_t *io, u64 gseq, u64 *size_out) {
+    const io_sim_t *s = (const io_sim_t *)io;
+    /* find per-io prefix: events with gseq <= wanted */
+    u32 k = 0;
+    while (k < s->nev && s->ev[k].gseq <= gseq) k++;
+    return seg_io_sim_replay_prefix(io, k, size_out);
 }
 
 u32 seg_io_sim_last_sync_before(const seg_io_t *io, u32 k) {

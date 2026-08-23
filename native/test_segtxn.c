@@ -267,7 +267,7 @@ int main(void) {
             seg_io_t *ro = io_mem(disk, size);
             segstore_t *r = segstore_open(ro);
             if (ack_ev[0] > k) {          /* pre-create crash */
-                if (r) segstore_close(r); else free(ro);
+                if (r) segstore_close(r);   /* else: open consumed ro */
                 free(disk); skipped_pre++; continue;
             }
             assert(r != NULL);

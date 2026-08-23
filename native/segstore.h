@@ -263,6 +263,10 @@ u8 *seg_io_sim_replay_prefix(const seg_io_t *io, u32 k, u64 *size_out);
 /* index of the last SYNC event < k, or event count if k covers all events;
  * helper for harness bookkeeping */
 u32 seg_io_sim_last_sync_before(const seg_io_t *io, u32 k);
+/* global event clock across ALL sim ios in the process — lets a crash
+ * harness cut one consistent point through several files' event logs */
+u64 seg_io_sim_gseq_now(void);
+u8 *seg_io_sim_replay_gseq(const seg_io_t *io, u64 gseq, u64 *size_out);
 
 /* ------------------------------------------------------------------ *
  * segfile — one segment's lifecycle over a seg_io (seg_file.c).
@@ -291,6 +295,9 @@ segfile_t *segfile_create(seg_io_t *io, u16 seg_id, u16 extent_pages_log2);
 /* Open an existing segment: pick the valid max-txid meta whose watermark
  * fits the file; NULL if neither slot is usable. */
 segfile_t *segfile_open(seg_io_t *io);
+/* manifest-directed open: select the meta slot with EXACTLY txid (rolls a
+ * ran-ahead segment back to the store pivot); NULL if no slot matches. */
+segfile_t *segfile_open_at(seg_io_t *io, u64 txid);
 
 /* RO pointer to page pgno of the committed image, NULL if pgno dead-zone
  * (meta pages) is requested via this path or out of watermark. */
@@ -344,6 +351,7 @@ typedef struct segpin { u64 txid; u32 *ptable; u64 logical_pages;
 
 segstore_t *segstore_create(seg_io_t *io, u16 seg_id, u16 extent_pages_log2);
 segstore_t *segstore_open(seg_io_t *io);
+segstore_t *segstore_open_at(seg_io_t *io, u64 txid);
 void        segstore_close(segstore_t *st);
 u64         segstore_txid(const segstore_t *st);
 u64         segstore_logical_pages(const segstore_t *st);
@@ -369,6 +377,56 @@ void seg_txn_set_roots(segstore_t *st, u32 nameindex_root, u32 indirect_root);
 /* publish: allocates physical pages (freelist/growth), writes data + ptable
  * + freelist snapshot + meta via segfile_commit. 1 = committed. */
 int  seg_txn_commit(segstore_t *st);
+/* commit with an explicit (store-assigned) txid; must be > current */
+int  seg_txn_commit_as(segstore_t *st, u64 commit_txid);
 void seg_txn_abort(segstore_t *st);
+
+/* ------------------------------------------------------------------ *
+ * mstore — multi-segment store with a manifest pivot (seg_mstore.c).
+ *
+ * Spec r2 §3 cross-segment atomicity, Q5 resolved CONSERVATIVELY: a
+ * manifest record is appended (and fsync'd) on EVERY store commit — the
+ * record is the store-level commit point. Single-segment folding is a
+ * later optimization, not a correctness feature.
+ *
+ * Why recovery always works (the dual-meta selection property): a store
+ * commit advances each dirty segment's meta by exactly one toggle, so the
+ * two meta slots of every segment always hold the last two states the
+ * store could want. The manifest's last valid record names the exact seg
+ * txid per segment; segstore_open_at selects the matching slot, rolling
+ * back any segment that ran ahead (crash after its toggle, before the
+ * manifest append). The orphaned newer slot is overwritten by the next
+ * commit (it is the inactive slot after an _at open).
+ *
+ * Manifest record (LE):
+ *   [u32 MST_MAGIC][u32 nsegs][u64 store_txid]
+ *   [(u32 seg_id, u32 pad0, u64 seg_txid) x nsegs][u32 crc32c(record sans crc)]
+ * Recovery scans forward; the last fully-valid record wins; a torn tail is
+ * ignored. Records always list ALL segments (nsegs small by design).
+ *
+ * The embedder owns file naming/opening: mstore takes one seg_io for the
+ * manifest and one per segment (index == seg_id). All ios are owned by the
+ * mstore after a successful create/open (closed by mstore_close).
+ * ------------------------------------------------------------------ */
+
+#define MST_MAGIC 0x4D535431u   /* "MST1" */
+
+typedef struct mstore mstore_t;
+
+mstore_t *mstore_create(seg_io_t *manifest_io, seg_io_t **seg_ios, u32 nsegs,
+                        u16 extent_pages_log2);
+mstore_t *mstore_open(seg_io_t *manifest_io, seg_io_t **seg_ios, u32 nsegs);
+void      mstore_close(mstore_t *ms);
+u64       mstore_txid(const mstore_t *ms);
+u32       mstore_nsegs(const mstore_t *ms);
+/* the per-segment store, for reads and txn ops */
+segstore_t *mstore_seg(mstore_t *ms, u32 seg_id);
+
+/* store-level txn: begin on all segments; ops go through seg_txn_* on the
+ * individual segments; commit = per-segment commits (dirty segments only,
+ * as store_txid+1) + manifest append (the pivot). */
+int mstore_txn_begin(mstore_t *ms);
+int mstore_txn_commit(mstore_t *ms);
+void mstore_txn_abort(mstore_t *ms);
 
 #endif /* SEGSTORE_H */
