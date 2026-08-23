@@ -217,4 +217,96 @@ int seg_meta_valid(const seg_meta_t *m);
  * both slots hold the txid-0 meta, and the slots are then identical. */
 int seg_meta_pick(const seg_meta_t *m0, const seg_meta_t *m1);
 
+/* ------------------------------------------------------------------ *
+ * seg_io — I/O vtable (seg_io.c).
+ *
+ * ALL bytes reach a segment file through this interface; there is no other
+ * write path (and no writable mmap anywhere — Insight_ROMmapPwrite...).
+ * Two implementations:
+ *   - posix: fd + PROT_READ MAP_SHARED mapping; pwrite loop; fdatasync;
+ *     ftruncate + remap on extend.
+ *   - sim:   in-memory disk image + APPEND-ONLY EVENT LOG (every write /
+ *     sync / extend). The crash harness replays event-log prefixes to
+ *     materialize every legal crash state (Design_CrashHarness_PrefixReplay).
+ *
+ * read_base() returns a pointer to the CURRENT readable image (RO mapping /
+ * sim buffer). It is invalidated by extend(); callers re-fetch after any
+ * commit that grew the file.
+ * ------------------------------------------------------------------ */
+
+typedef struct seg_io seg_io_t;
+struct seg_io {
+    /* write len bytes at absolute offset; 1 = ok, 0 = I/O error */
+    int (*write)(seg_io_t *io, const void *buf, u64 len, u64 off);
+    /* durability barrier (fdatasync); 1 = ok */
+    int (*sync)(seg_io_t *io);
+    /* grow the file to new_size bytes (zero-filled); 1 = ok */
+    int (*extend)(seg_io_t *io, u64 new_size);
+    /* current readable image; *size_out = current file size */
+    const u8 *(*read_base)(seg_io_t *io, u64 *size_out);
+    void (*close)(seg_io_t *io);   /* frees io */
+};
+
+seg_io_t *seg_io_posix_open(const char *path, int create);
+
+/* sim: fresh empty "file" with event recording */
+seg_io_t *seg_io_sim_open(void);
+/* number of recorded events so far */
+u32 seg_io_sim_event_count(const seg_io_t *io);
+/* materialize the disk image as of event prefix [0, k): a legal crash state
+ * under an in-order device. Caller frees via free(). *size_out = file size
+ * at that point. */
+u8 *seg_io_sim_replay_prefix(const seg_io_t *io, u32 k, u64 *size_out);
+/* index of the last SYNC event < k, or event count if k covers all events;
+ * helper for harness bookkeeping */
+u32 seg_io_sim_last_sync_before(const seg_io_t *io, u32 k);
+
+/* ------------------------------------------------------------------ *
+ * segfile — one segment's lifecycle over a seg_io (seg_file.c).
+ *
+ * Commit protocol (spec r2 §3):
+ *   1. extend file if watermark grew (extent-cluster-rounded)
+ *   2. write every dirty page at pgno * SEG_PAGE_SIZE
+ *   3. sync                                  <- data barrier
+ *   4. seal + write new meta to the INACTIVE slot
+ *   5. sync                                  <- commit point
+ *   6. flip active slot in memory
+ * Crash before (5) completes => the old meta wins recovery. Crash after all
+ * of (4)'s bytes landed may legally recover the NEW txid (see harness).
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    seg_io_t  *io;         /* owned: segfile_close closes it */
+    seg_meta_t meta;       /* active (last committed) meta */
+    int        active_slot;
+} segfile_t;
+
+/* Create a fresh segment: both meta slots hold the sealed txid-0 meta,
+ * synced. Returns opened segfile (caller segfile_close's it). */
+segfile_t *segfile_create(seg_io_t *io, u16 seg_id, u16 extent_pages_log2);
+
+/* Open an existing segment: pick the valid max-txid meta whose watermark
+ * fits the file; NULL if neither slot is usable. */
+segfile_t *segfile_open(seg_io_t *io);
+
+/* RO pointer to page pgno of the committed image, NULL if pgno dead-zone
+ * (meta pages) is requested via this path or out of watermark. */
+const u8 *segfile_page(segfile_t *sf, u32 pgno);
+
+/* Commit: dirty pages (pgno[i] -> page image bufs[i], each SEG_PAGE_SIZE
+ * bytes), plus the successor meta (txid/watermark/roots set by caller;
+ * seal is done here). Meta pgnos (0,1) are refused as dirty pages.
+ * 1 = committed; 0 = I/O error or invalid args (state unchanged: the
+ * in-memory meta only advances after the commit-point sync succeeds).
+ *
+ * COW DISCIPLINE (caller obligation, enforced by the txn layer above):
+ * a dirty pgno must NOT be reachable from the last committed meta — a crash
+ * between the data write and the commit point would otherwise tear the OLD
+ * state. Fresh pages and freelist-reclaimed pages (retired, no live pin)
+ * are the only legal targets. segfile itself cannot check reachability. */
+int segfile_commit(segfile_t *sf, const u32 *pgnos, const u8 *const *bufs,
+                   u32 ndirty, const seg_meta_t *next_meta);
+
+void segfile_close(segfile_t *sf);
+
 #endif /* SEGSTORE_H */
