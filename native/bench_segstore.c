@@ -47,6 +47,7 @@ static u64 med(u64 *v, u32 n) { qsort(v, n, 8, cmp_u64); return v[n / 2]; }
  * pages filled to natural density for the build's page size. */
 static const u64 BENCH_SEED = 0x9e3779b97f4a7c15ull;
 static u64 g_lpages;                     /* pages the prefill produced */
+static volatile u64 sink;                /* defeat DCE in read benches */
 
 static void prefill(segstore_t *st, u64 nents) {
     /* 70% fill factor: a live store's pages carry slack (compaction headroom,
@@ -145,6 +146,68 @@ int main(void) {
                (unsigned long long)N, (unsigned long long)g_lpages,
                (unsigned long long)med(cyc, ITERS), per_commit, amp,
                (unsigned long long)med(rcyc, 20), (double)size / 1e6);
+
+        /* ---- per-op costs (batched: B ops/sample, p50 of 30 samples) ---- */
+        {
+            enum { B = 256, S = 30 };
+            u64 sm[S];
+            /* committed read: ptable lookup + mapping pointer */
+            for (u32 s2 = 0; s2 < S; s2++) {
+                u64 t0 = rdtsc_s();
+                for (u32 i = 0; i < B; i++) {
+                    const u8 *p = segstore_read(st, (u32)(rng() % g_lpages));
+                    if (p) sink += p[SEG_PAGE_HDR_SIZE];
+                }
+                sm[s2] = (rdtsc_e() - t0) / B;
+            }
+            u64 c_read = med(sm, S);
+            /* pin_read via a live pin */
+            segpin_t *pin = seg_pin(st);
+            for (u32 s2 = 0; s2 < S; s2++) {
+                u64 t0 = rdtsc_s();
+                for (u32 i = 0; i < B; i++) {
+                    const u8 *p = seg_pin_read(st, pin, (u32)(rng() % g_lpages));
+                    if (p) sink += p[SEG_PAGE_HDR_SIZE];
+                }
+                sm[s2] = (rdtsc_e() - t0) / B;
+            }
+            u64 c_pinread = med(sm, S);
+            seg_unpin(st, pin);
+            /* pin+unpin pair (ptable memcpy: scales with N) */
+            for (u32 s2 = 0; s2 < S; s2++) {
+                u64 t0 = rdtsc_s();
+                for (u32 i = 0; i < 8; i++) {
+                    segpin_t *p = seg_pin(st);
+                    seg_unpin(st, p);
+                }
+                sm[s2] = (rdtsc_e() - t0) / 8;
+            }
+            u64 c_pin = med(sm, S);
+            /* first-touch (COW compact copy), 64 distinct pages/txn then abort */
+            for (u32 s2 = 0; s2 < S; s2++) {
+                seg_txn_begin(st);
+                u64 t0 = rdtsc_s();
+                for (u32 i = 0; i < 64; i++)
+                    (void)seg_txn_touch(st, (u32)((rng() % g_lpages)));
+                sm[s2] = (rdtsc_e() - t0) / 64;
+                seg_txn_abort(st);
+            }
+            u64 c_touch = med(sm, S);
+            /* alloc fresh page, txn aborted (no I/O) */
+            for (u32 s2 = 0; s2 < S; s2++) {
+                seg_txn_begin(st);
+                u64 t0 = rdtsc_s();
+                u32 l2;
+                for (u32 i = 0; i < 64; i++) (void)seg_txn_alloc(st, SEG_KIND_ENTITY, &l2);
+                sm[s2] = (rdtsc_e() - t0) / 64;
+                seg_txn_abort(st);
+            }
+            u64 c_alloc = med(sm, S);
+            printf("  per-op p50 cyc: read %llu | pin_read %llu | touch(COW) %llu | alloc %llu | pin+unpin %llu\n",
+                   (unsigned long long)c_read, (unsigned long long)c_pinread,
+                   (unsigned long long)c_touch, (unsigned long long)c_alloc,
+                   (unsigned long long)c_pin);
+        }
         segstore_close(st);
     }
 
