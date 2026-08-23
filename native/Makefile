@@ -11,13 +11,20 @@ CFLAGS = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 LIBS = -lm
 OUT = /tmp/mf_test
 
-.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta bench proofs proofs-eva wp-segmeta clean
+.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage bench proofs proofs-eva wp-segmeta clean
 
 # `make test` = prove the detector fires, then run every harness with it active.
-test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta
+test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage
 
 test_segmeta: test_segmeta.c seg_meta.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_segmeta && $(OUT)_segmeta
+
+test_segpage: test_segpage.c seg_page.c
+	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_segpage && $(OUT)_segpage
+
+# WP + RTE over the slotted page module (libsegstore proof target #2).
+wp-segpage:
+	frama-c -wp -wp-rte -wp-timeout 20 seg_page.c -cpp-extra-args="-I."
 
 # WP + RTE over the dual-meta recovery pivot (libsegstore proof target #1).
 # The sole assumed obligation is meta_body_crc's ensures (crc trust boundary).

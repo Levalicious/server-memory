@@ -141,6 +141,54 @@ typedef struct __attribute__((packed)) {
 #define SEG_KIND_EXTENT    7u   /* pages owned by an extent record (multi-page runs) */
 
 /* ------------------------------------------------------------------ *
+ * Slotted page module (seg_page.c) — proof target #2.
+ *
+ * All functions operate on a SEG_PAGE_SIZE byte buffer (the owner's heap
+ * working copy under COW, or a const view into the RO mapping). None do I/O.
+ *
+ * Free-space model: insert bumps rec_floor down; delete/shrink leave garbage
+ * in record space (rec_floor is a low-watermark, not a live-bytes tracker).
+ * seg_page_compact — used on every COW touch — rewrites tight, so garbage is
+ * transaction-local by construction (Decision_SlottedFormatTypeAffinity).
+ *
+ * Slot ids are stable across compaction (only record OFFSETS move); interior
+ * dead slots persist until they can be reused; trailing dead slots are
+ * trimmed by compact.
+ * ------------------------------------------------------------------ */
+
+void seg_page_init(u8 *pg, u16 kind_hint);
+
+/* Structural well-formedness audit: header bounds, every live slot inside
+ * [rec_floor, SEG_PAGE_SIZE), no live slot overlaps the slot array. 1 = ok. */
+int seg_page_validate(const u8 *pg);
+
+/* Contiguous free bytes available to insert (accounts for the slot entry a
+ * fresh insert may need). */
+u32 seg_page_free_space(const u8 *pg);
+
+/* Record pointer + size for a live slot; NULL if slot dead or out of range. */
+const u8 *seg_page_read(const u8 *pg, u16 slot, u16 *size_out);
+
+/* Insert a record (1 <= size <= SEG_PAGE_MAX_REC); reuses the lowest dead
+ * slot else appends one. 1 = ok (*slot_out set), 0 = page full. */
+int seg_page_insert(u8 *pg, const u8 *rec, u16 size, u16 *slot_out);
+
+/* Replace a live slot's record. Same-size: in place. Shrink: in place, slot
+ * size updated (tail bytes become garbage). Grow: needs contiguous free
+ * space for the new copy. 1 = ok, 0 = no space / dead slot / bad size. */
+int seg_page_update(u8 *pg, u16 slot, const u8 *rec, u16 size);
+
+/* Mark a live slot dead. 1 = ok, 0 = already dead / out of range. */
+int seg_page_delete(u8 *pg, u16 slot);
+
+/* Copy-compact src into dst (both SEG_PAGE_SIZE buffers, non-overlapping):
+ * live records packed tight against page end, slot ids preserved, trailing
+ * dead slots trimmed, garbage dropped, free gap zeroed. THE COW-touch
+ * primitive. 1 = ok; 0 = src fails validation or live records alias
+ * (corruption — dst contents undefined, caller must not publish). */
+int seg_page_compact(u8 *dst, const u8 *src);
+
+/* ------------------------------------------------------------------ *
  * crc32c (Castagnoli, software table; dep-free per D_NoExternalDependence)
  * ------------------------------------------------------------------ */
 
