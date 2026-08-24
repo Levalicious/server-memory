@@ -613,6 +613,22 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(names).toContain('Child2');
     });
 
+    it('omitted depth must equal the schema default (0 = immediate only)', async () => {
+      // Bug_DepthDefaultMismatch_2026_08_23: the handler defaulted to 1 while
+      // the tool schema advertises 0, so omitted-depth calls silently returned
+      // TWO-hop neighborhoods. This pins the default path itself — the
+      // explicit-depth tests above cannot catch a default divergence.
+      const result = await callTool(client, 'get_neighbors', {
+        entityName: 'Root'
+      }) as PaginatedResult<Neighbor>;
+
+      expect(result.items).toHaveLength(2);
+      const names = result.items.map(n => n.name);
+      expect(names).toContain('Child1');
+      expect(names).toContain('Child2');
+      expect(names).not.toContain('Grandchild');
+    });
+
     it('should get neighbors at depth 1 (includes neighbors of neighbors)', async () => {
       const result = await callTool(client, 'get_neighbors', {
         entityName: 'Root',
