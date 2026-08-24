@@ -5,6 +5,9 @@
  * Adjacency lands in the next module; adj_ref is carried but unused here.
  */
 #include "segstore.h"
+#include "regex.h"
+#include "re_dfa.h"
+#include "re_trigram.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -24,11 +27,24 @@ struct graph4 {
     segstore_t *gs;         /* graph segment */
     st4_t      *st;         /* strings layer (owned) */
     u32 last_adj_page;      /* ADJ insertion affinity; SEG_PT_NONE = none */
+    /* trigram prefilter (lazy; dirty-set decoupled from writes) */
+    ReTrigramLive *tri; int tri_built;
+    u32 *tri_dirty; u8 *tri_dirty_op; u32 tri_dcap, tri_dcnt;
+    /* type index: open-addr type_sid -> eid postings (lazy, O(1) maint) */
+    struct tpost { u32 type_sid; u32 *eids; u32 n, cap; } *tidx;
+    u32 tidx_cap, tidx_n; int tidx_built;
     u32 ni_dir_lpg;         /* directory page lpg + 1; 0 = none (mirror of meta) */
     u32 ni_npages;          /* cached from directory */
     u32 ent_count;          /* live entities (rebuilt at open) */
     u32 last_ent_page;      /* insertion affinity; SEG_PT_NONE = none */
 };
+
+#define TRI_OP_REINDEX 1u
+#define TRI_OP_REMOVE  2u
+
+static void tri_mark(graph4_t *g, u32 eid, u8 op);
+static int  tidx_add(graph4_t *g, u32 type_sid, u32 eid);
+static void tidx_remove(graph4_t *g, u32 type_sid, u32 eid);
 
 /* ---------- LE helpers ---------- */
 static u32  g4ld32(const u8 *p) { return (u32)p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24); }
@@ -305,6 +321,12 @@ graph4_t *graph4_open(mstore_t *ms) {
 
 void graph4_close(graph4_t *g) {
     if (!g) return;
+    if (g->tri) re_trigram_live_free(g->tri);
+    free(g->tri_dirty); free(g->tri_dirty_op);
+    if (g->tidx) {
+        for (u32 i = 0; i < g->tidx_cap; i++) free(g->tidx[i].eids);
+        free(g->tidx);
+    }
     st4_close(g->st);
     free(g);
 }
@@ -346,6 +368,8 @@ u32 g4_create_entity(graph4_t *g, const u8 *name, u16 nlen,
     u32 eid = EID_MAKE(lpg, slot);
     if (!ni_insert(g, name_sid, eid)) return 0;
     g->ent_count++;
+    tri_mark(g, eid, TRI_OP_REINDEX);
+    tidx_add(g, type_sid, eid);
     return eid;
 }
 
@@ -374,6 +398,8 @@ int g4_delete_entity(graph4_t *g, u32 eid) {
     u8 *pg = seg_txn_touch(g->gs, EID_LPG(eid));
     if (!pg || !seg_page_delete(pg, (u16)EID_SLOT(eid))) return 0;
     g->ent_count--;
+    tri_mark(g, eid, TRI_OP_REMOVE);
+    tidx_remove(g, e.type_sid, eid);
     return 1;
 }
 
@@ -401,6 +427,7 @@ int g4_add_observation(graph4_t *g, u32 eid, const u8 *obs, u16 len, u64 mtime) 
     else                  g4st32(r + 36, sid);
     r[40] = (u8)(e.obs_count + 1);
     g4st64(r + 24, mtime);                               /* obs_mtime */
+    tri_mark(g, eid, TRI_OP_REINDEX);
     return 1;
 }
 
@@ -424,6 +451,7 @@ int g4_remove_observation(graph4_t *g, u32 eid, const u8 *obs, u16 len, u64 mtim
     r[40] = (u8)(e.obs_count - 1);
     g4st64(r + 24, mtime);
     st4_decref(g->st, sid);
+    tri_mark(g, eid, TRI_OP_REINDEX);
     return 1;
 }
 
@@ -897,4 +925,304 @@ done:
     free(ff); free(bf);
     pmap_free(&sf); pmap_free(&sb);
     return result;
+}
+
+/* ================= indexes + search ================= */
+
+#define G4_DFA_MIN_VERIFY 128u
+
+/* ---- dirty set (eid -> op, last-wins; open addressing) ---- */
+
+static void tri_mark(graph4_t *g, u32 eid, u8 op) {
+    if (!g->tri_built) return;                /* index not built: nothing to catch up */
+    if ((u64)(g->tri_dcnt + 1) * 10 >= (u64)g->tri_dcap * 7) {
+        u32 ncap = g->tri_dcap ? g->tri_dcap * 2 : 256;
+        u32 *nk = (u32 *)calloc(ncap, 4);
+        u8  *no = (u8 *)calloc(ncap, 1);
+        if (!nk || !no) { free(nk); free(no); g->tri_built = 0; return; }  /* degrade: full rebuild */
+        for (u32 i = 0; i < g->tri_dcap; i++) if (g->tri_dirty[i]) {
+            u32 s = (u32)(((u64)g->tri_dirty[i] * 0x9E3779B97F4A7C15ull) >> 32) & (ncap - 1);
+            while (nk[s]) s = (s + 1) & (ncap - 1);
+            nk[s] = g->tri_dirty[i]; no[s] = g->tri_dirty_op[i];
+        }
+        free(g->tri_dirty); free(g->tri_dirty_op);
+        g->tri_dirty = nk; g->tri_dirty_op = no; g->tri_dcap = ncap;
+    }
+    u32 s = (u32)(((u64)eid * 0x9E3779B97F4A7C15ull) >> 32) & (g->tri_dcap - 1);
+    while (g->tri_dirty[s] && g->tri_dirty[s] != eid) s = (s + 1) & (g->tri_dcap - 1);
+    if (!g->tri_dirty[s]) { g->tri_dirty[s] = eid; g->tri_dcnt++; }
+    g->tri_dirty_op[s] = op;                  /* last write wins */
+}
+
+/* index one entity's field union into the live trigram index */
+static void tri_index_entity(graph4_t *g, u32 eid) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e)) { re_trigram_live_remove(g->tri, eid); return; }
+    const char *fields[4]; size_t lens[4]; int nf = 0;
+    u16 len;
+    const u8 *b;
+    if ((b = st4_get(g->st, e.name_sid, &len))) { fields[nf] = (const char *)b; lens[nf++] = len; }
+    if ((b = st4_get(g->st, e.type_sid, &len))) { fields[nf] = (const char *)b; lens[nf++] = len; }
+    if (e.obs_count >= 1 && (b = st4_get(g->st, e.obs0_sid, &len))) { fields[nf] = (const char *)b; lens[nf++] = len; }
+    if (e.obs_count >= 2 && (b = st4_get(g->st, e.obs1_sid, &len))) { fields[nf] = (const char *)b; lens[nf++] = len; }
+    re_trigram_live_set(g->tri, eid, fields, lens, nf);
+}
+
+void g4_index_sync(graph4_t *g) {
+    if (!g->tri_built) {
+        if (g->tri) re_trigram_live_free(g->tri);
+        g->tri = re_trigram_live_new();
+        if (!g->tri) return;
+        u32 cap = ni_capacity(g);
+        for (u32 i = 0; i < cap; i++) {
+            u32 ns, ei;
+            if (!ni_get(g, i, &ns, &ei)) break;
+            if (ns) tri_index_entity(g, ei);
+        }
+        g->tri_built = 1;
+        g->tri_dcnt = 0;
+        if (g->tri_dirty) memset(g->tri_dirty, 0, (size_t)g->tri_dcap * 4);
+        return;
+    }
+    if (!g->tri_dcnt) return;
+    for (u32 i = 0; i < g->tri_dcap; i++) {
+        if (!g->tri_dirty[i]) continue;
+        u32 eid = g->tri_dirty[i];
+        if (g->tri_dirty_op[i] == TRI_OP_REMOVE) re_trigram_live_remove(g->tri, eid);
+        else tri_index_entity(g, eid);
+    }
+    memset(g->tri_dirty, 0, (size_t)g->tri_dcap * 4);
+    memset(g->tri_dirty_op, 0, g->tri_dcap);
+    g->tri_dcnt = 0;
+}
+
+/* ---- type index ---- */
+
+static struct tpost *tidx_slot(graph4_t *g, u32 type_sid) {
+    u32 i = (u32)(((u64)type_sid * 0x9E3779B97F4A7C15ull) >> 32) & (g->tidx_cap - 1);
+    while (g->tidx[i].type_sid && g->tidx[i].type_sid != type_sid)
+        i = (i + 1) & (g->tidx_cap - 1);
+    return &g->tidx[i];
+}
+
+static int tidx_add(graph4_t *g, u32 type_sid, u32 eid) {
+    if (!g->tidx_built) return 1;
+    if ((g->tidx_n + 1) * 4 >= g->tidx_cap * 3) {
+        u32 ncap = g->tidx_cap ? g->tidx_cap * 2 : 64;
+        struct tpost *nt = (struct tpost *)calloc(ncap, sizeof *nt);
+        if (!nt) { g->tidx_built = 0; return 1; }          /* degrade */
+        struct tpost *old = g->tidx; u32 ocap = g->tidx_cap;
+        g->tidx = nt; g->tidx_cap = ncap;
+        for (u32 i = 0; i < ocap; i++) if (old[i].type_sid) {
+            struct tpost *s = tidx_slot(g, old[i].type_sid);
+            *s = old[i];
+        }
+        free(old);
+    }
+    struct tpost *p = tidx_slot(g, type_sid);
+    if (!p->type_sid) { p->type_sid = type_sid; g->tidx_n++; }
+    return g4push(&p->eids, &p->n, &p->cap, eid);
+}
+
+static void tidx_remove(graph4_t *g, u32 type_sid, u32 eid) {
+    if (!g->tidx_built || !g->tidx_cap) return;
+    struct tpost *p = tidx_slot(g, type_sid);
+    if (!p->type_sid) return;
+    for (u32 i = 0; i < p->n; i++)
+        if (p->eids[i] == eid) { p->eids[i] = p->eids[--p->n]; return; }
+}
+
+static void tidx_build(graph4_t *g) {
+    if (g->tidx_built) return;
+    g->tidx_built = 1;                        /* set first: tidx_add is gated on it */
+    u32 cap = ni_capacity(g);
+    for (u32 i = 0; i < cap; i++) {
+        u32 ns, ei;
+        if (!ni_get(g, i, &ns, &ei)) break;
+        if (!ns) continue;
+        g4_entity_t e;
+        if (g4_read_entity(g, ei, &e))
+            if (!tidx_add(g, e.type_sid, ei)) { g->tidx_built = 0; return; }
+    }
+}
+
+u32 g4_entities_by_type(graph4_t *g, const u8 *type, u16 tlen, u32 *out, u32 max) {
+    u32 sid = st4_find(g->st, type, tlen);
+    if (!sid) return 0;
+    tidx_build(g);
+    if (g->tidx_built && g->tidx_cap) {
+        struct tpost *p = tidx_slot(g, sid);
+        if (!p->type_sid) return 0;
+        for (u32 i = 0; i < p->n && i < max; i++) out[i] = p->eids[i];
+        return p->n;
+    }
+    /* sound fallback: O(N) scan */
+    u32 n = 0, cap = ni_capacity(g);
+    for (u32 i = 0; i < cap; i++) {
+        u32 ns, ei;
+        if (!ni_get(g, i, &ns, &ei)) break;
+        if (!ns) continue;
+        g4_entity_t e;
+        if (g4_read_entity(g, ei, &e) && e.type_sid == sid) {
+            if (n < max) out[n] = ei;
+            n++;
+        }
+    }
+    return n;
+}
+
+u32 g4_entity_types(graph4_t *g, u32 *out_sids, u32 max) {
+    tidx_build(g);
+    u32 n = 0;
+    if (g->tidx_built) {
+        for (u32 i = 0; i < g->tidx_cap; i++)
+            if (g->tidx[i].type_sid && g->tidx[i].n > 0) {
+                if (n < max) out_sids[n] = g->tidx[i].type_sid;
+                n++;
+            }
+        return n;
+    }
+    /* fallback: scan with local dedup */
+    u32 cap = ni_capacity(g);
+    for (u32 i = 0; i < cap; i++) {
+        u32 ns, ei;
+        if (!ni_get(g, i, &ns, &ei)) break;
+        if (!ns) continue;
+        g4_entity_t e;
+        if (!g4_read_entity(g, ei, &e)) continue;
+        int dup = 0;
+        for (u32 k = 0; k < n && k < max; k++) if (out_sids[k] == e.type_sid) { dup = 1; break; }
+        if (dup) continue;
+        if (n < max) out_sids[n] = e.type_sid;
+        n++;
+    }
+    return n;
+}
+
+u32 g4_relation_types(graph4_t *g, u32 *out_sids, u32 max) {
+    /* O(E) sweep of FORWARD entries with dedup via a small open set */
+    u32 setcap = 256, setn = 0;
+    u32 *set = (u32 *)calloc(setcap, 4);
+    if (!set) return 0;
+    u32 cap = ni_capacity(g);
+    for (u32 i = 0; i < cap; i++) {
+        u32 ns, ei;
+        if (!ni_get(g, i, &ns, &ei)) break;
+        if (!ns) continue;
+        g4_entity_t e;
+        if (!g4_read_entity(g, ei, &e)) continue;
+        u32 aref = e.adj_ref;
+        while (aref) {
+            adj_view_t v;
+            if (!adj_view(g, aref, &v)) break;
+            for (u32 k = 0; k < v.count; k++) {
+                g4_edge_t ed;
+                adj_ent_decode(v.ents + k * ADJ_ENT, &ed);
+                if (ed.direction != G4_DIR_FORWARD) continue;
+                if ((setn + 1) * 4 >= setcap * 3) {
+                    u32 nc = setcap * 2;
+                    u32 *nset = (u32 *)calloc(nc, 4);
+                    if (!nset) { free(set); return setn; }
+                    for (u32 x = 0; x < setcap; x++) if (set[x]) {
+                        u32 s = (u32)(((u64)set[x] * 0x9E3779B97F4A7C15ull) >> 32) & (nc - 1);
+                        while (nset[s]) s = (s + 1) & (nc - 1);
+                        nset[s] = set[x];
+                    }
+                    free(set); set = nset; setcap = nc;
+                }
+                u32 s = (u32)(((u64)ed.rel_sid * 0x9E3779B97F4A7C15ull) >> 32) & (setcap - 1);
+                while (set[s] && set[s] != ed.rel_sid) s = (s + 1) & (setcap - 1);
+                if (!set[s]) { set[s] = ed.rel_sid; setn++; }
+            }
+            aref = v.next;
+        }
+    }
+    u32 n = 0;
+    for (u32 i = 0; i < setcap; i++)
+        if (set[i]) { if (n < max) out_sids[n] = set[i]; n++; }
+    free(set);
+    return n;
+}
+
+u32 g4_orphaned(graph4_t *g, u32 *out, u32 max) {
+    u32 n = 0, cap = ni_capacity(g);
+    for (u32 i = 0; i < cap; i++) {
+        u32 ns, ei;
+        if (!ni_get(g, i, &ns, &ei)) break;
+        if (!ns) continue;
+        g4_entity_t e;
+        if (g4_read_entity(g, ei, &e) && e.adj_ref == 0) {
+            if (n < max) out[n] = ei;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* ---- search ---- */
+
+int g4_regex_valid(const char *pattern) {
+    const char *err = NULL;
+    ReNode *ast = re_parse(pattern, &err);
+    if (!ast) return 0;
+    re_ast_free(ast);
+    return 1;
+}
+
+static int g4_match_sid(graph4_t *g, const ReDfa *d, const Regex *re, u32 sid) {
+    if (!sid) return 0;
+    u16 len = 0;
+    const u8 *b = st4_get(g->st, sid, &len);
+    if (!b) return 0;
+    return d ? re_dfa_search(d, (const char *)b, len)
+             : re_search(re, (const char *)b, len);
+}
+
+static int g4_entity_matches(graph4_t *g, const ReDfa *d, const Regex *re, u32 eid) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e)) return 0;
+    return g4_match_sid(g, d, re, e.name_sid)
+        || g4_match_sid(g, d, re, e.type_sid)
+        || (e.obs_count >= 1 && g4_match_sid(g, d, re, e.obs0_sid))
+        || (e.obs_count >= 2 && g4_match_sid(g, d, re, e.obs1_sid));
+}
+
+u32 g4_search(graph4_t *g, const char *pattern, u32 *out, u32 max) {
+    const char *err = NULL;
+    ReNode *ast = re_parse(pattern, &err);
+    if (!ast) return 0;
+    Regex *re = re_compile_ast(ast);
+    if (!re) { re_ast_free(ast); return 0; }
+
+    g4_index_sync(g);
+
+    ReTrigramQuery *q = re_trigram_build(ast);
+    ReCandidates64 cand;
+    cand.ids = NULL; cand.n = 0; cand.all = 1;
+    if (g->tri_built) cand = re_trigram_live_eval(q, g->tri);
+
+    u32 nverify = cand.all ? g->ent_count : cand.n;
+    ReDfa *d = (nverify >= G4_DFA_MIN_VERIFY) ? re_dfa_build(re) : NULL;
+
+    u32 found = 0;
+    if (cand.all) {
+        u32 cap = ni_capacity(g);
+        for (u32 i = 0; i < cap; i++) {
+            u32 ns, ei;
+            if (!ni_get(g, i, &ns, &ei)) break;
+            if (!ns) continue;
+            if (g4_entity_matches(g, d, re, ei)) { if (found < max) out[found] = ei; found++; }
+        }
+    } else {
+        for (u32 i = 0; i < cand.n; i++) {
+            u32 ei = (u32)cand.ids[i];
+            if (g4_entity_matches(g, d, re, ei)) { if (found < max) out[found] = ei; found++; }
+        }
+    }
+    re_candidates64_free(&cand);
+    re_trigram_free(q);
+    if (d) re_dfa_free(d);
+    re_free(re);
+    re_ast_free(ast);
+    return found;
 }

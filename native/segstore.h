@@ -530,6 +530,21 @@ u32 g4_neighbors(graph4_t *g, u32 start, u32 depth, u32 direction,
 u32 g4_find_path(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
                  u32 *out_path, u32 max_path);
 
+/* ---- indexes + search (minimal-core port: trigram prefilter decoupled
+ * from writes via dirty-set, type index O(1)-maintained, both owner-private
+ * in-memory, rebuilt lazily — sound under the single-writer owner) ----
+ * g4_search: own regex engine over name|type|obs0|obs1 (v3 semantics),
+ * trigram-prefiltered, DFA-verified when the candidate set is large.
+ * Returns TRUE match count; out gets min(count, max) eids. */
+u32 g4_search(graph4_t *g, const char *pattern, u32 *out, u32 max);
+int g4_regex_valid(const char *pattern);
+/* bring indexes current (deferred from writes); search calls it itself */
+void g4_index_sync(graph4_t *g);
+u32 g4_entities_by_type(graph4_t *g, const u8 *type, u16 tlen, u32 *out, u32 max);
+u32 g4_entity_types(graph4_t *g, u32 *out_sids, u32 max);   /* distinct type sids */
+u32 g4_relation_types(graph4_t *g, u32 *out_sids, u32 max); /* distinct rel sids (O(E) scan) */
+u32 g4_orphaned(graph4_t *g, u32 *out, u32 max);            /* eids with no edges */
+
 /* ------------------------------------------------------------------ *
  * mstore — multi-segment store with a manifest pivot (seg_mstore.c).
  *

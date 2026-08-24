@@ -7,6 +7,7 @@
  * lookup by name, enumeration = live set.
  */
 #include "segstore.h"
+#include "regex.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -559,6 +560,137 @@ int main(void) {
                     assert(ok);
                 }
             }
+        }
+        assert(mstore_txn_commit(ms));
+        graph4_close(g); mstore_close(ms);
+    }
+    PASS();
+
+    TEST(search_and_type_index_basics);
+    {
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        u32 a = g4_create_entity(g, (const u8 *)"NetworkNotNotepad", 17, (const u8 *)"principle", 9, 1);
+        u32 b = g4_create_entity(g, (const u8 *)"Melting", 7, (const u8 *)"process", 7, 2);
+        u32 c = g4_create_entity(g, (const u8 *)"MeltingSession_X", 16, (const u8 *)"process", 7, 3);
+        assert(a && b && c);
+        assert(g4_add_observation(g, a, (const u8 *)"graph structure IS meaning", 26, 4));
+        u32 out[8]; u32 n;
+        /* literal + prefiltered */
+        n = g4_search(g, "Melting", out, 8);
+        assert(n == 2);
+        n = g4_search(g, "^Melting$", out, 8);
+        assert(n == 1 && out[0] == b);
+        /* obs text is searchable */
+        n = g4_search(g, "structure IS", out, 8);
+        assert(n == 1 && out[0] == a);
+        /* type text is searchable */
+        n = g4_search(g, "principle", out, 8);
+        assert(n == 1 && out[0] == a);
+        /* unfilterable (short) pattern: full-scan path */
+        n = g4_search(g, "Mx|Se", out, 8);
+        assert(n == 1 && out[0] == c);
+        /* invalid pattern */
+        assert(g4_search(g, "([unclosed", out, 8) == 0);
+        assert(g4_regex_valid("a(b|c)*d") == 1);
+        assert(g4_regex_valid("([bad") == 0);
+        /* writes AFTER a search must be caught by the dirty set */
+        u32 d2 = g4_create_entity(g, (const u8 *)"LateArrival_Melting", 19, (const u8 *)"late", 4, 9);
+        assert(d2);
+        n = g4_search(g, "Melting", out, 8);
+        assert(n == 3);
+        assert(g4_delete_entity(g, b));
+        n = g4_search(g, "Melting", out, 8);
+        assert(n == 2);
+        /* type index */
+        n = g4_entities_by_type(g, (const u8 *)"process", 7, out, 8);
+        assert(n == 1 && out[0] == c);                     /* b deleted */
+        n = g4_entities_by_type(g, (const u8 *)"absent", 6, out, 8);
+        assert(n == 0);
+        u32 sids[8];
+        n = g4_entity_types(g, sids, 8);
+        assert(n == 3);                                    /* principle, process, late */
+        assert(mstore_txn_commit(ms));
+        graph4_close(g); mstore_close(ms);
+    }
+    PASS();
+
+    TEST(relation_types_and_orphans);
+    {
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        u32 a = g4_create_entity(g, (const u8 *)"a", 1, (const u8 *)"t", 1, 1);
+        u32 b = g4_create_entity(g, (const u8 *)"b", 1, (const u8 *)"t", 1, 2);
+        u32 c = g4_create_entity(g, (const u8 *)"c", 1, (const u8 *)"t", 1, 3);
+        assert(g4_create_relation(g, a, b, (const u8 *)"REL_X", 5, 1));
+        assert(g4_create_relation(g, b, a, (const u8 *)"REL_Y", 5, 2));
+        u32 sids[8]; u32 out[8];
+        assert(g4_relation_types(g, sids, 8) == 2);
+        u32 n = g4_orphaned(g, out, 8);
+        assert(n == 1 && out[0] == c);
+        assert(mstore_txn_commit(ms));
+        graph4_close(g); mstore_close(ms);
+    }
+    PASS();
+
+    TEST(fuzz_search_vs_bruteforce);
+    {
+        /* soundness: trigram-prefiltered search == brute regex over all
+         * entities, across mutation churn. Patterns chosen to exercise
+         * filterable AND unfilterable paths. */
+        enum { NENT2 = 120, ROUNDS = 40 };
+        static const char *pats[] = {
+            "Node_1", "Node_.[0-9]", "alpha", "beta|gamma", "^Node_7",
+            "a.c", "obs.*text", "^x$", "Node_1[0-9]$", "(al|be)pha?"
+        };
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        static int  alive[NENT2]; static u32 ids[NENT2];
+        static char nm2[NENT2][32];
+        memset(alive, 0, sizeof alive);
+        for (u32 r = 0; r < ROUNDS; r++) {
+            /* mutate a handful */
+            for (u32 m = 0; m < 12; m++) {
+                u32 i = (u32)(rng() % NENT2);
+                if (!alive[i]) {
+                    const char *flavors[3] = { "alpha", "beta", "gamma" };
+                    snprintf(nm2[i], sizeof nm2[i], "Node_%u_%s", i, flavors[rng() % 3]);
+                    ids[i] = g4_create_entity(g, (const u8 *)nm2[i], (u16)strlen(nm2[i]),
+                                              (const u8 *)"fz", 2, r);
+                    assert(ids[i]); alive[i] = 1;
+                    if (rng() % 3 == 0)
+                        g4_add_observation(g, ids[i], (const u8 *)"obs some text", 13, r);
+                } else if (rng() % 2) {
+                    assert(g4_delete_entity(g, ids[i]));
+                    alive[i] = 0;
+                }
+            }
+            /* verify one random pattern against brute force */
+            const char *pat = pats[rng() % (sizeof pats / sizeof *pats)];
+            u32 out2[NENT2]; u32 n = g4_search(g, pat, out2, NENT2);
+            /* brute: run engine over each live entity's fields */
+            const char *err = NULL;
+            Regex *re = re_compile(pat, &err);
+            assert(re);
+            u32 want = 0;
+            for (u32 i = 0; i < NENT2; i++) {
+                if (!alive[i]) continue;
+                g4_entity_t e;
+                assert(g4_read_entity(g, ids[i], &e));
+                u16 len; const u8 *bb;
+                int hit = 0;
+                if ((bb = g4_str(g, e.name_sid, &len)) && re_search(re, (const char *)bb, len)) hit = 1;
+                if (!hit && (bb = g4_str(g, e.type_sid, &len)) && re_search(re, (const char *)bb, len)) hit = 1;
+                if (!hit && e.obs_count >= 1 && (bb = g4_str(g, e.obs0_sid, &len)) && re_search(re, (const char *)bb, len)) hit = 1;
+                if (!hit && e.obs_count >= 2 && (bb = g4_str(g, e.obs1_sid, &len)) && re_search(re, (const char *)bb, len)) hit = 1;
+                if (hit) want++;
+            }
+            re_free(re);
+            assert(n == want);                             /* soundness + completeness */
+            if (r % 7 == 0) { assert(mstore_txn_commit(ms)); assert(mstore_txn_begin(ms)); }
         }
         assert(mstore_txn_commit(ms));
         graph4_close(g); mstore_close(ms);

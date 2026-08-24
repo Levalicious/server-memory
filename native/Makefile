@@ -92,5 +92,5 @@ bench_segstore: $(SEGBENCH_SRC)
 test_str4: test_str4.c seg_str4.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_str4 && $(OUT)_str4
 
-test_graph4: test_graph4.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c
+test_graph4: test_graph4.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c seg_meta.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_graph4 && $(OUT)_graph4
