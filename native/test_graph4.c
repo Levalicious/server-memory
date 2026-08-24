@@ -433,6 +433,138 @@ int main(void) {
     }
     PASS();
 
+    TEST(neighbors_hops_and_direction);
+    {
+        /* chain A->B->C->D plus C->A back edge */
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        u32 A = g4_create_entity(g, (const u8 *)"A", 1, (const u8 *)"t", 1, 1);
+        u32 B = g4_create_entity(g, (const u8 *)"B", 1, (const u8 *)"t", 1, 2);
+        u32 C = g4_create_entity(g, (const u8 *)"C", 1, (const u8 *)"t", 1, 3);
+        u32 D = g4_create_entity(g, (const u8 *)"D", 1, (const u8 *)"t", 1, 4);
+        assert(g4_create_relation(g, A, B, (const u8 *)"r", 1, 1));
+        assert(g4_create_relation(g, B, C, (const u8 *)"r", 1, 2));
+        assert(g4_create_relation(g, C, D, (const u8 *)"r", 1, 3));
+        assert(g4_create_relation(g, C, A, (const u8 *)"r", 1, 4));
+        u32 out[8]; u32 n;
+        /* depth 1 (C hop-count) = immediate */
+        n = g4_neighbors(g, A, 1, G4_DIR_ANY, out, 8);
+        assert(n == 2);                        /* B (fwd) + C (backward mirror) */
+        n = g4_neighbors(g, A, 1, G4_DIR_FORWARD, out, 8);
+        assert(n == 1 && out[0] == B);         /* only A->B */
+        n = g4_neighbors(g, A, 1, G4_DIR_BACKWARD, out, 8);
+        assert(n == 1 && out[0] == C);         /* C->A seen backward */
+        /* depth 2 FORWARD: B then C */
+        n = g4_neighbors(g, A, 2, G4_DIR_FORWARD, out, 8);
+        assert(n == 2);
+        /* depth 3 FORWARD: B, C, D (start excluded even though reachable via cycle) */
+        n = g4_neighbors(g, A, 3, G4_DIR_FORWARD, out, 8);
+        assert(n == 3);
+        /* depth 0 = nothing (internal hop-count contract) */
+        assert(g4_neighbors(g, A, 0, G4_DIR_ANY, out, 8) == 0);
+        assert(mstore_txn_commit(ms));
+        graph4_close(g); mstore_close(ms);
+    }
+    PASS();
+
+    TEST(find_path_bidir_and_filters);
+    {
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        enum { NCH = 9 };
+        u32 ch[NCH];
+        char nm[8];
+        for (u32 i = 0; i < NCH; i++) {
+            snprintf(nm, sizeof nm, "P%u", i);
+            ch[i] = g4_create_entity(g, (const u8 *)nm, (u16)strlen(nm),
+                                     (const u8 *)"t", 1, i);
+            assert(ch[i]);
+            if (i) assert(g4_create_relation(g, ch[i-1], ch[i], (const u8 *)"n", 1, i));
+        }
+        u32 path[16]; u32 n;
+        n = g4_find_path(g, ch[0], ch[8], 10, G4_DIR_ANY, path, 16);
+        assert(n == 9);
+        assert(path[0] == ch[0] && path[8] == ch[8]);
+        for (u32 i = 0; i < 9; i++) assert(path[i] == ch[i]);   /* exact chain */
+        /* FORWARD works along the chain; BACKWARD from far end works */
+        assert(g4_find_path(g, ch[0], ch[8], 10, G4_DIR_FORWARD, path, 16) == 9);
+        assert(g4_find_path(g, ch[8], ch[0], 10, G4_DIR_BACKWARD, path, 16) == 9);
+        /* FORWARD from far end: impossible */
+        assert(g4_find_path(g, ch[8], ch[0], 10, G4_DIR_FORWARD, path, 16) == 0);
+        /* depth-limited: chain needs 8 levels; 4 = fail */
+        assert(g4_find_path(g, ch[0], ch[8], 4, G4_DIR_ANY, path, 16) == 0);
+        /* trivial + disconnected */
+        assert(g4_find_path(g, ch[3], ch[3], 5, G4_DIR_ANY, path, 16) == 1);
+        u32 iso = g4_create_entity(g, (const u8 *)"Iso", 3, (const u8 *)"t", 1, 99);
+        assert(g4_find_path(g, ch[0], iso, 10, G4_DIR_ANY, path, 16) == 0);
+        assert(mstore_txn_commit(ms));
+        graph4_close(g); mstore_close(ms);
+    }
+    PASS();
+
+    TEST(fuzz_findpath_vs_reference_bfs);
+    {
+        /* random graph; bidir result must MATCH a reference unidirectional
+         * BFS on (reachability, path length); path itself must be valid. */
+        enum { NV = 40, NEDGE = 90, TRIALS = 300 };
+        static u32 vid[NV];
+        static int adj[NV][NV];                            /* fwd adjacency */
+        memset(adj, 0, sizeof adj);
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        char nm[8];
+        for (u32 i = 0; i < NV; i++) {
+            snprintf(nm, sizeof nm, "V%u", i);
+            vid[i] = g4_create_entity(g, (const u8 *)nm, (u16)strlen(nm),
+                                      (const u8 *)"t", 1, i);
+            assert(vid[i]);
+        }
+        for (u32 e = 0; e < NEDGE; e++) {
+            u32 a = (u32)(rng() % NV), b = (u32)(rng() % NV);
+            if (a == b || adj[a][b]) continue;
+            assert(g4_create_relation(g, vid[a], vid[b], (const u8 *)"e", 1, e));
+            adj[a][b] = 1;
+        }
+        for (u32 t = 0; t < TRIALS; t++) {
+            u32 s = (u32)(rng() % NV), d = (u32)(rng() % NV);
+            u32 want = (u32)(rng() % 3);                   /* ANY/FWD/BWD */
+            u32 dirv = want == 0 ? G4_DIR_ANY : want == 1 ? G4_DIR_FORWARD : G4_DIR_BACKWARD;
+            /* reference BFS on the model */
+            int dist[NV]; for (u32 i = 0; i < NV; i++) dist[i] = -1;
+            u32 q[NV]; u32 qh = 0, qt = 0;
+            dist[s] = 0; q[qt++] = s;
+            while (qh < qt) {
+                u32 x = q[qh++];
+                for (u32 y = 0; y < NV; y++) {
+                    int ok = (dirv == G4_DIR_ANY) ? (adj[x][y] || adj[y][x])
+                           : (dirv == G4_DIR_FORWARD) ? adj[x][y] : adj[y][x];
+                    if (ok && dist[y] < 0) { dist[y] = dist[x] + 1; q[qt++] = y; }
+                }
+            }
+            u32 path[64];
+            u32 n = g4_find_path(g, vid[s], vid[d], 16, dirv, path, 64);
+            if (dist[d] < 0) assert(n == 0);
+            else {
+                assert(n == (u32)dist[d] + 1);             /* SHORTEST length */
+                assert(path[0] == vid[s] && path[n-1] == vid[d]);
+                /* every hop must be a real filtered edge */
+                for (u32 i = 0; i + 1 < n; i++) {
+                    u32 xa = 0, xb = 0;
+                    for (u32 k = 0; k < NV; k++) { if (vid[k] == path[i]) xa = k; if (vid[k] == path[i+1]) xb = k; }
+                    int ok = (dirv == G4_DIR_ANY) ? (adj[xa][xb] || adj[xb][xa])
+                           : (dirv == G4_DIR_FORWARD) ? adj[xa][xb] : adj[xb][xa];
+                    assert(ok);
+                }
+            }
+        }
+        assert(mstore_txn_commit(ms));
+        graph4_close(g); mstore_close(ms);
+    }
+    PASS();
+
     printf("test_graph4: %d tests passed\n", tests_run);
     return 0;
 }

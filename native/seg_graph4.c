@@ -688,3 +688,213 @@ static int adj_clear_all(graph4_t *g, u32 eid, const g4_entity_t *e) {
     }
     return ent_set_adj_ref(g, eid, 0);
 }
+
+/* ================= traversal ================= */
+
+static int g4push(u32 **a, u32 *n, u32 *cap, u32 v) {
+    if (*n == *cap) {
+        u32 nc = *cap ? *cap * 2 : 64;
+        u32 *na = (u32 *)realloc(*a, (size_t)nc * 4);
+        if (!na) return 0;
+        *a = na; *cap = nc;
+    }
+    (*a)[(*n)++] = v;
+    return 1;
+}
+
+static inline int g4_dir_match(u32 want, u32 have) {
+    return want == G4_DIR_ANY || have == want;
+}
+
+/* open-addressing eid -> parent map (parent 0 = root/none; eid never 0) */
+typedef struct { u32 *keys, *par; u32 cap, n; } pmap_t;
+
+static int pmap_init(pmap_t *m, u32 cap0) {
+    m->cap = 64; while (m->cap < cap0 * 2) m->cap *= 2;
+    m->keys = (u32 *)calloc(m->cap, 4);
+    m->par  = (u32 *)calloc(m->cap, 4);
+    m->n = 0;
+    return m->keys && m->par;
+}
+static void pmap_free(pmap_t *m) { free(m->keys); free(m->par); }
+static u32 pmap_slot(const pmap_t *m, u32 eid) {
+    u32 i = (u32)(((u64)eid * 0x9E3779B97F4A7C15ull) >> 32) & (m->cap - 1);
+    while (m->keys[i] && m->keys[i] != eid) i = (i + 1) & (m->cap - 1);
+    return i;
+}
+static int pmap_has(const pmap_t *m, u32 eid) { return m->keys[pmap_slot(m, eid)] == eid; }
+static u32 pmap_get(const pmap_t *m, u32 eid) { return m->par[pmap_slot(m, eid)]; }
+static int pmap_grow(pmap_t *m);
+static int pmap_put(pmap_t *m, u32 eid, u32 parent) {
+    if ((m->n + 1) * 4 >= m->cap * 3) if (!pmap_grow(m)) return 0;
+    u32 i = pmap_slot(m, eid);
+    if (m->keys[i] == eid) return 1;          /* keep first parent (BFS) */
+    m->keys[i] = eid; m->par[i] = parent; m->n++;
+    return 1;
+}
+static int pmap_grow(pmap_t *m) {
+    pmap_t nm;
+    nm.cap = m->cap * 2;
+    nm.keys = (u32 *)calloc(nm.cap, 4);
+    nm.par  = (u32 *)calloc(nm.cap, 4);
+    if (!nm.keys || !nm.par) { free(nm.keys); free(nm.par); return 0; }
+    nm.n = 0;
+    for (u32 i = 0; i < m->cap; i++)
+        if (m->keys[i]) {
+            u32 j = pmap_slot(&nm, m->keys[i]);
+            nm.keys[j] = m->keys[i]; nm.par[j] = m->par[i]; nm.n++;
+        }
+    pmap_free(m);
+    *m = nm;
+    return 1;
+}
+
+/* expand one node's edges through the filter, calling visit(target) */
+#define G4_EXPAND(g, eid, want, TARGET, BODY) do {                           \
+    g4_entity_t _e;                                                          \
+    if (g4_read_entity((g), (eid), &_e)) {                                   \
+        u32 _aref = _e.adj_ref;                                              \
+        while (_aref) {                                                      \
+            adj_view_t _v;                                                   \
+            if (!adj_view((g), _aref, &_v)) break;                           \
+            for (u32 _i = 0; _i < _v.count; _i++) {                          \
+                g4_edge_t _ed;                                               \
+                adj_ent_decode(_v.ents + _i * ADJ_ENT, &_ed);                \
+                if (!g4_dir_match((want), _ed.direction)) continue;          \
+                u32 TARGET = _ed.target_eid;                                 \
+                BODY                                                         \
+            }                                                                \
+            _aref = _v.next;                                                 \
+        }                                                                    \
+    }                                                                        \
+} while (0)
+
+u32 g4_neighbors(graph4_t *g, u32 start, u32 depth, u32 direction,
+                 u32 *out, u32 max) {
+    g4_entity_t e;
+    if (depth == 0 || !g4_read_entity(g, start, &e)) return 0;
+
+    if (depth == 1) {                          /* d0-public fast path */
+        /* small-degree: stack dedup; larger falls through to BFS below */
+        enum { FAST = 128 };
+        u32 buf[FAST]; u32 n = 0; int spill = 0;
+        G4_EXPAND(g, start, direction, t, {
+            if (t == start) continue;
+            int dup = 0;
+            for (u32 k = 0; k < n; k++) if (buf[k] == t) { dup = 1; break; }
+            if (dup) continue;
+            if (n == FAST) { spill = 1; break; }
+            buf[n++] = t;
+        });
+        if (!spill) {
+            for (u32 k = 0; k < n && k < max; k++) out[k] = buf[k];
+            return n;
+        }
+    }
+
+    pmap_t seen;
+    if (!pmap_init(&seen, 256)) return 0;
+    u32 *frontier = (u32 *)malloc(4), fcnt = 1, fcap = 1;
+    if (!frontier) { pmap_free(&seen); return 0; }
+    frontier[0] = start;
+    pmap_put(&seen, start, 0);
+    u32 total = 0;
+    for (u32 d = 0; d < depth && fcnt; d++) {
+        u32 *next = NULL, ncnt = 0, ncap = 0;
+        for (u32 f = 0; f < fcnt; f++) {
+            G4_EXPAND(g, frontier[f], direction, t, {
+                if (pmap_has(&seen, t)) continue;
+                if (!pmap_put(&seen, t, frontier[f])) goto oom;
+                if (total < max) out[total] = t;
+                total++;
+                if (!g4push(&next, &ncnt, &ncap, t)) goto oom;
+            });
+        }
+        free(frontier);
+        frontier = next; fcnt = ncnt; fcap = ncap;
+        continue;
+    oom:
+        free(next); free(frontier); pmap_free(&seen);
+        return total;
+    }
+    (void)fcap;
+    free(frontier);
+    pmap_free(&seen);
+    return total;
+}
+
+/* bidirectional level-sync BFS (Finding_BidirectionalBFS): expand the
+ * smaller frontier; reverse side uses the inverted filter. */
+u32 g4_find_path(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
+                 u32 *out_path, u32 max_path) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, from, &e) || !g4_read_entity(g, to, &e)) return 0;
+    if (from == to) {
+        if (max_path >= 1) out_path[0] = from;
+        return 1;
+    }
+    u32 rev_dir = direction == G4_DIR_ANY ? G4_DIR_ANY
+                : direction == G4_DIR_FORWARD ? G4_DIR_BACKWARD : G4_DIR_FORWARD;
+
+    pmap_t sf, sb;                              /* seen-from / seen-back */
+    if (!pmap_init(&sf, 64)) return 0;
+    if (!pmap_init(&sb, 64)) { pmap_free(&sf); return 0; }
+    pmap_put(&sf, from, 0);
+    pmap_put(&sb, to, 0);
+
+    u32 *ff = (u32 *)malloc(4), ffn = 1, ffc = 1;
+    u32 *bf = (u32 *)malloc(4), bfn = 1, bfc = 1;
+    u32 result = 0, meet = 0;
+    if (!ff || !bf) goto done;
+    ff[0] = from; bf[0] = to;
+
+    for (u32 lvl = 0; lvl < max_depth && ffn && bfn && !meet; lvl++) {
+        int fwd_side = ffn <= bfn;              /* expand the smaller side */
+        u32 *cur = fwd_side ? ff : bf;
+        u32 cn = fwd_side ? ffn : bfn;
+        pmap_t *own = fwd_side ? &sf : &sb;
+        pmap_t *other = fwd_side ? &sb : &sf;
+        u32 want = fwd_side ? direction : rev_dir;
+        u32 *next = NULL, ncnt = 0, ncap = 0;
+        for (u32 f = 0; f < cn && !meet; f++) {
+            G4_EXPAND(g, cur[f], want, t, {
+                if (pmap_has(own, t)) continue;
+                if (!pmap_put(own, t, cur[f])) goto pdone;
+                if (pmap_has(other, t)) { meet = t; break; }
+                if (!g4push(&next, &ncnt, &ncap, t)) goto pdone;
+            });
+        }
+        free(cur);
+        if (fwd_side) { ff = next; ffn = ncnt; ffc = ncap; }
+        else          { bf = next; bfn = ncnt; bfc = ncap; }
+        continue;
+    pdone:
+        free(next);
+        if (fwd_side) { ff = NULL; ffn = 0; } else { bf = NULL; bfn = 0; }
+        goto done;
+    }
+    (void)ffc; (void)bfc;
+
+    if (meet) {
+        /* reconstruct: from ... meet via sf parents, meet ... to via sb */
+        u32 tmp[512]; u32 nfrom = 0;
+        for (u32 x = meet; x; x = pmap_get(&sf, x)) {
+            if (nfrom >= 512) goto done;
+            tmp[nfrom++] = x;
+        }
+        u32 n = 0;
+        for (u32 i = nfrom; i-- > 0; ) {        /* from..meet in order */
+            if (n < max_path) out_path[n] = tmp[i];
+            n++;
+        }
+        for (u32 x = pmap_get(&sb, meet); x; x = pmap_get(&sb, x)) {
+            if (n < max_path) out_path[n] = x;
+            n++;
+        }
+        result = n;
+    }
+done:
+    free(ff); free(bf);
+    pmap_free(&sf); pmap_free(&sb);
+    return result;
+}

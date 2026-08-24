@@ -499,6 +499,7 @@ const u8 *g4_str(graph4_t *g, u32 sid, u16 *len_out);
 
 #define G4_DIR_FORWARD  0u
 #define G4_DIR_BACKWARD 1u
+#define G4_DIR_ANY      255u   /* traversal filter: follow any direction */
 
 typedef struct {
     u32 target_eid;
@@ -515,6 +516,19 @@ int g4_delete_relation(graph4_t *g, u32 from, u32 to, const u8 *rt, u16 rtlen);
 /* read up to max edges of eid into out[]; returns TRUE total edge count */
 u32 g4_edges(graph4_t *g, u32 eid, g4_edge_t *out, u32 max);
 u32 g4_edge_count(graph4_t *g, u32 eid);
+
+/* ---- traversal (C hop-count internal: depth 1 = immediate; the public
+ * 0-indexed numbering translates at the boundary — Fix_DepthDefault) ----
+ * g4_neighbors: eids within <= depth hops of start (start excluded),
+ * direction-filtered (dir_match: ANY or exact). depth==1 fast path.
+ * Returns TRUE reachable count (out gets min(count, max)).
+ * g4_find_path: bidirectional level-sync BFS; reverse frontier follows the
+ * INVERTED filter (mirror storage makes both sides local). Returns node
+ * count including endpoints written to out_path (0 = no path). */
+u32 g4_neighbors(graph4_t *g, u32 start, u32 depth, u32 direction,
+                 u32 *out, u32 max);
+u32 g4_find_path(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
+                 u32 *out_path, u32 max_path);
 
 /* ------------------------------------------------------------------ *
  * mstore — multi-segment store with a manifest pivot (seg_mstore.c).
