@@ -225,6 +225,9 @@ void segstore_close(segstore_t *st) {
 }
 
 u64 segstore_txid(const segstore_t *st)          { return st->sf->meta.txid; }
+u32 segstore_nameindex_root(const segstore_t *st) {
+    return st->txn_open ? st->txn_nameindex_root : st->sf->meta.nameindex_root_pgno;
+}
 u64 segstore_logical_pages(const segstore_t *st) { return st->logical_pages; }
 
 const u8 *seg_txn_view(segstore_t *st, u32 lpg) {

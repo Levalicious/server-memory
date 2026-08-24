@@ -361,6 +361,7 @@ segstore_t *segstore_open_at(seg_io_t *io, u64 txid);
 void        segstore_close(segstore_t *st);
 u64         segstore_txid(const segstore_t *st);
 u64         segstore_logical_pages(const segstore_t *st);
+u32         segstore_nameindex_root(const segstore_t *st);  /* staged if txn open */
 
 /* committed read: RO pointer to logical page lpg, NULL if unmapped */
 const u8 *segstore_read(segstore_t *st, u32 lpg);
@@ -425,6 +426,71 @@ u32 st4_refcount(st4_t *st, u32 sid);          /* 0 if dead */
 u32 st4_find(st4_t *st, const u8 *bytes, u16 len);
 
 /* ------------------------------------------------------------------ *
+ * graph4 — entities + persisted name index over segstores (seg_graph4.c).
+ *
+ * Design_Graph4Entities_2026_08_24. Two segstores: graph (entities, adj,
+ * name index) + strings (st4). Both commit in ONE mstore txn.
+ *
+ * Entity id (eid, u32) = ((lpg << 12) | slot) + 1, 0 = NULL — same packing
+ * discipline as sids, stable via frozen slot-id compaction stability.
+ *
+ * Entity record (68B, LE, in SEG_KIND_ENTITY slotted pages):
+ *   [u32 version][u32 name_sid][u32 type_sid][u32 adj_ref]
+ *   [u64 mtime][u64 obs_mtime][u32 obs0_sid][u32 obs1_sid]
+ *   [u8 obs_count + 3 pad][u64 structural_visits][u64 walker_visits][f64 psi]
+ *
+ * Name index (PERSISTED, Decision_PersistNameIndex): open-addressing over
+ *   name_sid. A NAMEIDX page is a slotted page whose slot 0 is one 4072B
+ *   record = 509 buckets {u32 name_sid, u32 eid} (0,0 = empty) — slotted so
+ *   COW-touch compaction remains universal; updates are same-size in-place.
+ *   A directory page (slot 0 record: [u32 npages][u32 lpg…]) lists index
+ *   pages; meta.nameindex_root_pgno = directory lpg + 1 (0 = none).
+ *   Probe: h(name_sid) % (npages*509), linear, backward-shift delete.
+ *   Rehash at load > 0.7 (fresh pages, old ones freed).
+ *
+ * String refcounts: entity owns one ref each on name_sid, type_sid and its
+ * observation sids (v3 discipline, unchanged).
+ * ------------------------------------------------------------------ */
+
+typedef struct graph4 graph4_t;
+typedef struct mstore mstore_t;   /* fwd (full decl below); C11 permits */
+
+#define G4_SEG_GRAPH   0u
+#define G4_SEG_STRINGS 1u
+
+/* open over an mstore created with >= 2 segments (graph, strings).
+ * mstore stays caller-owned; graph4_close does not close it. */
+graph4_t *graph4_open(mstore_t *ms);
+void      graph4_close(graph4_t *g);
+
+/* all mutating ops require an open mstore txn */
+u32  g4_create_entity(graph4_t *g, const u8 *name, u16 nlen,
+                      const u8 *type, u16 tlen, u64 mtime);  /* existing -> its eid */
+int  g4_delete_entity(graph4_t *g, u32 eid);                 /* 1 = deleted */
+u32  g4_lookup(graph4_t *g, const u8 *name, u16 nlen);       /* eid or 0 */
+
+typedef struct {
+    u32 eid, name_sid, type_sid, adj_ref;
+    u64 mtime, obs_mtime;
+    u32 obs0_sid, obs1_sid;
+    u8  obs_count;
+    u64 structural_visits, walker_visits;
+    double psi;
+} g4_entity_t;
+
+int  g4_read_entity(graph4_t *g, u32 eid, g4_entity_t *out); /* 1 = live */
+u32  g4_entity_count(graph4_t *g);
+/* enumerate live eids (bucket order); returns count written (<= max) */
+u32  g4_list_entities(graph4_t *g, u32 *out, u32 max);
+
+/* observations (KB constraint: max 2, each <= 140 bytes enforced above) */
+int  g4_add_observation(graph4_t *g, u32 eid, const u8 *obs, u16 len, u64 mtime);
+int  g4_remove_observation(graph4_t *g, u32 eid, const u8 *obs, u16 len, u64 mtime);
+
+/* string accessor passthrough (for callers resolving sids) */
+const u8 *g4_str(graph4_t *g, u32 sid, u16 *len_out);
+
+/* ------------------------------------------------------------------ *
  * mstore — multi-segment store with a manifest pivot (seg_mstore.c).
  *
  * Spec r2 §3 cross-segment atomicity, Q5 resolved CONSERVATIVELY: a
@@ -453,8 +519,6 @@ u32 st4_find(st4_t *st, const u8 *bytes, u16 len);
  * ------------------------------------------------------------------ */
 
 #define MST_MAGIC 0x4D535431u   /* "MST1" */
-
-typedef struct mstore mstore_t;
 
 mstore_t *mstore_create(seg_io_t *manifest_io, seg_io_t **seg_ios, u32 nsegs,
                         u16 extent_pages_log2);
