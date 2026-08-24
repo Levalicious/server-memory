@@ -545,6 +545,29 @@ u32 g4_entity_types(graph4_t *g, u32 *out_sids, u32 max);   /* distinct type sid
 u32 g4_relation_types(graph4_t *g, u32 *out_sids, u32 max); /* distinct rel sids (O(E) scan) */
 u32 g4_orphaned(graph4_t *g, u32 *out, u32 max);            /* eids with no edges */
 
+/* ---- rank + walks (verbatim v3 algorithms, eid-keyed; xorshift64 RNG,
+ * same seed => same walks/samples when candidate order matches; totals are
+ * recomputed from records at open and maintained in memory) ---- */
+void   g4_seed_rng(u64 seed);
+void   g4_inc_structural_visit(graph4_t *g, u32 eid);
+void   g4_inc_walker_visit(graph4_t *g, u32 eid);
+u64    g4_structural_total(graph4_t *g);
+u64    g4_walker_total(graph4_t *g);
+double g4_structural_rank(graph4_t *g, u32 eid);
+double g4_walker_rank(graph4_t *g, u32 eid);
+double g4_get_psi(graph4_t *g, u32 eid);
+u32    g4_relation_count(graph4_t *g);                      /* O(E) fwd sweep */
+/* MC pagerank: `iterations` damped forward walks from every entity */
+u32    g4_structural_sample(graph4_t *g, u32 iterations, double damping);
+/* MERW psi power iteration (warm-started from stored psi); returns iters */
+u32    g4_compute_merw_psi(graph4_t *g, double alpha, u32 max_iter, double tol);
+/* random walk; merw_mode weights by target psi; seed 0 = global rng */
+u32    g4_random_walk(graph4_t *g, u32 start, u32 depth, u32 direction,
+                      int merw_mode, u64 seed, u32 *out_path, u32 max_path);
+/* migration support: restore preserved fields on an existing entity */
+int    g4_set_entity_fields(graph4_t *g, u32 eid, u64 mtime, u64 obs_mtime,
+                            u64 svis, u64 wvis, double psi);
+
 /* ------------------------------------------------------------------ *
  * mstore — multi-segment store with a manifest pivot (seg_mstore.c).
  *

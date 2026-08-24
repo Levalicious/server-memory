@@ -36,6 +36,7 @@ struct graph4 {
     u32 ni_dir_lpg;         /* directory page lpg + 1; 0 = none (mirror of meta) */
     u32 ni_npages;          /* cached from directory */
     u32 ent_count;          /* live entities (rebuilt at open) */
+    u64 structural_total, walker_total;   /* recomputed at open; memory-held */
     u32 last_ent_page;      /* insertion affinity; SEG_PT_NONE = none */
 };
 
@@ -313,6 +314,11 @@ graph4_t *graph4_open(mstore_t *ms) {
             if (ns) {
                 g->ent_count++;
                 if (EID_LPG(ei) != (u32)SEG_PT_NONE) g->last_ent_page = EID_LPG(ei);
+                g4_entity_t e2;
+                if (g4_read_entity(g, ei, &e2)) {
+                    g->structural_total += e2.structural_visits;
+                    g->walker_total     += e2.walker_visits;
+                }
             }
         }
     }
@@ -1225,4 +1231,262 @@ u32 g4_search(graph4_t *g, const char *pattern, u32 *out, u32 max) {
     re_free(re);
     re_ast_free(ast);
     return found;
+}
+
+/* ================= rank + walks (v3-verbatim, eid-keyed) ================= */
+
+static u64 g4_rng_state = 0x9e3779b97f4a7c15ull;
+void g4_seed_rng(u64 seed) { g4_rng_state = seed ? seed : 0x9e3779b97f4a7c15ull; }
+static inline u64 g4_rng_u64(u64 *s) { u64 x = *s; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return *s = x; }
+static inline double g4_rng_d(u64 *s) { return (double)(g4_rng_u64(s) >> 11) * (1.0 / 9007199254740992.0); }
+
+void g4_inc_structural_visit(graph4_t *g, u32 eid) {
+    u8 *r = ent_rec_w(g, eid);
+    if (!r) return;
+    g4st64(r + 44, g4ld64(r + 44) + 1);
+    g->structural_total++;
+}
+void g4_inc_walker_visit(graph4_t *g, u32 eid) {
+    u8 *r = ent_rec_w(g, eid);
+    if (!r) return;
+    g4st64(r + 52, g4ld64(r + 52) + 1);
+    g->walker_total++;
+}
+u64 g4_structural_total(graph4_t *g) { return g->structural_total; }
+u64 g4_walker_total(graph4_t *g)     { return g->walker_total; }
+double g4_structural_rank(graph4_t *g, u32 eid) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e) || !g->structural_total) return 0.0;
+    return (double)e.structural_visits / (double)g->structural_total;
+}
+double g4_walker_rank(graph4_t *g, u32 eid) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e) || !g->walker_total) return 0.0;
+    return (double)e.walker_visits / (double)g->walker_total;
+}
+double g4_get_psi(graph4_t *g, u32 eid) {
+    g4_entity_t e;
+    return g4_read_entity(g, eid, &e) ? e.psi : 0.0;
+}
+
+int g4_set_entity_fields(graph4_t *g, u32 eid, u64 mtime, u64 obs_mtime,
+                         u64 svis, u64 wvis, double psi) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e)) return 0;
+    u8 *r = ent_rec_w(g, eid);
+    if (!r) return 0;
+    g->structural_total = g->structural_total - e.structural_visits + svis;
+    g->walker_total     = g->walker_total     - e.walker_visits     + wvis;
+    g4st64(r + 16, mtime);
+    g4st64(r + 24, obs_mtime);
+    g4st64(r + 44, svis);
+    g4st64(r + 52, wvis);
+    memcpy(r + 60, &psi, 8);
+    return 1;
+}
+
+u32 g4_relation_count(graph4_t *g) {
+    u32 n = 0, cap = ni_capacity(g);
+    for (u32 i = 0; i < cap; i++) {
+        u32 ns, ei;
+        if (!ni_get(g, i, &ns, &ei)) break;
+        if (!ns) continue;
+        g4_entity_t e;
+        if (!g4_read_entity(g, ei, &e)) continue;
+        u32 aref = e.adj_ref;
+        while (aref) {
+            adj_view_t v;
+            if (!adj_view(g, aref, &v)) break;
+            for (u32 k = 0; k < v.count; k++) {
+                g4_edge_t ed;
+                adj_ent_decode(v.ents + k * ADJ_ENT, &ed);
+                if (ed.direction == G4_DIR_FORWARD) n++;
+            }
+            aref = v.next;
+        }
+    }
+    return n;
+}
+
+static u32 g4_structural_walk(graph4_t *g, u32 start, double damping) {
+    u32 cur = start, visits = 0;
+    for (;;) {
+        g4_inc_structural_visit(g, cur); visits++;
+        u32 ec = g4_edge_count(g, cur);
+        if (!ec) break;
+        g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+        if (!es) break;
+        g4_edges(g, cur, es, ec);
+        u32 fwd = 0;
+        for (u32 k = 0; k < ec; k++) if (es[k].direction == G4_DIR_FORWARD) fwd++;
+        if (fwd == 0 || g4_rng_d(&g4_rng_state) >= damping) { free(es); break; }
+        u32 pick = (u32)(g4_rng_d(&g4_rng_state) * fwd); if (pick >= fwd) pick = fwd - 1;
+        u32 seen = 0, next = cur;
+        for (u32 k = 0; k < ec; k++) if (es[k].direction == G4_DIR_FORWARD) {
+            if (seen == pick) { next = es[k].target_eid; break; }
+            seen++;
+        }
+        free(es);
+        cur = next;
+    }
+    return visits;
+}
+
+u32 g4_structural_sample(graph4_t *g, u32 iterations, double damping) {
+    u32 n = g->ent_count;
+    if (n == 0) return 0;
+    u32 *eids = (u32 *)malloc((size_t)n * 4);
+    if (!eids) return 0;
+    u32 got = g4_list_entities(g, eids, n);
+    u32 total = 0;
+    for (u32 it = 0; it < iterations; it++)
+        for (u32 i = 0; i < got; i++) total += g4_structural_walk(g, eids[i], damping);
+    free(eids);
+    return total;
+}
+
+u32 g4_random_walk(graph4_t *g, u32 start, u32 depth, u32 direction,
+                   int merw_mode, u64 seed, u32 *out_path, u32 max_path) {
+    g4_entity_t e0;
+    if (!g4_read_entity(g, start, &e0)) return 0;
+    u64 st = seed ? seed : g4_rng_state;
+    u32 plen = 0;
+    if (max_path >= 1) out_path[plen] = start;
+    plen = 1;
+    u32 cur = start;
+    for (u32 i = 0; i < depth; i++) {
+        u32 ec = g4_edge_count(g, cur);
+        if (!ec) break;
+        g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+        if (!es) break;
+        g4_edges(g, cur, es, ec);
+        u32 *cand = (u32 *)malloc((size_t)ec * 4);
+        double *cpsi = (double *)malloc((size_t)ec * 8);
+        u32 nc = 0;
+        if (!cand || !cpsi) { free(es); free(cand); free(cpsi); break; }
+        for (u32 k = 0; k < ec; k++) {
+            if (!g4_dir_match(direction, es[k].direction)) continue;
+            u32 t = es[k].target_eid; if (t == cur) continue;
+            double p = g4_get_psi(g, t);
+            int found = 0;
+            for (u32 j = 0; j < nc; j++) if (cand[j] == t) { if (p > cpsi[j]) cpsi[j] = p; found = 1; break; }
+            if (!found) { cand[nc] = t; cpsi[nc] = p; nc++; }
+        }
+        free(es);
+        if (nc == 0) { free(cand); free(cpsi); break; }
+        double total_psi = 0; for (u32 j = 0; j < nc; j++) total_psi += cpsi[j];
+        u32 chosen;
+        if (merw_mode && total_psi > 0) {
+            double r = g4_rng_d(&st) * total_psi, cum = 0; chosen = cand[nc - 1];
+            for (u32 j = 0; j < nc; j++) { cum += cpsi[j]; if (r <= cum) { chosen = cand[j]; break; } }
+        } else {
+            u32 ix = (u32)(g4_rng_d(&st) * nc); if (ix >= nc) ix = nc - 1; chosen = cand[ix];
+        }
+        free(cand); free(cpsi);
+        cur = chosen;
+        if (plen < max_path) out_path[plen] = cur;
+        plen++;
+    }
+    if (!seed) g4_rng_state = st;
+    return plen;
+}
+
+/* eid -> dense-index map for the psi solver */
+typedef struct { u32 *k; u32 *v; u32 cap; } e2i_t;
+static u32 e2i_get(const e2i_t *m, u32 eid) {
+    u32 i = (u32)(((u64)eid * 0x9E3779B97F4A7C15ull) >> 32) & (m->cap - 1);
+    while (m->k[i] && m->k[i] != eid) i = (i + 1) & (m->cap - 1);
+    return m->k[i] == eid ? m->v[i] : 0;
+}
+static void e2i_put(e2i_t *m, u32 eid, u32 val) {
+    u32 i = (u32)(((u64)eid * 0x9E3779B97F4A7C15ull) >> 32) & (m->cap - 1);
+    while (m->k[i] && m->k[i] != eid) i = (i + 1) & (m->cap - 1);
+    m->k[i] = eid; m->v[i] = val;
+}
+
+u32 g4_compute_merw_psi(graph4_t *g, double alpha, u32 max_iter, double tol) {
+    u32 n = g->ent_count;
+    if (n == 0) return 0;
+    u32 *eids = (u32 *)malloc((size_t)n * 4);
+    if (!eids) return 0;
+    u32 got = g4_list_entities(g, eids, n);
+    n = got;
+
+    e2i_t idx;
+    idx.cap = 256; while (idx.cap < n * 2) idx.cap *= 2;
+    idx.k = (u32 *)calloc(idx.cap, 4); idx.v = (u32 *)calloc(idx.cap, 4);
+    if (!idx.k || !idx.v) { free(eids); free(idx.k); free(idx.v); return 0; }
+    for (u32 i = 0; i < n; i++) e2i_put(&idx, eids[i], i + 1);
+
+    /* CSR forward adjacency */
+    u32 *rowoff = (u32 *)malloc((size_t)(n + 1) * 4);
+    if (!rowoff) goto fail0;
+    rowoff[0] = 0;
+    for (u32 i = 0; i < n; i++) {
+        u32 ec = g4_edge_count(g, eids[i]), d = 0;
+        if (ec) {
+            g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+            if (!es) { free(rowoff); goto fail0; }
+            g4_edges(g, eids[i], es, ec);
+            for (u32 k = 0; k < ec; k++)
+                if (es[k].direction == G4_DIR_FORWARD && e2i_get(&idx, es[k].target_eid)) d++;
+            free(es);
+        }
+        rowoff[i + 1] = rowoff[i] + d;
+    }
+    {
+        u32 nnz = rowoff[n];
+        u32 *col = (u32 *)malloc((size_t)(nnz ? nnz : 1) * 4);
+        double *psi = (double *)malloc((size_t)n * 8);
+        double *nx = (double *)malloc((size_t)n * 8);
+        if (!col || !psi || !nx) { free(col); free(psi); free(nx); free(rowoff); goto fail0; }
+        for (u32 i = 0; i < n; i++) {
+            u32 ec = g4_edge_count(g, eids[i]);
+            if (!ec) continue;
+            g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+            if (!es) { free(col); free(psi); free(nx); free(rowoff); goto fail0; }
+            g4_edges(g, eids[i], es, ec);
+            u32 w = rowoff[i];
+            for (u32 k = 0; k < ec; k++) if (es[k].direction == G4_DIR_FORWARD) {
+                u32 j = e2i_get(&idx, es[k].target_eid);
+                if (j) col[w++] = j - 1;
+            }
+            free(es);
+        }
+        double warm_sum = 0; u32 warm_cnt = 0;
+        for (u32 i = 0; i < n; i++) {
+            double v = g4_get_psi(g, eids[i]); psi[i] = v;
+            if (v > 0) { warm_sum += v; warm_cnt++; }
+        }
+        if (warm_cnt) { double m = warm_sum / warm_cnt; for (u32 i = 0; i < n; i++) if (psi[i] <= 0) psi[i] = m; }
+        else { double u = 1.0 / __builtin_sqrt((double)n); for (u32 i = 0; i < n; i++) psi[i] = u; }
+        double nrm = 0; for (u32 i = 0; i < n; i++) nrm += psi[i] * psi[i]; nrm = __builtin_sqrt(nrm);
+        if (nrm > 0) for (u32 i = 0; i < n; i++) psi[i] /= nrm;
+
+        double teleport = (1.0 - alpha) / (double)n;
+        u32 iter = 0;
+        for (iter = 0; iter < max_iter; iter++) {
+            for (u32 i = 0; i < n; i++) nx[i] = 0;
+            double psi_sum = 0; for (u32 i = 0; i < n; i++) psi_sum += psi[i];
+            double tc = teleport * psi_sum;
+            for (u32 i = 0; i < n; i++) { double val = alpha * psi[i]; for (u32 p = rowoff[i]; p < rowoff[i + 1]; p++) nx[col[p]] += val; }
+            for (u32 i = 0; i < n; i++) nx[i] += tc;
+            double norm = 0; for (u32 i = 0; i < n; i++) norm += nx[i] * nx[i]; norm = __builtin_sqrt(norm);
+            if (norm > 0) for (u32 i = 0; i < n; i++) nx[i] /= norm;
+            double diff = 0; for (u32 i = 0; i < n; i++) { double d = nx[i] - psi[i]; diff += d * d; } diff = __builtin_sqrt(diff);
+            double *t = psi; psi = nx; nx = t;
+            if (diff < tol) { iter++; break; }
+        }
+        for (u32 i = 0; i < n; i++) {
+            if (psi[i] < 0) psi[i] = 0;
+            u8 *r = ent_rec_w(g, eids[i]);
+            if (r) memcpy(r + 60, &psi[i], 8);
+        }
+        free(col); free(psi); free(nx); free(rowoff);
+        free(eids); free(idx.k); free(idx.v);
+        return iter;
+    }
+fail0:
+    free(eids); free(idx.k); free(idx.v);
+    return 0;
 }

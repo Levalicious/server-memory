@@ -697,6 +697,73 @@ int main(void) {
     }
     PASS();
 
+    TEST(rank_walk_psi_surface);
+    {
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        /* small ring + tail: a->b->c->a, c->d */
+        u32 a = g4_create_entity(g, (const u8 *)"ra", 2, (const u8 *)"t", 1, 1);
+        u32 b = g4_create_entity(g, (const u8 *)"rb", 2, (const u8 *)"t", 1, 2);
+        u32 c = g4_create_entity(g, (const u8 *)"rc", 2, (const u8 *)"t", 1, 3);
+        u32 d = g4_create_entity(g, (const u8 *)"rd", 2, (const u8 *)"t", 1, 4);
+        assert(g4_create_relation(g, a, b, (const u8 *)"n", 1, 1));
+        assert(g4_create_relation(g, b, c, (const u8 *)"n", 1, 2));
+        assert(g4_create_relation(g, c, a, (const u8 *)"n", 1, 3));
+        assert(g4_create_relation(g, c, d, (const u8 *)"n", 1, 4));
+        assert(g4_relation_count(g) == 4);
+
+        /* visits + ranks */
+        g4_inc_structural_visit(g, a);
+        g4_inc_structural_visit(g, a);
+        g4_inc_walker_visit(g, b);
+        assert(g4_structural_total(g) == 2 && g4_walker_total(g) == 1);
+        assert(g4_structural_rank(g, a) == 1.0);
+        assert(g4_walker_rank(g, b) == 1.0);
+
+        /* MC sample: deterministic under a seed; increments visits */
+        g4_seed_rng(42);
+        u64 before = g4_structural_total(g);
+        u32 visits = g4_structural_sample(g, 3, 0.85);
+        assert(visits > 0 && g4_structural_total(g) == before + visits);
+
+        /* psi power iteration converges; psi normalized, persisted */
+        u32 iters = g4_compute_merw_psi(g, 0.9, 200, 1e-10);
+        assert(iters > 0);
+        double sum2 = 0;
+        u32 all[8]; u32 na = g4_list_entities(g, all, 8);
+        assert(na == 4);
+        for (u32 i = 0; i < na; i++) { double p = g4_get_psi(g, all[i]); assert(p >= 0); sum2 += p * p; }
+        assert(sum2 > 0.99 && sum2 < 1.01);               /* unit norm */
+
+        /* random walk: valid, seeded-deterministic */
+        u32 p1[16], p2[16];
+        u32 n1 = g4_random_walk(g, a, 8, G4_DIR_FORWARD, 0, 777, p1, 16);
+        u32 n2 = g4_random_walk(g, a, 8, G4_DIR_FORWARD, 0, 777, p2, 16);
+        assert(n1 == n2 && n1 >= 2);
+        for (u32 i = 0; i < n1; i++) assert(p1[i] == p2[i]);
+        assert(p1[0] == a);
+        /* every hop is a real forward edge */
+        for (u32 i = 0; i + 1 < n1; i++) {
+            g4_edge_t es[8]; u32 ne = g4_edges(g, p1[i], es, 8);
+            int found = 0;
+            for (u32 k = 0; k < ne; k++)
+                if (es[k].direction == G4_DIR_FORWARD && es[k].target_eid == p1[i+1]) found = 1;
+            assert(found);
+        }
+        /* merw mode also valid */
+        u32 n3 = g4_random_walk(g, a, 8, G4_DIR_ANY, 1, 123, p1, 16);
+        assert(n3 >= 1 && p1[0] == a);
+
+        /* totals survive reopen via record scan: commit + check set_fields */
+        assert(g4_set_entity_fields(g, d, 99, 98, 7, 5, 0.25));
+        g4_entity_t e;
+        assert(g4_read_entity(g, d, &e) && e.structural_visits == 7 && e.mtime == 99);
+        assert(mstore_txn_commit(ms));
+        graph4_close(g); mstore_close(ms);
+    }
+    PASS();
+
     printf("test_graph4: %d tests passed\n", tests_run);
     return 0;
 }
