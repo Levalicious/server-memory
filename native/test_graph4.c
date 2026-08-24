@@ -265,6 +265,174 @@ int main(void) {
     }
     PASS();
 
+    TEST(relations_bidir_dup_delete);
+    {
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        u32 a = g4_create_entity(g, (const u8 *)"A", 1, (const u8 *)"t", 1, 1);
+        u32 b = g4_create_entity(g, (const u8 *)"B", 1, (const u8 *)"t", 1, 2);
+        assert(a && b);
+        assert(g4_create_relation(g, a, b, (const u8 *)"LIKES", 5, 10) == 1);
+        assert(g4_create_relation(g, a, b, (const u8 *)"LIKES", 5, 11) == 0);  /* dup */
+        assert(g4_create_relation(g, b, a, (const u8 *)"LIKES", 5, 12) == 1);  /* reverse != dup */
+        assert(g4_edge_count(g, a) == 2 && g4_edge_count(g, b) == 2);
+        g4_edge_t ed[4];
+        u32 n = g4_edges(g, a, ed, 4);
+        assert(n == 2);
+        u32 fwd = 0, bwd = 0;
+        for (u32 i = 0; i < n; i++) {
+            assert(ed[i].target_eid == b);
+            u16 len = 0;
+            assert(memcmp(g4_str(g, ed[i].rel_sid, &len), "LIKES", 5) == 0 && len == 5);
+            if (ed[i].direction == G4_DIR_FORWARD) fwd++; else bwd++;
+        }
+        assert(fwd == 1 && bwd == 1);
+        /* delete one direction; the other survives */
+        assert(g4_delete_relation(g, a, b, (const u8 *)"LIKES", 5) == 1);
+        assert(g4_delete_relation(g, a, b, (const u8 *)"LIKES", 5) == 0);
+        assert(g4_edge_count(g, a) == 1 && g4_edge_count(g, b) == 1);
+        assert(g4_delete_relation(g, b, a, (const u8 *)"LIKES", 5) == 1);
+        assert(g4_edge_count(g, a) == 0 && g4_edge_count(g, b) == 0);
+        /* rel string fully released: interning it again starts fresh */
+        assert(mstore_txn_commit(ms));
+        graph4_close(g);
+        mstore_close(ms);
+    }
+    PASS();
+
+    TEST(hub_chain_spill_400_edges);
+    {
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        u32 hub = g4_create_entity(g, (const u8 *)"Hub", 3, (const u8 *)"t", 1, 1);
+        assert(hub);
+        char nm[32];
+        static u32 spokes[400];
+        for (u32 i = 0; i < 400; i++) {
+            int n = snprintf(nm, sizeof nm, "S%u", i);
+            spokes[i] = g4_create_entity(g, (const u8 *)nm, (u16)n, (const u8 *)"t", 1, i);
+            assert(spokes[i]);
+            assert(g4_create_relation(g, hub, spokes[i], (const u8 *)"SPOKE", 5, i) == 1);
+        }
+        assert(g4_edge_count(g, hub) == 400);              /* chained records */
+        static g4_edge_t ed[500];
+        assert(g4_edges(g, hub, ed, 500) == 400);
+        /* delete from the middle of the chain */
+        assert(g4_delete_relation(g, hub, spokes[200], (const u8 *)"SPOKE", 5) == 1);
+        assert(g4_edge_count(g, hub) == 400 - 1);
+        assert(g4_edge_count(g, spokes[200]) == 0);
+        /* delete the hub: every spoke's mirror must vanish */
+        assert(g4_delete_entity(g, hub) == 1);
+        for (u32 i = 0; i < 400; i += 23)
+            assert(g4_edge_count(g, spokes[i]) == 0);
+        assert(mstore_txn_commit(ms));
+        graph4_close(g);
+        mstore_close(ms);
+    }
+    PASS();
+
+    TEST(self_loop_and_reopen_edges);
+    {
+        char mp[] = "/tmp/g4e_manifest_XXXXXX", gp[] = "/tmp/g4e_graph_XXXXXX",
+             sp[] = "/tmp/g4e_strings_XXXXXX";
+        int f;
+        f = mkstemp(mp); assert(f >= 0); close(f);
+        f = mkstemp(gp); assert(f >= 0); close(f);
+        f = mkstemp(sp); assert(f >= 0); close(f);
+        seg_io_t *sios[2] = { seg_io_posix_open(gp, 1), seg_io_posix_open(sp, 1) };
+        mstore_t *ms = mstore_create(seg_io_posix_open(mp, 1), sios, 2, 2);
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        u32 a = g4_create_entity(g, (const u8 *)"Loop", 4, (const u8 *)"t", 1, 1);
+        u32 b = g4_create_entity(g, (const u8 *)"Peer", 4, (const u8 *)"t", 1, 2);
+        assert(g4_create_relation(g, a, a, (const u8 *)"SELF", 4, 5) == 1);
+        assert(g4_edge_count(g, a) == 2);                  /* both mirrors on a */
+        assert(g4_create_relation(g, a, b, (const u8 *)"OUT", 3, 6) == 1);
+        assert(mstore_txn_commit(ms));
+        graph4_close(g); mstore_close(ms);
+
+        seg_io_t *rios[2] = { seg_io_posix_open(gp, 0), seg_io_posix_open(sp, 0) };
+        mstore_t *ms2 = mstore_open(seg_io_posix_open(mp, 0), rios, 2);
+        graph4_t *g2 = graph4_open(ms2);
+        assert(g2);
+        u32 a2 = g4_lookup(g2, (const u8 *)"Loop", 4);
+        assert(a2 == a && g4_edge_count(g2, a2) == 3);     /* edges persisted */
+        assert(mstore_txn_begin(ms2));
+        assert(g4_delete_entity(g2, a2) == 1);             /* self-loop cleanup */
+        assert(g4_edge_count(g2, b) == 0);                 /* mirror on peer gone */
+        assert(mstore_txn_commit(ms2));
+        graph4_close(g2); mstore_close(ms2);
+        unlink(mp); unlink(gp); unlink(sp);
+    }
+    PASS();
+
+    TEST(fuzz_edges_vs_model_6k_ops);
+    {
+        enum { NE = 60, NREL = 3, OPS = 6000 };
+        static const char *rels[NREL] = { "R_ALPHA", "R_BETA", "R_GAMMA" };
+        static int medge[NE][NE][NREL];                    /* fwd edge model */
+        static int mlive[NE]; static u32 meid[NE];
+        char nm[16];
+        mstore_t *ms = fresh_store();
+        graph4_t *g = graph4_open(ms);
+        assert(mstore_txn_begin(ms));
+        memset(medge, 0, sizeof medge);
+        for (u32 i = 0; i < NE; i++) { mlive[i] = 0; meid[i] = 0; }
+        u32 commits = 0;
+        for (u32 op = 0; op < OPS; op++) {
+            u32 i = (u32)(rng() % NE), j = (u32)(rng() % NE), r = (u32)(rng() % NREL);
+            u32 kind = (u32)(rng() % 100);
+            if (kind < 25) {                               /* ensure entity */
+                if (!mlive[i]) {
+                    snprintf(nm, sizeof nm, "F%u", i);
+                    meid[i] = g4_create_entity(g, (const u8 *)nm, (u16)strlen(nm),
+                                               (const u8 *)"t", 1, op);
+                    assert(meid[i]); mlive[i] = 1;
+                }
+            } else if (kind < 55) {                        /* create relation */
+                int ok = g4_create_relation(g, meid[i], meid[j],
+                                            (const u8 *)rels[r], (u16)strlen(rels[r]), op);
+                if (!mlive[i] || !mlive[j]) assert(ok == 0);
+                else if (medge[i][j][r]) assert(ok == 0);
+                else { assert(ok == 1); medge[i][j][r] = 1; }
+            } else if (kind < 75) {                        /* delete relation */
+                int ok = g4_delete_relation(g, meid[i], meid[j],
+                                            (const u8 *)rels[r], (u16)strlen(rels[r]));
+                if (!mlive[i] || !mlive[j] || !medge[i][j][r]) assert(ok == 0);
+                else { assert(ok == 1); medge[i][j][r] = 0; }
+            } else if (kind < 85) {                        /* delete entity + incident */
+                int ok = g4_delete_entity(g, meid[i]);
+                assert(ok == (mlive[i] ? 1 : 0));
+                if (ok) {
+                    mlive[i] = 0; meid[i] = 0;
+                    for (u32 k = 0; k < NE; k++)
+                        for (u32 rr = 0; rr < NREL; rr++)
+                            medge[i][k][rr] = medge[k][i][rr] = 0;
+                }
+            } else if (kind < 97) {                        /* verify edge counts */
+                if (!mlive[i]) { assert(g4_edge_count(g, meid[i]) == 0); continue; }
+                u32 want = 0;
+                for (u32 k = 0; k < NE; k++)
+                    for (u32 rr = 0; rr < NREL; rr++) {
+                        if (medge[i][k][rr]) want++;                 /* fwd */
+                        if (medge[k][i][rr]) want++;                 /* mirror */
+                    }
+                assert(g4_edge_count(g, meid[i]) == want);
+            } else {
+                assert(mstore_txn_commit(ms));
+                assert(mstore_txn_begin(ms));
+                commits++;
+            }
+        }
+        assert(mstore_txn_commit(ms));
+        printf("(commits %u) ", commits);
+        graph4_close(g);
+        mstore_close(ms);
+    }
+    PASS();
+
     printf("test_graph4: %d tests passed\n", tests_run);
     return 0;
 }

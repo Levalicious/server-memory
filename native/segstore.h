@@ -490,6 +490,32 @@ int  g4_remove_observation(graph4_t *g, u32 eid, const u8 *obs, u16 len, u64 mti
 /* string accessor passthrough (for callers resolving sids) */
 const u8 *g4_str(graph4_t *g, u32 sid, u16 *len_out);
 
+/* ---- adjacency (Design_Graph4Adjacency_2026_08_24) ----
+ * Bidirectional storage (BGS_BidirStorage): an edge A-[rt]->B stores a
+ * FORWARD entry on A and a BACKWARD mirror on B; each entry owns one ref
+ * on rel_sid. Adjacency lives in chained ADJ records ([u32 count]
+ * [u32 next_ref][20B entries]); a record relocates freely (single
+ * referrer: its entity or the previous chain link). */
+
+#define G4_DIR_FORWARD  0u
+#define G4_DIR_BACKWARD 1u
+
+typedef struct {
+    u32 target_eid;
+    u32 rel_sid;
+    u64 mtime;
+    u32 direction;         /* G4_DIR_* */
+} g4_edge_t;
+
+/* 1 = created; 0 = exists already / dead endpoint / error */
+int g4_create_relation(graph4_t *g, u32 from, u32 to,
+                       const u8 *rt, u16 rtlen, u64 mtime);
+/* 1 = deleted (both mirrors); 0 = not found */
+int g4_delete_relation(graph4_t *g, u32 from, u32 to, const u8 *rt, u16 rtlen);
+/* read up to max edges of eid into out[]; returns TRUE total edge count */
+u32 g4_edges(graph4_t *g, u32 eid, g4_edge_t *out, u32 max);
+u32 g4_edge_count(graph4_t *g, u32 eid);
+
 /* ------------------------------------------------------------------ *
  * mstore — multi-segment store with a manifest pivot (seg_mstore.c).
  *

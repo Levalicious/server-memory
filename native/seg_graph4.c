@@ -23,6 +23,7 @@ struct graph4 {
     mstore_t   *ms;
     segstore_t *gs;         /* graph segment */
     st4_t      *st;         /* strings layer (owned) */
+    u32 last_adj_page;      /* ADJ insertion affinity; SEG_PT_NONE = none */
     u32 ni_dir_lpg;         /* directory page lpg + 1; 0 = none (mirror of meta) */
     u32 ni_npages;          /* cached from directory */
     u32 ent_count;          /* live entities (rebuilt at open) */
@@ -278,6 +279,7 @@ graph4_t *graph4_open(mstore_t *ms) {
     g->st = st4_open(mstore_seg(ms, G4_SEG_STRINGS));
     if (!g->gs || !g->st) { graph4_close(g); return NULL; }
     g->last_ent_page = SEG_PT_NONE;
+    g->last_adj_page = SEG_PT_NONE;
 
     /* name index root from meta (committed) */
     /* note: nameindex_root is maintained via seg_txn_set_roots at rehash */
@@ -356,9 +358,13 @@ int g4_read_entity(graph4_t *g, u32 eid, g4_entity_t *out) {
     return 1;
 }
 
+static int adj_clear_all(graph4_t *g, u32 eid, const g4_entity_t *e);
+
 int g4_delete_entity(graph4_t *g, u32 eid) {
     g4_entity_t e;
     if (!g4_read_entity(g, eid, &e)) return 0;
+    /* remove every incident edge (mirrors on peers + own chain) first */
+    if (!adj_clear_all(g, eid, &e)) return 0;
     /* release string refs */
     st4_decref(g->st, e.name_sid);
     st4_decref(g->st, e.type_sid);
@@ -419,4 +425,266 @@ int g4_remove_observation(graph4_t *g, u32 eid, const u8 *obs, u16 len, u64 mtim
     g4st64(r + 24, mtime);
     st4_decref(g->st, sid);
     return 1;
+}
+
+/* ================= adjacency ================= */
+
+#define ADJ_HDR       8u                    /* [u32 count][u32 next_ref] */
+#define ADJ_ENT       20u                   /* target, rel_sid, mtime, dir */
+#define ADJ_MAX_ENT   ((SEG_PAGE_MAX_REC - ADJ_HDR) / ADJ_ENT)   /* 203 */
+#define ADJ_SPLIT     128u                  /* new head past this many */
+
+#define AREF_LPG(r)   (((r) - 1u) >> 12)
+#define AREF_SLOT(r)  (((r) - 1u) & 0xFFFu)
+#define AREF_MAKE(l, s) ((((u32)(l) << 12) | (u32)(s)) + 1u)
+
+typedef struct { u32 count, next; const u8 *ents; } adj_view_t;
+
+static int adj_view(graph4_t *g, u32 aref, adj_view_t *v) {
+    if (aref == 0) return 0;
+    const u8 *pg = seg_txn_view(g->gs, AREF_LPG(aref));
+    if (!pg) return 0;
+    u16 sz = 0;
+    const u8 *r = seg_page_read(pg, (u16)AREF_SLOT(aref), &sz);
+    if (!r || sz < ADJ_HDR) return 0;
+    v->count = g4ld32(r);
+    v->next  = g4ld32(r + 4);
+    if ((u32)sz != ADJ_HDR + v->count * ADJ_ENT) return 0;
+    v->ents = r + ADJ_HDR;
+    return 1;
+}
+
+static void adj_ent_decode(const u8 *p, g4_edge_t *e) {
+    e->target_eid = g4ld32(p);
+    e->rel_sid    = g4ld32(p + 4);
+    e->mtime      = g4ld64(p + 8);
+    e->direction  = g4ld32(p + 16);
+}
+
+static void adj_ent_encode(u8 *p, const g4_edge_t *e) {
+    g4st32(p, e->target_eid);
+    g4st32(p + 4, e->rel_sid);
+    g4st64(p + 8, e->mtime);
+    g4st32(p + 16, e->direction);
+}
+
+static u32 adj_new(graph4_t *g, const u8 *img, u16 sz);
+
+static int ent_set_adj_ref(graph4_t *g, u32 eid, u32 aref) {
+    u8 *r = ent_rec_w(g, eid);
+    if (!r) return 0;
+    g4st32(r + 12, aref);
+    return 1;
+}
+
+/* rewrite record `aref` with a new image (grow/shrink via update; on grow
+ * failure relocate to another page and return the NEW aref, else same). */
+static u32 adj_write(graph4_t *g, u32 aref, const u8 *img, u16 sz) {
+    u8 *pg = seg_txn_touch(g->gs, AREF_LPG(aref));
+    if (!pg) return 0;
+    if (seg_page_update(pg, (u16)AREF_SLOT(aref), img, sz))
+        return aref;
+    /* relocate: delete here, insert with affinity */
+    if (!seg_page_delete(pg, (u16)AREF_SLOT(aref))) return 0;
+    return adj_new(g, img, sz);
+}
+
+/* fresh record with page affinity; returns aref or 0 */
+static u32 adj_new(graph4_t *g, const u8 *img, u16 sz) {
+    u32 lpg = g->last_adj_page; u16 slot;
+    u8 *pg = (lpg != (u32)SEG_PT_NONE) ? seg_txn_touch(g->gs, lpg) : NULL;
+    if (pg && seg_page_insert(pg, img, sz, &slot))
+        return AREF_MAKE(lpg, slot);
+    pg = seg_txn_alloc(g->gs, SEG_KIND_ADJ, &lpg);
+    if (!pg || lpg >= G4_MAX_LPG || !seg_page_insert(pg, img, sz, &slot)) return 0;
+    g->last_adj_page = lpg;
+    return AREF_MAKE(lpg, slot);
+}
+
+/* add an entry at the HEAD record of eid's chain (new head on overflow) */
+static int adj_add(graph4_t *g, u32 eid, const g4_edge_t *edge) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e)) return 0;
+    u8 img[ADJ_HDR + (ADJ_SPLIT + 1) * ADJ_ENT];
+    adj_view_t v;
+    if (e.adj_ref && adj_view(g, e.adj_ref, &v) && v.count < ADJ_SPLIT) {
+        /* extend head in place (possibly relocating) */
+        g4st32(img, v.count + 1);
+        g4st32(img + 4, v.next);
+        memcpy(img + ADJ_HDR, v.ents, v.count * ADJ_ENT);
+        adj_ent_encode(img + ADJ_HDR + v.count * ADJ_ENT, edge);
+        u32 nref = adj_write(g, e.adj_ref, img, (u16)(ADJ_HDR + (v.count + 1) * ADJ_ENT));
+        if (!nref) return 0;
+        if (nref != e.adj_ref && !ent_set_adj_ref(g, eid, nref)) return 0;
+        return 1;
+    }
+    /* new head (first record, or head full): [1 entry][next = old head] */
+    g4st32(img, 1);
+    g4st32(img + 4, e.adj_ref);
+    adj_ent_encode(img + ADJ_HDR, edge);
+    u32 nref = adj_new(g, img, ADJ_HDR + ADJ_ENT);
+    if (!nref) return 0;
+    return ent_set_adj_ref(g, eid, nref);
+}
+
+/* remove first entry matching (target, rel_sid, dir); 1 = removed */
+static int adj_remove(graph4_t *g, u32 eid, u32 target, u32 rel_sid, u32 dir) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e)) return 0;
+    u32 prev = 0, aref = e.adj_ref;
+    u8 img[ADJ_HDR + ADJ_MAX_ENT * ADJ_ENT];
+    while (aref) {
+        adj_view_t v;
+        if (!adj_view(g, aref, &v)) return 0;
+        for (u32 i = 0; i < v.count; i++) {
+            g4_edge_t ed;
+            adj_ent_decode(v.ents + i * ADJ_ENT, &ed);
+            if (ed.target_eid != target || ed.rel_sid != rel_sid || ed.direction != dir)
+                continue;
+            /* swap-remove within this record */
+            u32 nc = v.count - 1;
+            g4st32(img, nc);
+            g4st32(img + 4, v.next);
+            memcpy(img + ADJ_HDR, v.ents, v.count * ADJ_ENT);
+            if (i != nc)
+                memcpy(img + ADJ_HDR + i * ADJ_ENT,
+                       img + ADJ_HDR + nc * ADJ_ENT, ADJ_ENT);
+            if (nc == 0) {
+                /* record empty: unlink it */
+                u8 *pg = seg_txn_touch(g->gs, AREF_LPG(aref));
+                if (!pg || !seg_page_delete(pg, (u16)AREF_SLOT(aref))) return 0;
+                if (prev) {
+                    adj_view_t pv;
+                    if (!adj_view(g, prev, &pv)) return 0;
+                    u8 pimg[ADJ_HDR + ADJ_MAX_ENT * ADJ_ENT];
+                    g4st32(pimg, pv.count);
+                    g4st32(pimg + 4, v.next);              /* skip over */
+                    memcpy(pimg + ADJ_HDR, pv.ents, pv.count * ADJ_ENT);
+                    u32 nref = adj_write(g, prev, pimg,
+                                         (u16)(ADJ_HDR + pv.count * ADJ_ENT));
+                    if (!nref) return 0;
+                    if (nref != prev) {
+                        /* prev relocated: fix ITS referrer (entity or prev-prev).
+                         * prev is always the head's predecessor path — simplest
+                         * sound approach: re-walk from entity is overkill; the
+                         * same-size update NEVER relocates (no grow), so this
+                         * branch is unreachable. Guard anyway. */
+                        return 0;
+                    }
+                } else if (!ent_set_adj_ref(g, eid, v.next)) return 0;
+                return 1;
+            }
+            u32 nref = adj_write(g, aref, img, (u16)(ADJ_HDR + nc * ADJ_ENT));
+            if (!nref) return 0;                           /* shrink: no relocate */
+            if (nref != aref) return 0;                    /* unreachable */
+            return 1;
+        }
+        prev = aref;
+        aref = v.next;
+    }
+    return 0;
+}
+
+static u32 adj_find(graph4_t *g, u32 eid, u32 target, u32 rel_sid, u32 dir,
+                    g4_edge_t *out) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e)) return 0;
+    u32 aref = e.adj_ref;
+    while (aref) {
+        adj_view_t v;
+        if (!adj_view(g, aref, &v)) return 0;
+        for (u32 i = 0; i < v.count; i++) {
+            g4_edge_t ed;
+            adj_ent_decode(v.ents + i * ADJ_ENT, &ed);
+            if (ed.target_eid == target && ed.rel_sid == rel_sid && ed.direction == dir) {
+                if (out) *out = ed;
+                return 1;
+            }
+        }
+        aref = v.next;
+    }
+    return 0;
+}
+
+u32 g4_edge_count(graph4_t *g, u32 eid) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e)) return 0;
+    u32 n = 0, aref = e.adj_ref;
+    while (aref) {
+        adj_view_t v;
+        if (!adj_view(g, aref, &v)) return n;
+        n += v.count;
+        aref = v.next;
+    }
+    return n;
+}
+
+u32 g4_edges(graph4_t *g, u32 eid, g4_edge_t *out, u32 max) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, eid, &e)) return 0;
+    u32 n = 0, aref = e.adj_ref;
+    while (aref) {
+        adj_view_t v;
+        if (!adj_view(g, aref, &v)) break;
+        for (u32 i = 0; i < v.count; i++, n++)
+            if (n < max) adj_ent_decode(v.ents + i * ADJ_ENT, &out[n]);
+        aref = v.next;
+    }
+    return n;
+}
+
+int g4_create_relation(graph4_t *g, u32 from, u32 to,
+                       const u8 *rt, u16 rtlen, u64 mtime) {
+    g4_entity_t ef, et;
+    if (!g4_read_entity(g, from, &ef) || !g4_read_entity(g, to, &et)) return 0;
+    u32 existing_sid = st4_find(g->st, rt, rtlen);
+    if (existing_sid && adj_find(g, from, to, existing_sid, G4_DIR_FORWARD, NULL))
+        return 0;                                          /* duplicate edge */
+    u32 sid = st4_intern(g->st, rt, rtlen);                /* ref for fwd entry */
+    if (!sid) return 0;
+    if (!st4_incref(g->st, sid)) { st4_decref(g->st, sid); return 0; }  /* ref for mirror */
+    g4_edge_t fwd = { to,   sid, mtime, G4_DIR_FORWARD };
+    g4_edge_t bwd = { from, sid, mtime, G4_DIR_BACKWARD };
+    if (!adj_add(g, from, &fwd)) { st4_decref(g->st, sid); st4_decref(g->st, sid); return 0; }
+    if (!adj_add(g, to, &bwd))   { adj_remove(g, from, to, sid, G4_DIR_FORWARD);
+                                   st4_decref(g->st, sid); st4_decref(g->st, sid); return 0; }
+    return 1;
+}
+
+int g4_delete_relation(graph4_t *g, u32 from, u32 to, const u8 *rt, u16 rtlen) {
+    u32 sid = st4_find(g->st, rt, rtlen);
+    if (!sid) return 0;
+    if (!adj_remove(g, from, to, sid, G4_DIR_FORWARD)) return 0;
+    if (!adj_remove(g, to, from, sid, G4_DIR_BACKWARD)) return 0;
+    st4_decref(g->st, sid);
+    st4_decref(g->st, sid);
+    return 1;
+}
+
+/* delete-entity support: drop every incident edge. For each own entry,
+ * remove the mirror on the peer and release both rel refs; then free the
+ * whole own chain. */
+static int adj_clear_all(graph4_t *g, u32 eid, const g4_entity_t *e) {
+    u32 aref = e->adj_ref;
+    while (aref) {
+        adj_view_t v;
+        if (!adj_view(g, aref, &v)) return 0;
+        /* copy entries out: mirror removal mutates pages under us */
+        u32 cnt = v.count, next = v.next;
+        g4_edge_t *eds = (g4_edge_t *)malloc((size_t)(cnt ? cnt : 1) * sizeof *eds);
+        if (!eds) return 0;
+        for (u32 i = 0; i < cnt; i++) adj_ent_decode(v.ents + i * ADJ_ENT, &eds[i]);
+        for (u32 i = 0; i < cnt; i++) {
+            u32 mdir = eds[i].direction == G4_DIR_FORWARD ? G4_DIR_BACKWARD
+                                                          : G4_DIR_FORWARD;
+            if (eds[i].target_eid != eid)                  /* self-loop mirror lives here */
+                adj_remove(g, eds[i].target_eid, eid, eds[i].rel_sid, mdir);
+            st4_decref(g->st, eds[i].rel_sid);
+        }
+        free(eds);
+        u8 *pg = seg_txn_touch(g->gs, AREF_LPG(aref));
+        if (!pg || !seg_page_delete(pg, (u16)AREF_SLOT(aref))) return 0;
+        aref = next;
+    }
+    return ent_set_adj_ref(g, eid, 0);
 }
