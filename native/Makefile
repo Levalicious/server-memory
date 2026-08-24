@@ -11,10 +11,10 @@ CFLAGS = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 LIBS = -lm
 OUT = /tmp/mf_test
 
-.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity bench proofs proofs-eva wp-segmeta clean
+.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon bench proofs proofs-eva wp-segmeta clean
 
 # `make test` = prove the detector fires, then run every harness with it active.
-test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity
+test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon
 
 test_segmeta: test_segmeta.c seg_meta.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_segmeta && $(OUT)_segmeta
@@ -97,3 +97,10 @@ test_graph4: test_graph4.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_fi
 
 test_parity: test_parity.c graph.c stringtable.c memoryfile.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_parity && $(OUT)_parity
+
+DAEMON_SRC = seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
+kbd4: seg_daemon.c $(DAEMON_SRC)
+	$(CC) -std=c11 -O2 -march=native -Wall -Wextra -D_GNU_SOURCE -I. $^ $(LIBS) -o kbd4
+
+test_daemon: test_daemon.c $(DAEMON_SRC)
+	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_daemon && $(OUT)_daemon
