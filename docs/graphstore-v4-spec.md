@@ -1,337 +1,295 @@
 # Graph Store v4 — networked single-writer, segmented, page-COW (libmdbx-imitation)
 
-Status: DRAFT r2 for iteration. Nothing here is frozen until marked FROZEN.
+Status: r3 — **FORMAT FREEZE**. Sections stamped FROZEN are format commitments:
+changing them henceforth means a migration, not an edit. Unstamped sections
+remain design-current but revisable.
 
-r2 (2026-08-20) supersedes r1 (2026-07-01). Deltas, with KB anchors:
+r3 (2026-08-23) supersedes r2. Deltas, with KB anchors:
 
-- **Externalized.** The owner is a network daemon (TCP + token on LAN), not a
-  local-shm peer. Multi-machine access is now a *goal*, not a non-goal
-  (`Goal_KBExternalization_2026_08_20`, `Decision_ExternalizeViaCDaemon_2026_08_20`).
-- **COW unit is the page, not the segment.** Each segment is internally a
-  libmdbx-imitation paged store (`Decision_LibmdbxTargetArch_2026_08_20`,
-  `Decision_PagedStorePerSegment_2026_08_20`). r1 §1.1's "memfile unchanged"
-  premise is retired — segment-granularity copy was write amplification of
-  exactly the kind this spec exists to kill.
-- **No WAL, ever.** The scale-up roadmap's stage-2 WAL is deleted
-  (`Design_DBScaleUp_Roadmap_2026_07_20` is SETTLED by the libmdbx target):
-  commit = COW'd pages + meta toggle; throughput comes from sync-mode knobs,
-  not log machinery.
-- **Minimal-core is the baseline store**, not v3-as-it-shipped: schema v3
-  node-log elimination, decoupled in-memory indexes with O(delta) catch-up,
-  own regex engine + trigram prefilter + DFA, bidirectional BFS
-  (`Finding_NodeLogEliminated_2026_07_13`, `Finding_AllOpsFinal_2026_07_20`,
-  branch `bench/regex-minimalcore`).
-- **Rank is a background concern**, permanently off the op paths
-  (`Plan_V3MinimalCoreBench_2026_07_13`); re-added amortized in the owner (§5).
-- **Shard seam designed now, implemented never (yet)**
-  (`Design_ShardSeamFirst_2026_08_20`).
+- **Formats FROZEN** (§2, §5): every on-disk structure is implemented, crash-
+  harness-verified, and where marked, machine-proved. Evidence inline.
+- **Q1 CLOSED**: 4K pages, by measurement on the agreed 500/5K/50K/500K
+  entity ladder (`Finding_SegstoreScaleLadder_2026_08_23`) — 2.8–3.4× less
+  write volume than 16K, no losing axis.
+- **Identity model added** (§2.3): logical pgnos + COW'd shadow page table
+  (`Decision_LogicalPgnoShadowTable_2026_08_23`) — the one deliberate
+  libmdbx deviation, forced by graph in-refs (r2 Q3 closed and extended).
+- **Q4 CLOSED**: RO-mmap reads + pwrite/fdatasync writes — libmdbx's own
+  default mode (`Insight_ROMmapPwriteIsLibmdbxDefault_2026_08_20`); no
+  writable mmap and no msync exist in the codebase.
+- **Q5 CLOSED**: manifest record fsync'd on every store commit; recovery by
+  dual-meta *selection* (`Insight_DualMetaSelectionProperty_2026_08_23`).
+- **Protocol gains the traversal algebra** (§6.2): TRAVERSE/RESUME with
+  declared combine-semantics; partial traversals are first-class
+  (`Design_PartialTraversalProtocol_2026_08_23`, proposed by Lev).
+- **Depth semantics canonicalized** (§6.3): 0-indexed everywhere public
+  (`Bug_DepthDefaultMismatch_2026_08_23` → `Fix_DepthDefault_2026_08_23`).
+- Phase 2 (libsegstore) is **DONE** (§10).
 
-## 0. Why (epistemic chain)
+## 0. Why (epistemic chain — unchanged from r2, abridged)
 
-Production hang: `create_entities` times out at 300s, self-recovers, silent
-write loss. Diagnosis (KB: `Diag_MemfileSingleOwner_2026_06_29`):
-
-- memfile is a **single-owner** construct; commit `13937aa` bolted N-process
-  shared-mmap + flock onto it ("multi-instance safety") — off-design.
-- The hang is a lock holder stalled in blocking `msync(MS_SYNC)` under I/O
-  saturation, holding the flock; peers time out
-  (`Insight_MsyncUnderLockAntipattern_2026_07_22`: *any* lock held across a
-  durability barrier serializes all writers — the flavor of lock is
-  irrelevant).
-- Root problem: four half concurrency systems (2 flocks + migrate.lock +
-  refresh/remap + msync-under-lock), none providing crash-atomicity.
-
-New forcing function (2026-08-20): 8+ months of multi-machine work over
-stdio MCP, with the KB file manually shepherded between hosts. The store
-must live on exactly one host and be reachable from all of them. This
-dissolves the multi-instance problem rather than solving it: one daemon
-*is* the single writer.
-
-Requirements (Lev): do it properly. ACID semantics. Batched ingest at
-millions of nodes/sec (already demonstrated on minimal-core: all write ops
->1M TPS, `Finding_AllOpsFinal_2026_07_20`). Graph-native read path (traversal
-is the hot path — no LSM merge tax, no KV hop tax). Design for sharding
-ahead of implementing networking — "just an upgrade" must never mean
-"rewrite the codebase".
+Production hang: msync-under-flock on a single-owner memfile bolted into
+N-process sharing (`Diag_MemfileSingleOwner_2026_06_29`,
+`Insight_MsyncUnderLockAntipattern_2026_07_22`). Plus 8+ months of
+multi-machine stdio use with hand-carried KB files. One owner daemon on one
+host dissolves both. Requirements: ACID, batched ingest >1M rec/s, graph-
+native read path, sharding designed-for before networking is built.
 
 ## 1. Architecture
 
 One **owner daemon** per store, on the store's host. Clients are thin
-stdio-MCP shims (server.ts reduced to framing + pagination + formatting),
-one per machine, speaking a binary protocol over TCP. Nobody but the owner
-ever opens a store file. There is exactly one concurrency mechanism in the
-system: the owner's request queue.
+stdio-MCP shims speaking a binary protocol over TCP+token (LAN). Nobody but
+the owner opens a store file. One concurrency mechanism: the owner's queue.
 
     ┌─ machine A ─┐   ┌─ machine B ─┐
     │ claude⇄shim │   │ claude⇄shim │      (stdio MCP, unchanged surface)
     └──────┬──────┘   └──────┬──────┘
            └───── TCP+token ──┴────► owner daemon ──► store files (one host)
 
-Storage is **N segment files + 1 manifest**:
-
     store/
-      MANIFEST            # cross-segment commit pivot (tiny, append-only, fsync'd)
-      seg-0003.kb         # segment 3: self-contained paged store (§2)
-      seg-0007.kb
-      strings-00.kb       # string segments (same mechanics, §7.Q2)
+      MANIFEST            # store-level commit pivot (append-only, fsync'd)
+      seg-NNNN.kb         # segment: self-contained paged store (§2)
+      strings-NN.kb       # string segments (same mechanics)
 
-Terminology: **segment**, deliberately not "shard" — one machine, one writer,
-one transaction domain. Segments are a physical layout + COW granularity +
-*future placement* choice, not (yet) a distribution boundary. Cross-segment
-edges are cheap (a deref into another mapping), never a cross-domain
-operation.
+**Segment** ≠ shard: one machine, one writer, one tx domain. Segments are
+the physical layout, COW granularity, *and future shard seam* (§7).
 
-## 2. Segment = libmdbx-imitation paged store
+## 2. Segment format — FROZEN
 
-Imitation, not linkage (`D_NoExternalDependence`; the mandate was never
-"avoid the architecture", it was "own the code"). Each segment file:
+Implemented in `native/segstore.h` / `seg_meta.c` / `seg_page.c` /
+`seg_file.c` / `seg_txn.c`. The header is the normative reference; this
+section fixes the commitments.
 
-- **Page-granularity COW.** Fixed page size (§7.Q1). A write tx never
-  modifies a live page: it copies the page, mutates the copy, and the new
-  page becomes reachable only at commit.
-- **Dual meta pages** at fixed offsets 0 and 1, alternating. A meta page
-  holds: txid, root refs (name-index root, adjacency heap root, freelist
-  root), page-count watermark, checksum. Commit toggles to the *other* meta
-  slot; recovery picks the valid meta with the highest txid. A torn meta
-  write loses nothing — the other slot is the previous commit.
-- **Freelist as first-class data.** Pages retired by COW (the old versions)
-  are recorded in a freelist tree, itself COW'd, keyed by the txid that
-  retired them. A retired page is reusable once no live snapshot (§4) can
-  reference it. This is the libmdbx GC discipline: space is reclaimed by
-  *reuse*, not compaction; the file grows only when the reclaimable set is
-  empty.
-- **No WAL.** Crash-atomicity is the meta toggle. Durability is the fsync
-  policy (§3). Recovery is O(1): read two metas, pick one. No replay.
+### 2.1 Constants and refs — FROZEN
 
-### 2.1 What lives inside the pages
+- `SEG_PAGE_SIZE = 4096`. Closed by `bench_segstore` on the 500/5K/50K/500K
+  ladder: bytes/commit 2.8–3.4× better than 16K, touch 3× cheaper, recover
+  2.4× faster @500K; 16K's sole theoretical edge (co-location) measures
+  negligible (E[distinct pages | K=16] 15.9 vs 15.5). Page = COW unit;
+  **extent** (`extent_pages_log2`, per-segment) = allocation/locality unit.
+- Packed ref: `(u16 seg | u32 pgno | u16 slot)` in a u64. pgno is LOGICAL
+  (§2.3). 16TB/segment address space; byte-clean fields.
+- Byte order: little-endian.
 
-The minimal-core v3 *content* layout carries over as the intra-page record
-format — this is layout knowledge, not code reuse:
+### 2.2 Dual meta — FROZEN
 
-- EntityRecord 76B (`[u32 version][72B body]`, biscuit-style versioned
-  records — the version word is how records migrate schema in place).
-- AdjEntry 24B, bidirectional storage, `target<<2|dir` packing.
-- Name index (open-addressing, name_id → ref) as the **sole entity
-  registry** (schema v3; node log stays dead —
-  `Decision_EliminateNodeLog_2026_07_13`). Enumeration is bucket order.
-- Refcount discipline against the string store unchanged: adj entry owns
-  one ref on relType_id; entity owns refs on name_id, type_id, obs ids.
+`seg_meta_t` at pgno 0 and 1, alternating; crc32c over all-but-checksum
+(the only checksummed structure — data pages rely on commit ordering, the
+libmdbx/LMDB discipline). Commit toggles slots; recovery picks valid-max-
+txid (or manifest-directed exact txid, §5). Fields include graph roots
+(logical), `ptable_root_pgno` + `freelist_root_pgno` (physical),
+`watermark` (physical pages), `logical_pages`.
 
-What does NOT carry over: the memfile cartesian-tree arena and all in-place
-mutation of published bytes. Allocation becomes page-local (records packed
-into pages; a page's free space is its own concern). The v3 sin — in-place
-mutation of shared state — is structurally impossible, not policed.
+Evidence: WP+RTE 119/121 (2 = the declared crc trust boundary); exhaustive
+single-bitflip (0 survivors) and torn-write-every-prefix tests.
 
-### 2.2 In-memory index layer (owner-private, per-segment)
+### 2.3 Identity model: logical pgnos + shadow page table — FROZEN
 
-Proven on `bench/regex-minimalcore`; all owner-private, none persisted,
-all rebuilt lazily and maintained incrementally:
+`Decision_LogicalPgnoShadowTable_2026_08_23` — the deliberate libmdbx
+deviation. Relocating COW (libmdbx pgno = physical) cascades through
+arbitrary graph in-refs; a B-tree has one parent, a graph node has any
+number of referrers. Therefore refs carry **stable logical pgnos** and a
+COW'd page table maps them:
 
-- **Trigram prefilter** over name+type+obs, decoupled from the write path:
-  writes do an O(1) dirty-set mark (offset → op, last-wins); `index_sync`
-  applies O(delta) catch-up at search time
-  (`Finding_WriteDecoupled_2026_07_20`, `Finding_IncrementalSync_2026_07_20`:
-  K=1 catch-up 1.2µs vs 267ms rebuild @200K). Search = trigram prefilter →
-  own-engine DFA/NFA verify; 132–157× glibc ERE at 2K, 4403× selective at
-  500K (`Finding_BenchCorrectBaseline_2026_07_20`).
-- **Type index** (type_id → offset postings), lazy, O(1) maintained,
-  entities_by_type O(result): 340× at 500K (`Finding_TypeIndex_2026_07_20`).
-- **Traversal fast paths**: depth-1 immediate-neighbor path (4.84×,
-  `Finding_ImmediateNeighborFastPath_2026_07_20`); bidirectional level-sync
-  BFS for find_path (22.7×, `Finding_BidirectionalBFS_2026_07_20`).
+    meta.ptable_root_pgno → root page [ntpages][tpage_phys…]
+                          → table pages [1024 × u32 phys entries, PT_NONE]
 
-The single-writer owner is what makes these *sound*: exactly one process
-mutates, so in-memory indexes cannot go stale under it
-(`Insight_TrigramIsSingleWriterFeature_2026_07_14` — now ungated).
+Touch never relocates a logical page; commit re-points its table entry at a
+fresh physical page. Table pages and root are COW'd like data. Cost: ~15
+table pages at 500K entities; +1–10 pages per commit of table dirt.
 
-## 3. Transactions, durability, ACID
+### 2.4 Slotted page — FROZEN
 
-- **Write path**: client batches arrive at the owner; the owner coalesces
-  them into a tx (group commit is *the default shape*, not an optimization:
-  one batch = one tx = one meta toggle per dirty segment + at most one
-  manifest record).
-- **Commit protocol**:
-  1. write COW'd data pages + freelist pages of every dirty segment
-  2. per dirty segment: fsync (policy-dependent, below), toggle meta
-  3. if >1 segment dirty: append manifest record
-     `{txid, [(seg → meta_txid)...], checksum}`, fsync — the record is the
-     cross-segment pivot. Single-segment txs skip the manifest entirely;
-     the segment meta *is* the commit point (§7.Q5 folds manifest state).
-  4. retired pages enter per-segment freelists, tagged with txid
-- **Durability modes** (libmdbx-imitation, per-store config):
-  - `DURABLE`: fsync data + meta every commit. The pre-crash txid is the
-    recovered txid.
-  - `SAFE_NOSYNC`: fsync on a cadence (ops/bytes/ms watermark), meta toggle
-    ordered after data writes (`fdatasync` barrier only at checkpoint). A
-    crash loses the tail *as a unit* — recovers to the last checkpointed
-    txid, never a torn state. This is the default: the KB's durability
-    unit-of-loss is a melt batch, and the walker already tolerates replay.
-- **ACID**: A = meta toggle / manifest record, all-or-nothing. C = single
-  writer validates before publish. I = snapshots (§4); single writer ⇒
-  serializable. D = mode above, *chosen*, not accidental.
-- **Relaxed-durability class (unchanged from r1)**: walker/structural visit
-  counters and ψ accumulate in owner memory, flush piggybacked on real
-  commits. Counter loss = rank statistics loss, explicitly not graph truth.
-  Under page-COW this matters *more*: a counter bump must never be the sole
-  reason a page is COW'd.
+General slotted format for every record kind
+(`Decision_SlottedFormatTypeAffinity_2026_08_20`): 16B header (nslots,
+rec_floor, kind_hint, flags), 4B slots (offset,size; offset 0 = dead)
+growing up, records growing down. `kind_hint` is placement POLICY, never
+semantics. COW-touch always copy-compacts: slot ids stable, free gap
+zeroed (no stale heap bytes reach disk), refuses corrupt input. Records
+>page use extent-descriptor kind (multi-page runs).
 
-## 4. Reads and snapshots
+Evidence: WP+RTE **367/367, zero assumed obligations**; 20K-op
+fuzz-vs-shadow-model with byte equality after every op; parse-don't-trust
+header guards (a corrupt disk page cannot drive OOB — found by WP, invisible
+to fuzz).
 
-- All reads go through the owner (v4.0; there is no local-mmap client
-  anymore — machines are remote). A read request executes against **the
-  live root under the owner's tx mutex-free read view**: single writer +
-  COW means a reader that captured root refs at txid T sees frozen pages
-  for as long as those refs are pinned.
-- **Snapshot pin = owner-internal lease** on {segment metas, manifest txid}.
-  Leases pin freelist reclamation (a retired page outlives every lease that
-  can reach it). Leases are bounded (timeout) so a stuck client cannot
-  wedge reclamation — libmdbx's long-reader problem, solved by fiat: the
-  owner *owns* the leases and expires them.
-- Paginated MCP ops (cursors) hold a lease across the cursor's lifetime,
-  bounded; an expired cursor re-resolves against the newest snapshot
-  (documented, observable via txid in the cursor token).
-- v4.1 (option, unchanged): same-host direct read-only mmap under a lease.
-  Only if owner-mediated read throughput measurably bottlenecks — at 14.9M
-  TPS immediate-neighbor reads (`Finding_AllOpsFinal_2026_07_20`), the
-  network is the bottleneck long before the owner is.
+### 2.5 Freelist — FROZEN
 
-## 5. Rank maintenance (amortized, background)
+Retired physical pages persist as a snapshot chain (fixed-format pages:
+next, nwords, word stream = free[], pending[(txid, pgnos)]), rewritten each
+commit, meta-rooted. Reuse gated: a page retired at txid T is allocatable
+iff every live pin has txid ≥ T; restart clears pins. **The freelist feeds
+itself** (chain pages allocate from free[] pop-then-serialize — the
+watermark-only variant leaked +1 pg/commit under churn;
+`Finding_FreelistMustFeedItself_2026_08_23`). Structurally acyclic:
+append-only records in COW pages, never links through freed space.
 
-r1 had rank in the op paths (resample-on-write, ψ power iteration inline).
-Minimal-core ripped it out and the ops got their >1M TPS. It comes back as
-an **owner background job**, never on an op path:
+## 3. Transactions and durability
 
-- **Visit counters**: already relaxed (§3). `pagerank`/`llmrank` sort keys
-  read whatever the counters say now — they are statistics, not invariants.
-- **MC structural rank**: `graph_structural_sample` (exists in C) run in
-  idle slices. Monte-Carlo error ∝ 1/√π (`PR_ErrorInverselyProportionalToRank`)
-  — important nodes converge first, so partial work is immediately useful,
-  which is exactly the amortization property we want.
-- **MERW ψ**: incremental recompute. Power iteration restarted from the
-  *previous* ψ after a batch of graph edits converges in few iterations
-  (warm start; eigengap does the work). Trigger: dirty-edge count watermark
-  or idle timer, not per-op. Sweeps enumerate via the name index — the node
-  log stays dead; if sweep locality ever measurably hurts, that is a §7
-  question, not a resurrection.
-- Scheduling: strictly idle/background-priority in the owner; a rank job
-  yields to any incoming op. Rank writes go through the counter relaxation
-  path (in-memory, piggyback flush), so background rank NEVER causes page
-  COW on its own.
+- Write path: `seg_txn_begin / touch (COW+compact into heap) / alloc /
+  free / commit`. COW discipline is **enforced here**: physical targets
+  come only from gated freelist or watermark growth — never a page
+  reachable from the last committed meta.
+- Segment commit protocol — FROZEN ordering:
+  1. extend (cluster-rounded)  2. write dirty data+ptable+freelist pages
+  3. **sync** (data barrier)   4. sealed meta → inactive slot
+  5. **sync** (commit point)   6. flip in memory (only now)
+- Durability modes: `DURABLE` (as above) and `SAFE_NOSYNC` (fsync on
+  cadence; loses the tail as a unit, never tears — the default; the KB's
+  unit-of-loss is a melt batch).
+- Relaxed class: walker/structural counters and ψ accumulate in owner
+  memory, piggyback on real commits, never the sole cause of a COW.
+- Snapshot pins: `{txid, ptable copy}`; pinned reads are byte-stable
+  (verified through 20-commit churn on the pinned page).
 
-## 6. Network protocol and the shard seam
+Evidence: crash harness (prefix replay over recorded write/sync/extend
+events = every legal in-order crash state): segfile 67 prefix + 126
+torn-write states; txn layer 132 states over real COW txns with recycling.
+Property: recovered txid ∈ {last_acked, last_acked+1}
+(`Insight_RecoveredTxidPlusOneLegal_2026_08_23` — a fully-landed unacked
+commit may legally win) with byte-exact state for whichever recovered.
 
-- **Framing**: length-prefixed binary, request-id multiplexed (concurrent
-  in-flight requests per connection), version byte first. CBOR-ish
-  self-describing payloads are acceptable for v4.0 (op rate is human-scale);
-  the frame header is what's frozen, payload encoding can evolve.
-- **Auth**: static bearer token in the connection handshake (per-store
-  secret file, `0600`, same token on all clients). LAN deployment. TLS
-  explicitly out of scope for v4.0 (LAN trust boundary — revisit only if
-  the deployment leaves the LAN).
-- **Batching**: the write API is batch-shaped end-to-end (MCP tools already
-  are: create_entities[], create_relations[]). One client batch = one tx
-  request = one group commit. No autocommit-per-record anywhere.
-- **The seam** (`Design_ShardSeamFirst_2026_08_20`): every ref on the wire
-  and in adjacency is segment-qualified: packed u64 `(u16 seg | u48 off)`.
-  Node identity for external callers is the **logical node id** (r1 Q3
-  resolved: option (b)), mapped via a per-segment indirection table
-  (node_id → packed ref). The indirection table is simultaneously:
-  1. the rebalance mechanism (move node = update one table entry),
-  2. the stable external id for the MCP layer and walker counters,
-  3. the future cross-shard forwarding point (a table entry that says
-     "segment 12, which lives on host X" is routing, and nothing about
-     the record format changes).
-  Sharding-the-implementation = "some segments are served by another owner
-  behind the same protocol". The protocol, refs, and indirection are built
-  so that sentence is *only* about the owner, never about the store format.
-- Cost accepted: one indirection per hop entry into a node. Adjacency
-  stores packed refs (fast path); the indirection is consulted at the MCP
-  boundary and on rebalance-forwarding, not per traversal step (refs are
-  repaired lazily when a traversal crosses a moved node — forwarding entry
-  retained until the last referrer segment has been rewritten by some
-  later tx).
+## 4. Reads
 
-## 7. Open questions (to resolve before freeze)
+All reads through the owner (remote machines make local-mmap clients moot).
+RO `MAP_SHARED` mapping + pwrite coherence via the page cache; the only
+durability barrier is fdatasync on the commit path, held under nothing.
+Leases (owner-internal, bounded) pin snapshots for cursors; expired cursors
+re-resolve and say so.
 
-- **Q1 page size.** 4K logical pages (matches device/mmap granularity,
-  minimal COW amplification for scattered melts) vs 16K (fewer freelist
-  entries, longer adjacency runs per page). Strawman: 4K pages, allocation
-  *clusters* of 4 pages for adjacency-heavy nodes. Decide by benchmark on
-  the real 90K-entity store's dirty-page distribution per melt batch.
-- **Q2 strings.** r1 strawman stands: global string segment group (max
-  dedup — the KB dedups heavily), own refcounts, same paged mechanics.
-  Per-segment tables would simplify future sharding (no cross-shard string
-  refs) at real dedup cost — measure dedup ratio before freeze; the seam
-  requires only that string refs also be `(seg|off)`-shaped.
-- **Q3 segment size / split.** Target 4–16MB, split on overflow. With
-  page-COW this is placement granularity only (no copy cost cliff), so the
-  pressure that produced r1-Q1 is gone; choose for locality.
-- **Q4 dirty-page write strategy.** Write COW pages via `pwrite` into the
-  (preallocated, `fallocate`d) file vs mmap-dirty + `msync(frozen range)`.
-  Lean `pwrite` + `fdatasync`: no writable mmap of live files at all, which
-  makes §2's "structurally impossible" literal.
-- **Q5 manifest folding.** Single-segment txs commit via segment meta only;
-  the manifest then lags. Recovery rule: store txid = max(manifest txid,
-  per-segment meta txids) with manifest consulted only for multi-segment
-  atomicity groups. Verify this composes with lease pinning; else manifest
-  every tx (it's one small fsync'd append — acceptable fallback).
-- **Q6 owner lifecycle.** systemd user unit on the KB host (it's a
-  long-lived network daemon now — first-client-spawns no longer makes
-  sense). Health endpoint for the shims; shim behavior on owner restart =
-  reconnect + re-resolve cursors (§4).
-- **Q7 rank cadence.** Watermarks for ψ warm-start recompute and MC top-up
-  (edit-count? wall-clock? both?). Needs measurement of rank drift vs melt
-  rate on the live store.
-- **Q8 migration.** One-shot import: v3 file → owner ingest as one batched
-  tx stream (segment placement = §8 streaming assignment from a cold
-  start). Verify counts + spot-check refs + full validate_graph before
-  cutover; keep the v3 file frozen as fallback for one release.
+Measured (rdtsc p50, ladder N=500K, 4K): read 88 cyc, pin_read 85,
+touch 4.4K (memcpy-bound), alloc 265, pin+unpin 3.7K (ptable memcpy →
+lease-per-cursor, not per-op), commit(K=16 melt) 69K ≈ 27µs, recover 30K ≈
+11.5µs. Commit cost is scale-flat 5K→500K.
 
-## 8. Locality (mitigation, not solution — unchanged from r1)
+## 5. mstore: manifest + cross-segment atomicity — FROZEN
 
-KB: `Design_CommunityPageLocality_2026_07_01`. Community-based streaming
-placement (Fennel/LDG-style), bounded KL/FM refinement piggybacked only on
-commits already dirtying both segments, hubs accepted as cross-segment.
-Under page-COW the refinement budget is cheaper (pages, not segments), but
-the discipline stands: swaps ride existing dirt, never generate their own.
+Record: `[MST_MAGIC][nsegs][store_txid][(seg_id, pad, seg_txid)×nsegs][crc]`,
+append-only, fsync'd on **every** store commit (r2-Q5 closed conservatively;
+folding is a later optimization). Scan-forward recovery, torn tail ignored.
 
-## 9. What this deletes
+**Dual-meta selection property** (`Insight_DualMetaSelectionProperty`): a
+store commit advances each dirty segment by exactly one meta toggle, so
+both states the store could want are always on disk; the manifest *names*
+which one each segment presents (`segfile_open_at` exact-txid selection).
+Rollback of a ran-ahead segment is a selection, not a repair; its orphaned
+slot is overwritten by the next commit. Seg txids are store txids (sparse
+per segment); segfile's txid gate is strictly-forward.
 
-- both flocks, lock ordering, `withReadLock`/`withWriteLock`
-- `refresh()`/remap protocol, `migrate.lock`
-- blocking whole-arena `msync` under a lock (there is no shared mmap, no
-  arena, and no lock to hold it under)
-- per-client server processes mapping one live file; N stdio servers
-- manual KB file transfer between machines (the entire failure mode)
-- the WAL that was never written (roadmap stage 2)
-- segment-generation file churn from r1 (page COW happens *inside* the
-  segment file; generations exist only as meta txids)
+Evidence: 184 global crash points (one event clock across manifest + 3
+segment files) — recovery always lands on ONE consistent store txid ∈
+{acked, acked+1}, zero mixed states, byte-exact per segment.
 
-## 10. Delivery phases
+Free consequence: a **consistent cross-segment (later: cross-shard)
+snapshot is just a manifest record** — pin the store txid, each segment
+pins its named seg txid.
 
-1. **Spec freeze** — iterate this document; freeze: page header, meta page,
-   freelist record, manifest record, packed ref, frame header, handshake.
-2. **libsegstore (C)** — paged segment + dual meta + freelist + manifest +
-   commit/recovery, single process, no network. Crash-injection harness
-   (kill -9 at every write/fsync boundary; property: recovered state ==
-   last committed txid, no torn page reachable). ACSL/WP over commit/
-   recovery paths (`Heuristic_WP_RealMmapCode_2026_06_28` technique; the
-   memfile-era proofs do NOT carry over — new core, new proofs).
-3. **Owner daemon** — TCP transport + token, request multiplexing, group
-   commit, snapshot leases, counter relaxation, background rank (§5).
-   Minimal-core index layer (trigram/type/BFS) ported onto paged reads.
-4. **Client cutover** — server.ts → thin shim (MCP surface unchanged);
-   migrate v3 store (§7.Q8); delete the flock layer; all machines point at
-   the daemon. **This is the phase that ends KB file transfers.**
-5. **Locality + rank tuning** — streaming assignment, then swaps/compaction
-   and rank cadence from measurement, not before.
+## 6. Network protocol
 
-## 11. Explicit non-goals
+### 6.1 Framing and auth
 
-- Multi-writer. One owner. Forever, until a measured workload says otherwise.
-- Sharding *implementation* (multi-host segment serving). The seam (§6) is
-  in; the second host is not.
-- General MVCC with a shared reader table (owner-internal leases only).
-- LSM levels / read-path merging (rejected: traversal is the hot path).
-- In-place mutation of published pages (the v3 sin, in any disguise).
-- TLS / WAN exposure (LAN + token; revisit on deployment change).
+Length-prefixed binary frames, request-id multiplexed, version byte first;
+payload encoding may evolve, the frame header is frozen at daemon v1.
+Static bearer token in the handshake (0600 secret file); LAN boundary; TLS
+out of scope until the deployment leaves the LAN. Write API is batch-shaped
+end-to-end: one client batch = one store txn = one group commit.
+
+### 6.2 Traversal algebra: TRAVERSE / RESUME
+(`Design_PartialTraversalProtocol_2026_08_23`)
+
+Partial traversals are first-class protocol objects, not an optimization:
+
+    TRAVERSE { seeds: [(ref, alg_state)], spec: {dir, filter, budget},
+               semantics }
+    → { partial_results, continuations: [(ref, alg_state, residual_budget)],
+        exhausted }
+    RESUME { token }        // token = { store_txid, continuations[] }
+
+    Law: resume(continuations) ⊕ partial_results ≡ full traversal,
+         ⊕ = the declared combine algebra.
+
+Semantics classes (normative):
+
+| class     | algebra                | ops                          | distribution behavior |
+|-----------|------------------------|------------------------------|-----------------------|
+| SET       | union (comm., idem.)   | neighbors(d), reachability, orphans | shard-local schedule freedom (BFS/DFS/async); idempotent retry |
+| MIN_DIST  | min-combine (monotone) | BFS distances, shortest path | async over-exploration legal (delta-stepping); label correction |
+| ANY_PATH  | first-witness          | find_path                    | bidir seeds; first meet wins |
+| SERIAL    | none (chain)           | random_walk, DFS *ordering*  | continuation migrates to owning shard; exactly-once token |
+
+- Continuation tokens carry the **store txid**: a resumed traversal — across
+  requests, shards, minutes — runs against one consistent snapshot (§5).
+- `alg_state` cost: SET none, MIN_DIST u32, RPQ = NFA state mask (≤64-state
+  masks per the regex determinizer) — RPQ distributes with zero extra
+  protocol machinery (`BGS_RPQ` closed over).
+- Today's MCP ops are thin presets over TRAVERSE; pagination cursors are
+  continuations that never crossed a shard. `graph_find_path_ex`'s
+  {budget_exhausted, farthest} was this shape before it had a name.
+- v4.0 single-host: continuations surface only on budget exhaustion.
+  Sharding changes *who resumes*, never what a continuation is.
+
+### 6.3 Depth semantics — canonical
+
+Public numbering is **0-indexed**: depth 0 = immediate neighbors (op_bench
+"d0", MCP schema). C-layer hop-count (1 = immediate) is internal; exactly
+one +1 translation lives at the boundary, pinned by an omitted-depth test
+(`Fix_DepthDefault_2026_08_23`; the handler-default divergence returned
+2-hop sets against a schema promising immediate — three numberings may
+never again meet an untested default).
+
+### 6.4 The shard seam
+(`Design_ShardSeamFirst_2026_08_20`, `Design_ShardOpClasses_2026_08_23`)
+
+- Refs segment-qualified on the wire; node identity = logical node id via
+  the per-segment indirection table (rebalance mechanism + stable external
+  id + future cross-shard forwarding point, in one structure).
+- Op classes under sharding: **split-and-route** (search, by-type, scans,
+  point reads — per-shard indexes, scatter-gather, ≥linear) vs
+  **sequentially-bound** (traversals — placement hostage; cross-host edge
+  ≈ 3 orders over the 175-cyc local d0 op). Community placement (§8) keeps
+  crossings rare; TRAVERSE continuations grouped per shard per round keep
+  them batched; bidir BFS halves the rounds.
+- Writes: community-clustered melts → mostly single-shard txns (zero
+  coordination); cross-shard txns ride §5 unchanged (the selection argument
+  is host-count-agnostic; only the manifest's home host is new engineering).
+- Open under sharding: ψ/MERW (per-shard iteration + boundary exchange is
+  an argument, not yet a measurement).
+
+## 7. Rank maintenance (amortized, background — unchanged from r2)
+
+MC structural rank in idle slices (error ∝ 1/√π: important nodes converge
+first); ψ warm-start power iteration on edit watermarks; all rank writes via
+the relaxed counter class. Never on an op path (`Design_RankAmortized`).
+
+## 8. Locality (mitigation, not solution — unchanged)
+
+Community streaming placement (Fennel/LDG), bounded KL/FM swaps riding
+existing commit dirt, hubs accepted as cross-segment, full re-cut last
+resort (`Design_CommunityPageLocality_2026_07_01`).
+
+## 9. What this deletes (all verified deleted in the v4 stack)
+
+flocks + lock ordering; refresh/remap; migrate.lock; msync (does not exist);
+per-client processes on one live file; manual KB file transfer; the WAL
+(never written); segment-generation file churn (COW is intra-file).
+
+## 10. Delivery
+
+1. ~~Spec freeze~~ — **this document (r3)**.
+2. ~~libsegstore~~ — **DONE**: seg_meta / seg_page / seg_io / seg_file /
+   seg_txn / seg_mstore + crash harnesses + WP + ladder bench.
+   `feat/libsegstore` @ `c6e4704`. Residual: WP pass over seg_txn/mstore
+   arithmetic helpers (quality, not blocking).
+3. **Owner daemon** ← next: TCP+token framing, TRAVERSE/RESUME +
+   batch-write verbs, group commit over mstore, leases, counter relaxation,
+   background rank; graph layer (graph.c + minimal-core indexes: trigram,
+   type, bidir BFS) ported onto seg_txn refs.
+4. **Client cutover**: server.ts → thin shim; one-shot v3 import; all
+   machines point at the daemon. Ends KB file transfers.
+5. **Locality + rank cadence** from measurement.
+
+## 11. Non-goals (unchanged)
+
+Multi-writer; sharding implementation (the seam is in, the second host is
+not); shared reader tables; LSM; in-place mutation of published pages;
+TLS/WAN.
