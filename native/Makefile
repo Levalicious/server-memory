@@ -11,10 +11,10 @@ CFLAGS = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 LIBS = -lm
 OUT = /tmp/mf_test
 
-.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore bench proofs proofs-eva wp-segmeta clean
+.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 bench proofs proofs-eva wp-segmeta clean
 
 # `make test` = prove the detector fires, then run every harness with it active.
-test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore
+test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4
 
 test_segmeta: test_segmeta.c seg_meta.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_segmeta && $(OUT)_segmeta
@@ -88,3 +88,6 @@ SEGBENCH_SRC = bench_segstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_pag
 bench_segstore: $(SEGBENCH_SRC)
 	$(CC) $(BENCH_CFLAGS) $(SEGBENCH_SRC) -lm -o $(OUT)_segbench4k && $(OUT)_segbench4k
 	$(CC) $(BENCH_CFLAGS) -DSEG_PAGE_SIZE=16384u $(SEGBENCH_SRC) -lm -o $(OUT)_segbench16k && $(OUT)_segbench16k
+
+test_str4: test_str4.c seg_str4.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c
+	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_str4 && $(OUT)_str4

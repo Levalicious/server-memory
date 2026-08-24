@@ -30,6 +30,9 @@
 typedef struct { u64 txid; u32 *pg; u32 n; } pend_t;
 typedef struct { u32 lpg; u8 *buf; } dirty_t;
 
+struct segstore;
+static dirty_t *find_dirty(struct segstore *st, u32 lpg);
+
 struct segstore {
     segfile_t *sf;
     u32 *ptable; u64 logical_pages, lp_cap;
@@ -223,6 +226,17 @@ void segstore_close(segstore_t *st) {
 
 u64 segstore_txid(const segstore_t *st)          { return st->sf->meta.txid; }
 u64 segstore_logical_pages(const segstore_t *st) { return st->logical_pages; }
+
+const u8 *seg_txn_view(segstore_t *st, u32 lpg) {
+    if (st->txn_open) {
+        for (u32 i = 0; i < st->nfreed; i++)
+            if (st->freed[i] == lpg) return NULL;
+        dirty_t *d = find_dirty(st, lpg);
+        if (d) return d->buf;
+        if (lpg >= st->txn_logical_pages) return NULL;
+    }
+    return segstore_read(st, lpg);
+}
 
 const u8 *segstore_read(segstore_t *st, u32 lpg) {
     if (lpg >= st->logical_pages) return NULL;

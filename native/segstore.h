@@ -364,6 +364,9 @@ u64         segstore_logical_pages(const segstore_t *st);
 
 /* committed read: RO pointer to logical page lpg, NULL if unmapped */
 const u8 *segstore_read(segstore_t *st, u32 lpg);
+/* read-through-txn: the open txn's working copy if lpg is dirty, else the
+ * committed page. What a layer building ON txns (graph, strings) reads. */
+const u8 *seg_txn_view(segstore_t *st, u32 lpg);
 
 /* snapshot pins */
 segpin_t *seg_pin(segstore_t *st);
@@ -386,6 +389,40 @@ int  seg_txn_commit(segstore_t *st);
 /* commit with an explicit (store-assigned) txid; must be > current */
 int  seg_txn_commit_as(segstore_t *st, u64 commit_txid);
 void seg_txn_abort(segstore_t *st);
+
+/* ------------------------------------------------------------------ *
+ * st4 — refcounted interned strings over a segstore (seg_str4.c).
+ *
+ * Design_St4Strings_2026_08_24:
+ *   sid (u32) = ((lpg << 12) | slot) + 1; 0 = NULL. Stable forever because
+ *   slot ids survive compaction (FROZEN property of the slotted page).
+ *   Caps the string segment at 2^20 logical pages (4 GB of strings).
+ *   Record = [u32 refcount][bytes]; length = slot size - 4.
+ *   Intern map (bytes-hash -> sid) is owner-private memory, rebuilt by a
+ *   page scan at open; only records persist. decref to 0 deletes the
+ *   record (slot reused by the page's lowest-dead-slot policy).
+ *
+ * All mutating calls require an open txn on the underlying segstore; reads
+ * go through seg_txn_view so a txn sees its own interns. The graph and
+ * string segments commit in ONE mstore txn = cross-segment atomicity.
+ * ------------------------------------------------------------------ */
+
+typedef struct st4 st4_t;
+
+st4_t *st4_open(segstore_t *seg);              /* scans pages, builds map */
+void   st4_close(st4_t *st);
+u32    st4_count(const st4_t *st);             /* live string count */
+
+/* intern: existing -> refcount+1; new -> record with refcount 1. 0 = fail.
+ * len in [1, SEG_PAGE_MAX_REC-4]. */
+u32 st4_intern(st4_t *st, const u8 *bytes, u16 len);
+/* bytes of a live sid (txn view); NULL if dead/invalid. *len_out set. */
+const u8 *st4_get(st4_t *st, u32 sid, u16 *len_out);
+int st4_incref(st4_t *st, u32 sid);            /* 1 = ok */
+int st4_decref(st4_t *st, u32 sid);            /* 1 = ok; 0 refs deletes */
+u32 st4_refcount(st4_t *st, u32 sid);          /* 0 if dead */
+/* lookup without interning: sid or 0 */
+u32 st4_find(st4_t *st, const u8 *bytes, u16 len);
 
 /* ------------------------------------------------------------------ *
  * mstore — multi-segment store with a manifest pivot (seg_mstore.c).
