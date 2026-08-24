@@ -71,8 +71,8 @@ int main(void) {
         u32 a = g4_create_entity(g, (const u8 *)"E", 1, (const u8 *)"t", 1, 1);
         assert(a);
         assert(g4_add_observation(g, a, (const u8 *)"obs one", 7, 10) == 1);
-        assert(g4_add_observation(g, a, (const u8 *)"obs one", 7, 11) == 0);  /* dup */
         assert(g4_add_observation(g, a, (const u8 *)"obs two", 7, 12) == 1);
+        /* v3 semantics: no dup refusal; the LIMIT is what refuses now */
         assert(g4_add_observation(g, a, (const u8 *)"obs three", 9, 13) == 0); /* limit 2 */
         g4_entity_t e;
         assert(g4_read_entity(g, a, &e));

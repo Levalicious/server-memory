@@ -2,13 +2,17 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <regex.h>
+#include "regex.h"    /* our byte-level, linear-time engine (NOT POSIX <regex.h>) */
+#include "re_dfa.h"   /* determinized matcher for the search path */
+#include "re_trigram.h" /* trigram prefilter (candidate narrowing) */
 #include "entity.h"   /* versioned record schema (single source of truth) */
 
-#define GRAPH_HEADER_SIZE 40u   /* node_log_off, structural_total, walker_total, name_index_off, schema_ver, pad */
+#define GRAPH_HEADER_SIZE 40u   /* reserved0, structural_total, walker_total, name_index_off, schema_ver, pad */
 
-/* graph header field offsets */
-#define GH_NODE_LOG_OFF     0
+/* graph header field offsets. GH_RESERVED_0 was the node-log offset; the node
+ * log was eliminated 2026-07-13 (the name index is the sole entity registry).
+ * The slot is left dead rather than renumbered so existing stores still map. */
+#define GH_RESERVED_0       0
 #define GH_STRUCTURAL_TOTAL 8
 #define GH_WALKER_TOTAL     16
 #define GH_NAME_INDEX_OFF   24
@@ -57,8 +61,6 @@ static inline u32 hash32(u32 x) {
 }
 
 /* ---- graph header accessors ---- */
-static inline u64 node_log_off(graph_t *g)   { return rdu64(g->mf, g->header_offset + GH_NODE_LOG_OFF); }
-static inline void set_node_log_off(graph_t *g, u64 v) { wru64(g->mf, g->header_offset + GH_NODE_LOG_OFF, v); }
 static inline u64 name_index_off(graph_t *g) { return rdu64(g->mf, g->header_offset + GH_NAME_INDEX_OFF); }
 static inline void set_name_index_off(graph_t *g, u64 v) { wru64(g->mf, g->header_offset + GH_NAME_INDEX_OFF, v); }
 
@@ -191,46 +193,21 @@ void graph_read_entity(graph_t *g, u64 off, entity_t *e) {
 }
 
 /* ======================================================================
- * Node log
+ * Entity registry = the name index
+ *
+ * The node log was eliminated 2026-07-13 (Decision_EliminateNodeLog): it was a
+ * redundant second registry that made create/delete carry log bookkeeping. The
+ * name index already holds EVERY entity (ni_insert on create, regardless of
+ * edges), so it is the sole registry. Enumeration walks its buckets via
+ * ni_bucket_count + ni_slot_entity, skipping empty buckets (offset 0). NOTE:
+ * iteration order is bucket order — NOT insertion order (callers must not rely
+ * on ordering; the log's insertion-order guarantee is gone by design).
  * ====================================================================== */
-
-static void log_append(graph_t *g, u64 ent_off) {
-    memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0);
-    u32 cap = rdu32(mf, log + 4);
-    if (count < cap) {
-        wru64(mf, log + NODE_LOG_HEADER_SIZE + (u64)count * 8, ent_off);
-        wru32(mf, log + 0, count + 1);
-        return;
-    }
-    u32 newcap = cap * 2;
-    u64 newlog = memfile_alloc(mf, NODE_LOG_HEADER_SIZE + (u64)newcap * 8);
-    if (!newlog) return;
-    wru32(mf, newlog + 0, count + 1);
-    wru32(mf, newlog + 4, newcap);
-    if (count) memcpy(memfile_ptr(mf, newlog + NODE_LOG_HEADER_SIZE),
-                      memfile_ptr(mf, log + NODE_LOG_HEADER_SIZE), (u64)count * 8);
-    wru64(mf, newlog + NODE_LOG_HEADER_SIZE + (u64)count * 8, ent_off);
-    memfile_free(mf, log, NODE_LOG_HEADER_SIZE + (u64)cap * 8);
-    set_node_log_off(g, newlog);
-}
-
-static void log_remove(graph_t *g, u64 ent_off) {
-    memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0);
-    for (u32 i = 0; i < count; i++) {
-        if (rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8) == ent_off) {
-            u32 last = count - 1;
-            if (i < last)
-                wru64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8,
-                      rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)last * 8));
-            wru32(mf, log + 0, last);
-            return;
-        }
-    }
-}
+static inline u32 ni_bucket_count(graph_t *g) { return rdu32(g->mf, name_index_off(g) + 0); }
+/* live entity count is the name-index population counter (idx + 4) */
+static inline u32 ni_entity_count(graph_t *g) { return rdu32(g->mf, name_index_off(g) + 4); }
+/* offset stored in bucket `s` (0 = empty bucket) */
+static inline u64 ni_slot_entity(graph_t *g, u32 s) { return rdu64(g->mf, ni_bucket_pos(name_index_off(g), s) + 8); }
 
 /* ======================================================================
  * Adjacency
@@ -327,6 +304,168 @@ u64 graph_lookup(graph_t *g, const u8 *name, u16 name_len) {
     return ni_lookup(g, (u32)nid);
 }
 
+/* ---- incremental catch-up: dirty-set of entity offsets changed since the last
+ * sync. Writes mark O(1); graph_index_sync applies only the deltas. Op is
+ * last-write-wins; correctness comes from the diff-based live_set / live_remove
+ * against the index's stored state, so delete-then-reuse of an offset is fine. */
+#define TRI_REINDEX 1
+#define TRI_REMOVE  2
+
+static void dirty_free(graph_t *g) {
+    free(g->tri_dirty); free(g->tri_dirty_op);
+    g->tri_dirty = NULL; g->tri_dirty_op = NULL; g->tri_dirty_cap = g->tri_dirty_cnt = 0;
+}
+/* On OOM, drop the index so the next sync full-rebuilds — sound, never stale. */
+static void dirty_drop_index(graph_t *g) {
+    if (g->tri) { re_trigram_live_free(g->tri); g->tri = NULL; }
+    dirty_free(g);
+}
+static void dirty_grow(graph_t *g) {
+    u32 ncap = g->tri_dirty_cap ? g->tri_dirty_cap * 2 : 256;
+    u64 *no = calloc(ncap, sizeof *no);
+    u8  *nop = calloc(ncap, sizeof *nop);
+    if (!no || !nop) { free(no); free(nop); dirty_drop_index(g); return; }
+    u32 mask = ncap - 1;
+    for (u32 i = 0; i < g->tri_dirty_cap; i++) if (g->tri_dirty[i]) {
+        u64 off = g->tri_dirty[i]; u32 s = hash32((u32)(off ^ (off >> 32))) & mask;
+        while (no[s]) s = (s + 1) & mask;
+        no[s] = off; nop[s] = g->tri_dirty_op[i];
+    }
+    free(g->tri_dirty); free(g->tri_dirty_op);
+    g->tri_dirty = no; g->tri_dirty_op = nop; g->tri_dirty_cap = ncap;
+}
+static void dirty_mark(graph_t *g, u64 off, u8 op) {
+    if (!g->tri) return;   /* index not built yet — the next full build catches up */
+    if ((u64)(g->tri_dirty_cnt + 1) * 10 >= (u64)g->tri_dirty_cap * 7) {
+        dirty_grow(g);
+        if (!g->tri) return;    /* grow OOM dropped the index */
+    }
+    u32 mask = g->tri_dirty_cap - 1, s = hash32((u32)(off ^ (off >> 32))) & mask;
+    while (g->tri_dirty[s]) { if (g->tri_dirty[s] == off) { g->tri_dirty_op[s] = op; return; } s = (s + 1) & mask; }
+    g->tri_dirty[s] = off; g->tri_dirty_op[s] = op; g->tri_dirty_cnt++;
+}
+static void dirty_clear(graph_t *g) {
+    if (g->tri_dirty) memset(g->tri_dirty, 0, (size_t)g->tri_dirty_cap * sizeof *g->tri_dirty);
+    g->tri_dirty_cnt = 0;
+}
+
+/* Re-index entity `off` in the trigram prefilter from its current searchable
+ * fields (name, type, obs0, obs1). Idempotent. */
+static void tri_reindex(graph_t *g, u64 off) {
+    if (!g->tri) return;
+    memfile_t *mf = g->mf;
+    u32 ids[4] = { rdu32(mf, off + E_NAME_ID), rdu32(mf, off + E_TYPE_ID),
+                   rdu32(mf, off + E_OBS0),    rdu32(mf, off + E_OBS1) };
+    const char *fields[4]; size_t lens[4]; int nf = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!ids[i]) continue;
+        u16 l; const u8 *s = st_get(g->st, ids[i], &l);
+        fields[nf] = (const char *)s; lens[nf] = l; nf++;
+    }
+    re_trigram_live_set(g->tri, off, fields, lens, nf);
+}
+
+/* ======================================================================
+ * Type index: type_id -> set of entity offsets (in-memory, not persisted).
+ *
+ * entities_by_type was an O(N) walk of every name-index bucket that pointer-
+ * chased into each scattered entity record just to read its type_id (at 500K,
+ * 66% of the cost was that chase). This reverse index makes it O(result): a
+ * per-type open-addressing hash-set of offsets. type_id is immutable for an
+ * entity's life (set at create, released at delete — there is no set-type op),
+ * so maintenance is a single O(1) add/remove on create/delete, with no
+ * decouple/dirty machinery (unlike the trigram index, whose per-write reindex
+ * is expensive). Lazily built on first query; O(1) maintained thereafter.
+ *
+ * Sentinels: type_id is never 0 (0 = "no such string") so it marks an empty
+ * outer bucket; entity offsets are never 0 so 0 marks an empty posting slot.
+ * ====================================================================== */
+static inline u32 mix_off(u64 x) { return (u32)((x * 0x9e3779b97f4a7c15ull) >> 32); }
+
+typedef struct { u64 *slots; u32 cap, cnt; } TypePost;   /* hash-set of offsets */
+struct TypeIndex { u32 *keys; TypePost *posts; u32 cap, cnt; };  /* type_id -> posting */
+
+static int tp_grow(TypePost *p) {
+    u32 nc = p->cap ? p->cap * 2 : 8, nmask = nc - 1;
+    u64 *ns = calloc(nc, sizeof *ns);
+    if (!ns) return 0;
+    for (u32 i = 0; i < p->cap; i++) {
+        u64 v = p->slots[i]; if (!v) continue;
+        u32 s = mix_off(v) & nmask; while (ns[s]) s = (s + 1) & nmask; ns[s] = v;
+    }
+    free(p->slots); p->slots = ns; p->cap = nc; return 1;
+}
+static int tp_add(TypePost *p, u64 off) {   /* 1 ok, 0 OOM (caller drops the index) */
+    if (!p) return 0;
+    if (!p->cap || (u64)(p->cnt + 1) * 10 >= (u64)p->cap * 7) { if (!tp_grow(p)) return 0; }
+    u32 mask = p->cap - 1, s = mix_off(off) & mask;
+    while (p->slots[s]) { if (p->slots[s] == off) return 1; s = (s + 1) & mask; }
+    p->slots[s] = off; p->cnt++; return 1;
+}
+static void tp_del(TypePost *p, u64 off) {   /* backward-shift delete; never allocs */
+    if (!p || !p->cap) return;
+    u32 mask = p->cap - 1, s = mix_off(off) & mask;
+    while (p->slots[s]) { if (p->slots[s] == off) break; s = (s + 1) & mask; }
+    if (!p->slots[s]) return;   /* not present */
+    for (u32 j = s;;) {
+        j = (j + 1) & mask;
+        if (!p->slots[j]) break;
+        if (ni_needs_reloc(mix_off(p->slots[j]) & mask, s, j)) { p->slots[s] = p->slots[j]; s = j; }
+    }
+    p->slots[s] = 0; p->cnt--;
+}
+
+static int tyx_grow(TypeIndex *t) {
+    u32 nc = t->cap ? t->cap * 2 : 64, nmask = nc - 1;
+    u32 *nk = calloc(nc, sizeof *nk);
+    TypePost *np = calloc(nc, sizeof *np);
+    if (!nk || !np) { free(nk); free(np); return 0; }
+    for (u32 i = 0; i < t->cap; i++) {
+        if (!t->keys[i]) continue;
+        u32 s = hash32(t->keys[i]) & nmask; while (nk[s]) s = (s + 1) & nmask;
+        nk[s] = t->keys[i]; np[s] = t->posts[i];   /* move posting (owns slots ptr) */
+    }
+    free(t->keys); free(t->posts); t->keys = nk; t->posts = np; t->cap = nc; return 1;
+}
+/* Locate the posting for `tid`; create the bucket if `create` and absent.
+ * Returns NULL if absent (and !create) or on OOM. */
+static TypePost *tyx_slot(TypeIndex *t, u32 tid, int create) {
+    if (create && (!t->cap || (u64)(t->cnt + 1) * 10 >= (u64)t->cap * 7)) {
+        if (!tyx_grow(t) && !t->cap) return NULL;
+    }
+    if (!t->cap) return NULL;
+    u32 mask = t->cap - 1, s = hash32(tid) & mask;
+    while (t->keys[s]) { if (t->keys[s] == tid) return &t->posts[s]; s = (s + 1) & mask; }
+    if (!create) return NULL;
+    t->keys[s] = tid; t->cnt++; return &t->posts[s];   /* posts[s] zeroed by calloc */
+}
+static void tyx_free(TypeIndex *t) {
+    if (!t) return;
+    for (u32 i = 0; i < t->cap; i++) free(t->posts[i].slots);
+    free(t->keys); free(t->posts); free(t);
+}
+/* One O(N) pass over the buckets — the only time we pointer-chase for type_id. */
+static TypeIndex *tyx_build(graph_t *g) {
+    TypeIndex *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    u32 bc = ni_bucket_count(g);
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s); if (!e) continue;
+        if (!tp_add(tyx_slot(t, rdu32(g->mf, e + E_TYPE_ID), 1), e)) { tyx_free(t); return NULL; }
+    }
+    return t;
+}
+static void tyx_drop(graph_t *g) { tyx_free(g->type_idx); g->type_idx = NULL; }
+/* O(1) maintenance hooks; on OOM drop the index so the next query rebuilds. */
+static void tyx_on_create(graph_t *g, u32 tid, u64 off) {
+    if (!g->type_idx) return;
+    if (!tp_add(tyx_slot(g->type_idx, tid, 1), off)) tyx_drop(g);
+}
+static void tyx_on_delete(graph_t *g, u32 tid, u64 off) {
+    if (!g->type_idx) return;
+    tp_del(tyx_slot(g->type_idx, tid, 0), off);
+}
+
 u64 graph_create_entity(graph_t *g, const u8 *name, u16 name_len,
                         const u8 *type, u16 type_len, u64 mtime) {
     u64 existing = graph_lookup(g, name, name_len);
@@ -344,8 +483,9 @@ u64 graph_create_entity(graph_t *g, const u8 *name, u16 name_len,
     wru64(g->mf, off + E_MTIME, mtime);
     /* obs_mtime stays 0 until an observation is added (matches old no-obs => 0). */
 
-    log_append(g, off);
-    ni_insert(g, (u32)nid, off);
+    ni_insert(g, (u32)nid, off);   /* name index is the sole registry (node log eliminated) */
+    dirty_mark(g, off, TRI_REINDEX);   /* decoupled: caught up incrementally at search */
+    tyx_on_create(g, (u32)tid, off);   /* type index: O(1), no-op until first by_type query */
     return off;
 }
 
@@ -371,8 +511,9 @@ int graph_delete_entity(graph_t *g, u64 off) {
         memfile_free(g->mf, e.adj_offset, ADJ_HEADER_SIZE + (u64)cap * ADJ_ENTRY_SIZE);
     }
 
-    ni_remove(g, e.name_id);
-    log_remove(g, off);
+    dirty_mark(g, off, TRI_REMOVE);   /* decoupled: caught up incrementally at search */
+    tyx_on_delete(g, e.type_id, off);   /* type index: O(1) removal (type_id still valid here) */
+    ni_remove(g, e.name_id);   /* sole registry removal; O(1) amortized, no log to patch */
 
     st_release(g->st, e.name_id);
     st_release(g->st, e.type_id);
@@ -405,7 +546,7 @@ int graph_delete_relation(graph_t *g, u64 from, u64 to, const u8 *rt, u16 rt_len
 }
 
 u32 graph_entity_count(graph_t *g) {
-    return rdu32(g->mf, node_log_off(g) + 0);
+    return ni_entity_count(g);
 }
 
 /* ======================================================================
@@ -422,6 +563,7 @@ int graph_add_observation(graph_t *g, u64 off, const u8 *obs, u16 len, u64 mtime
     wru8(mf, off + E_OBSCNT, (u8)(cnt + 1));
     wru64(mf, off + E_OBSM, mtime);
     wru64(mf, off + E_MTIME, mtime);
+    dirty_mark(g, off, TRI_REINDEX);
     return 1;
 }
 
@@ -443,6 +585,7 @@ int graph_remove_observation(graph_t *g, u64 off, const u8 *obs, u16 len, u64 mt
     wru8(mf, off + E_OBSCNT, (u8)(rdu8(mf, off + E_OBSCNT) - 1));
     wru64(mf, off + E_OBSM, mtime);
     wru64(mf, off + E_MTIME, mtime);
+    dirty_mark(g, off, TRI_REINDEX);
     return 1;
 }
 
@@ -455,45 +598,59 @@ const u8 *graph_entity_name(graph_t *g, u64 off, u16 *len_out) {
 }
 
 u32 graph_list_entities(graph_t *g, u64 *out, u32 max) {
-    memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0);
-    u32 n = count < max ? count : max;
-    for (u32 i = 0; i < n; i++) out[i] = rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8);
-    return count;
+    u32 bc = ni_bucket_count(g), found = 0;
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
+        if (found < max) out[found] = e;
+        found++;
+    }
+    return found;
 }
 
 u32 graph_entities_by_type(graph_t *g, const u8 *type, u16 len, u64 *out, u32 max) {
     memfile_t *mf = g->mf;
     u64 tid = st_find(g->st, type, len);
     if (!tid) return 0;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0), found = 0;
-    for (u32 i = 0; i < count; i++) {
-        u64 e = rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8);
+    if (!g->type_idx) g->type_idx = tyx_build(g);   /* lazy build: one O(N) pass */
+    if (g->type_idx) {                              /* O(result): iterate the posting */
+        TypePost *p = tyx_slot(g->type_idx, (u32)tid, 0);
+        u32 found = 0;
+        if (p) for (u32 i = 0; i < p->cap; i++) {
+            u64 e = p->slots[i]; if (!e) continue;
+            if (found < max) { out[found] = e; }
+            found++;
+        }
+        return found;
+    }
+    /* OOM building the index: fall back to the sound O(N) bucket scan. */
+    u32 bc = ni_bucket_count(g), found = 0;
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
         if (rdu32(mf, e + E_TYPE_ID) == (u32)tid) { if (found < max) out[found] = e; found++; }
     }
     return found;
 }
 
 u32 graph_orphaned(graph_t *g, u64 *out, u32 max) {
-    memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0), found = 0;
-    for (u32 i = 0; i < count; i++) {
-        u64 e = rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8);
+    u32 bc = ni_bucket_count(g), found = 0;
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
         if (graph_edge_count(g, e) == 0) { if (found < max) out[found] = e; found++; }
     }
     return found;
 }
 
 u32 graph_relation_count(graph_t *g) {
-    memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0);
+    u32 bc = ni_bucket_count(g);
     u64 edges = 0;
-    for (u32 i = 0; i < count; i++)
-        edges += graph_edge_count(g, rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8));
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
+        edges += graph_edge_count(g, e);
+    }
     return (u32)(edges / 2);   /* each relation = forward + backward entry */
 }
 
@@ -504,15 +661,18 @@ static int cmp_u32(const void *a, const void *b) {
 
 u32 graph_entity_types(graph_t *g, u32 *out, u32 max) {
     memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0);
+    u32 count = ni_entity_count(g);
     if (count == 0) return 0;
     u32 *tmp = malloc((size_t)count * sizeof(u32));
-    for (u32 i = 0; i < count; i++)
-        tmp[i] = rdu32(mf, rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8) + E_TYPE_ID);
-    qsort(tmp, count, sizeof(u32), cmp_u32);
+    u32 bc = ni_bucket_count(g), n = 0;
+    for (u32 s = 0; s < bc && n < count; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
+        tmp[n++] = rdu32(mf, e + E_TYPE_ID);
+    }
+    qsort(tmp, n, sizeof(u32), cmp_u32);
     u32 distinct = 0;
-    for (u32 i = 0; i < count; i++)
+    for (u32 i = 0; i < n; i++)
         if (i == 0 || tmp[i] != tmp[i - 1]) { if (distinct < max) out[distinct] = tmp[i]; distinct++; }
     free(tmp);
     return distinct;
@@ -520,16 +680,19 @@ u32 graph_entity_types(graph_t *g, u32 *out, u32 max) {
 
 u32 graph_relation_types(graph_t *g, u32 *out, u32 max) {
     memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0);
+    u32 bc = ni_bucket_count(g);
     u64 total = 0;
-    for (u32 i = 0; i < count; i++)
-        total += graph_edge_count(g, rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8));
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
+        total += graph_edge_count(g, e);
+    }
     if (total == 0) return 0;
     u32 *tmp = malloc((size_t)total * sizeof(u32));
     u64 k = 0;
-    for (u32 i = 0; i < count; i++) {
-        u64 e = rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8);
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
         u64 adj = rdu64(mf, e + E_ADJ);
         if (!adj) continue;
         u32 ec = rdu32(mf, adj + 0);
@@ -548,40 +711,98 @@ u32 graph_relation_types(graph_t *g, u32 *out, u32 max) {
  * Search (POSIX ERE over name + type + observations); full result set
  * ====================================================================== */
 
-static int match_id(graph_t *g, regex_t *re, u32 id) {
+static int match_id(graph_t *g, const Regex *re, u32 id) {
     if (!id) return 0;
     u16 len; const u8 *s = st_get(g->st, id, &len);
-    regmatch_t pm; pm.rm_so = 0; pm.rm_eo = (regoff_t)len;
-    return regexec(re, (const char *)s, 0, &pm, REG_STARTEND) == 0;
+    return re_search(re, (const char *)s, len);
+}
+static int match_id_dfa(graph_t *g, const ReDfa *d, u32 id) {
+    if (!id) return 0;
+    u16 len; const u8 *s = st_get(g->st, id, &len);
+    return re_dfa_search(d, (const char *)s, len);
+}
+/* Does entity `off` match over any of name/type/obs0/obs1? DFA if available, else NFA. */
+static int entity_matches(graph_t *g, const ReDfa *d, const Regex *re, u64 off) {
+    memfile_t *mf = g->mf;
+    u32 nm = rdu32(mf, off + E_NAME_ID), ty = rdu32(mf, off + E_TYPE_ID),
+        o0 = rdu32(mf, off + E_OBS0),    o1 = rdu32(mf, off + E_OBS1);
+    if (d) return match_id_dfa(g, d, nm) || match_id_dfa(g, d, ty) || match_id_dfa(g, d, o0) || match_id_dfa(g, d, o1);
+    return match_id(g, re, nm) || match_id(g, re, ty) || match_id(g, re, o0) || match_id(g, re, o1);
+}
+
+/* Determinizing costs ~120K cyc even for a tiny pattern and amortizes only past
+ * this many verified docs; below it the build-free NFA is cheaper. */
+#define GRAPH_DFA_MIN_VERIFY 128u
+
+/* Bring the trigram prefilter current with the store. Writes only flag the index
+ * stale (O(1) — keeps write TPS at store speed); the catch-up (here, a full
+ * rebuild over the live name index) is deferred off the write path. Incremental
+ * / cheaper maintenance is a separate, independently benchmarked optimization. */
+void graph_index_sync(graph_t *g) {
+    if (!g->tri) {                                 /* not built yet — full build */
+        g->tri = re_trigram_live_new();
+        if (g->tri) {
+            u32 bc = ni_bucket_count(g);
+            for (u32 s = 0; s < bc; s++) { u64 e = ni_slot_entity(g, s); if (e) tri_reindex(g, e); }
+        }
+        dirty_clear(g);
+        return;
+    }
+    if (g->tri_dirty_cnt == 0) return;             /* index already current */
+    for (u32 i = 0; i < g->tri_dirty_cap; i++) {   /* apply only the deltas */
+        u64 off = g->tri_dirty[i];
+        if (!off) continue;
+        if (g->tri_dirty_op[i] == TRI_REMOVE) re_trigram_live_remove(g->tri, off);
+        else tri_reindex(g, off);                  /* REINDEX: entity live, set current fields */
+    }
+    dirty_clear(g);
 }
 
 u32 graph_search(graph_t *g, const char *pattern, u64 *out, u32 max) {
-    regex_t re;
-    if (regcomp(&re, pattern, REG_EXTENDED) != 0) return 0;   /* POSIX ERE, case-sensitive; invalid pattern -> no matches */
-    memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 count = rdu32(mf, log + 0), found = 0;
-    for (u32 i = 0; i < count; i++) {
-        u64 e = rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8);
-        if (match_id(g, &re, rdu32(mf, e + E_NAME_ID)) ||
-            match_id(g, &re, rdu32(mf, e + E_TYPE_ID)) ||
-            match_id(g, &re, rdu32(mf, e + E_OBS0))   ||
-            match_id(g, &re, rdu32(mf, e + E_OBS1))) {
-            if (found < max) out[found] = e;
-            found++;
+    const char *err = NULL;
+    ReNode *ast = re_parse(pattern, &err);
+    if (!ast) return 0;                       /* invalid pattern -> no matches */
+    Regex *re = re_compile_ast(ast);
+    if (!re) { re_ast_free(ast); return 0; }
+
+    graph_index_sync(g);   /* catch the prefilter up (deferred from writes) */
+
+    /* Prefilter first so we know how many docs we'll actually verify. */
+    ReTrigramQuery *q = re_trigram_build(ast);
+    ReCandidates64 cand = re_trigram_live_eval(q, g->tri);
+
+    u32 nverify = cand.all ? ni_entity_count(g) : cand.n;
+    ReDfa *d = (nverify >= GRAPH_DFA_MIN_VERIFY) ? re_dfa_build(re) : NULL;
+
+    u32 found = 0;
+    if (cand.all) {
+        u32 bc = ni_bucket_count(g);          /* full scan: walk the name index */
+        for (u32 s = 0; s < bc; s++) {
+            u64 e = ni_slot_entity(g, s);
+            if (!e) continue;
+            if (entity_matches(g, d, re, e)) { if (found < max) out[found] = e; found++; }
+        }
+    } else {
+        for (u32 i = 0; i < cand.n; i++) {    /* prefiltered candidates only */
+            u64 e = cand.ids[i];
+            if (entity_matches(g, d, re, e)) { if (found < max) out[found] = e; found++; }
         }
     }
-    regfree(&re);
+
+    re_candidates64_free(&cand);
+    re_trigram_free(q);
+    if (d) re_dfa_free(d);
+    re_free(re);
+    re_ast_free(ast);
     return found;
 }
 
-/* Validity of a search pattern under the SAME engine that matches it (POSIX ERE),
- * so the TS layer can surface "Invalid regex pattern" without a second, divergent
- * regex dialect (JS RegExp). Returns 1 iff regcomp(REG_EXTENDED) accepts it. */
+/* Validity under the SAME engine used to match (formal regular langs; no backrefs). */
 int graph_regex_valid(const char *pattern) {
-    regex_t re;
-    if (regcomp(&re, pattern, REG_EXTENDED) != 0) return 0;
-    regfree(&re);
+    const char *err = NULL;
+    Regex *re = re_compile(pattern, &err);
+    if (!re) return 0;
+    re_free(re);
     return 1;
 }
 
@@ -592,21 +813,30 @@ int graph_regex_valid(const char *pattern) {
 
 typedef struct { u64 *k, *v; u32 cap, cnt; } omap;
 
-static void omap_init(omap *m, u32 cap) { m->cap = cap; m->cnt = 0; m->k = calloc(cap, 8); m->v = calloc(cap, 8); }
+/* omap capacity is kept a power of two so the open-addressing index is a 1-cycle
+ * mask, not a ~20-40 cycle `div`: `cap` is a runtime value the compiler cannot
+ * prove pow2, so `% cap` compiled to a real division on the per-edge hot path
+ * (it dominated find_path/neighbors BFS). omap_init rounds any requested cap up
+ * to a power of two so every probe below can use `& (cap-1)`. */
+static inline u32 pow2_ceil(u32 x) {
+    if (x < 2) return 2;
+    x--; x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16; return x + 1;
+}
+static void omap_init(omap *m, u32 cap) { cap = pow2_ceil(cap); m->cap = cap; m->cnt = 0; m->k = calloc(cap, 8); m->v = calloc(cap, 8); }
 static void omap_free(omap *m) { free(m->k); free(m->v); }
-static inline u32 omap_h(u64 x, u32 cap) { return (u32)(((x * 0x9e3779b97f4a7c15ull) >> 32) % cap); }
+static inline u32 omap_h(u64 x, u32 cap) { return (u32)((x * 0x9e3779b97f4a7c15ull) >> 32) & (cap - 1); }
 static int omap_has(omap *m, u64 key) {
-    for (u32 i = omap_h(key, m->cap); m->k[i]; i = (i + 1) % m->cap) if (m->k[i] == key) return 1;
+    for (u32 i = omap_h(key, m->cap); m->k[i]; i = (i + 1) & (m->cap - 1)) if (m->k[i] == key) return 1;
     return 0;
 }
 static u64 omap_get(omap *m, u64 key) {
-    for (u32 i = omap_h(key, m->cap); m->k[i]; i = (i + 1) % m->cap) if (m->k[i] == key) return m->v[i];
+    for (u32 i = omap_h(key, m->cap); m->k[i]; i = (i + 1) & (m->cap - 1)) if (m->k[i] == key) return m->v[i];
     return 0;
 }
 static void omap_grow(omap *m) {
     u32 nc = m->cap * 2; u64 *nk = calloc(nc, 8), *nv = calloc(nc, 8);
     for (u32 j = 0; j < m->cap; j++) if (m->k[j]) {
-        u32 i = omap_h(m->k[j], nc); while (nk[i]) i = (i + 1) % nc;
+        u32 i = omap_h(m->k[j], nc); while (nk[i]) i = (i + 1) & (nc - 1);
         nk[i] = m->k[j]; nv[i] = m->v[j];
     }
     free(m->k); free(m->v); m->k = nk; m->v = nv; m->cap = nc;
@@ -614,13 +844,43 @@ static void omap_grow(omap *m) {
 static void omap_put(omap *m, u64 key, u64 val) {
     if ((u64)(m->cnt + 1) * 10 > (u64)m->cap * 7) omap_grow(m);
     u32 i = omap_h(key, m->cap);
-    while (m->k[i]) { if (m->k[i] == key) { m->v[i] = val; return; } i = (i + 1) % m->cap; }
+    while (m->k[i]) { if (m->k[i] == key) { m->v[i] = val; return; } i = (i + 1) & (m->cap - 1); }
     m->k[i] = key; m->v[i] = val; m->cnt++;
 }
 
 static inline int dir_match(u32 want, u32 have) { return want == DIR_ANY || have == want; }
 
 u32 graph_neighbors(graph_t *g, u64 start, u32 depth, u32 direction, u64 *out, u32 max) {
+    if (depth == 0) return 0;
+    /* Immediate-neighbor fast path (depth 1): one adjacency read + linear dedup,
+     * NO BFS scaffolding (the omap + queue allocations). Bidirectional storage and
+     * multi-relType edges can repeat a target, and self-loops point back at start,
+     * so distinct non-start targets are still deduped — nb[] holds every distinct
+     * target so the returned count is exact even when it overflows `out`. Zero heap
+     * allocs for the common low-degree case; nodes with > NB_FAST edges fall through
+     * to the hashed BFS below (O(deg) dedup beats O(deg^2) once degree is large). */
+    if (depth == 1) {
+        enum { NB_FAST = 128 };
+        u32 ec = graph_edge_count(g, start);
+        if (ec == 0) return 0;
+        if (ec <= NB_FAST) {
+            adj_entry_t es[NB_FAST]; u64 nb[NB_FAST];
+            graph_read_edges(g, start, es, ec);
+            u32 nd = 0;
+            for (u32 k = 0; k < ec; k++) {
+                if (!dir_match(direction, es[k].direction)) continue;
+                u64 t = es[k].target_offset;
+                if (t == start) continue;                 /* self-loop: start is not its own neighbor */
+                u32 j = 0; while (j < nd && nb[j] != t) j++;
+                if (j < nd) continue;                     /* duplicate target already emitted */
+                nb[nd] = t;
+                if (nd < max) out[nd] = t;
+                nd++;
+            }
+            return nd;
+        }
+        /* else: high degree — fall through to the hashed BFS (handles depth 1). */
+    }
     omap seen; omap_init(&seen, 256);
     omap_put(&seen, start, 1);
     u32 qcap = 256, head = 0, tail = 0;
@@ -674,8 +934,12 @@ u32 graph_find_path_ex(graph_t *g, u64 from, u64 to, u32 max_depth, u32 directio
     u64 *q = malloc(qcap * 8); u32 *qd = malloc(qcap * 4);
     q[tail] = from; qd[tail] = 0; tail++;
 
-    u16 fl; (void)graph_entity_name(g, from, &fl);
-    u64 bytes_used = (u64)fl + 28;
+    /* Byte-budget accounting costs two string-table lookups per frontier node
+     * (name of the node + its rel type). graph_find_path passes an infinite
+     * budget, so that work is pure waste there — only track when finite. */
+    int track = (budget_bytes != (u64)-1);
+    u64 bytes_used = 0;
+    if (track) { u16 fl; (void)graph_entity_name(g, from, &fl); bytes_used = (u64)fl + 28; }
     int found = 0, exhausted = 0;
 
     while (head < tail && !found && !exhausted) {
@@ -692,10 +956,12 @@ u32 graph_find_path_ex(graph_t *g, u64 from, u64 to, u32 max_depth, u32 directio
             omap_put(&parent, t, f);
             *farthest = t;
             if (t == to) { found = 1; break; }              /* target check first */
-            u16 nl; (void)graph_entity_name(g, t, &nl);
-            u16 rl; (void)st_get(g->st, es[k].rel_type_id, &rl);
-            bytes_used += (u64)nl + (u64)rl + 28;
-            if (bytes_used >= budget_bytes) { exhausted = 1; break; } /* then budget */
+            if (track) {                                    /* then budget (finite only) */
+                u16 nl; (void)graph_entity_name(g, t, &nl);
+                u16 rl; (void)st_get(g->st, es[k].rel_type_id, &rl);
+                bytes_used += (u64)nl + (u64)rl + 28;
+                if (bytes_used >= budget_bytes) { exhausted = 1; break; }
+            }
             if (tail == qcap) { qcap *= 2; q = realloc(q, qcap * 8); qd = realloc(qd, qcap * 4); }
             q[tail] = t; qd[tail] = d + 1; tail++;
         }
@@ -716,11 +982,90 @@ u32 graph_find_path_ex(graph_t *g, u64 from, u64 to, u32 max_depth, u32 directio
     return n;
 }
 
+/* reverse a traversal direction for the backward half of bidirectional search:
+ * a FORWARD edge a->b is stored on b as a BACKWARD entry, so following
+ * predecessors of `to` under logical direction FORWARD means matching BACKWARD
+ * stored edges. ANY and BIDIR are symmetric. */
+static inline u32 reverse_dir(u32 d) {
+    if (d == DIR_FORWARD)  return DIR_BACKWARD;
+    if (d == DIR_BACKWARD) return DIR_FORWARD;
+    return d;
+}
+
+/* Bidirectional BFS shortest path (unweighted). Grows the SMALLER of the two
+ * frontiers one level at a time from both ends until they meet; on a small-world
+ * graph this explores ~2*b^(d/2) nodes instead of b^d. Level-synchronized, so
+ * the first meet is at the true shortest distance L: once df+db reaches L the
+ * shortest path's midpoint node is settled on both sides (pigeonhole), and the
+ * sum grows by exactly one per expansion, so no shorter meet is skipped.
+ *
+ * Returns node count (0 = no path within max_depth); fills out_path up to
+ * max_path. This is the exact-shortest, no-budget path. graph_find_path_ex
+ * keeps the unidirectional best-effort/budgeted search (farthest node + budget
+ * exhaustion reporting), which is a different, single-source-shaped contract. */
 u32 graph_find_path(graph_t *g, u64 from, u64 to, u32 max_depth, u32 direction,
                     u64 *out_path, u32 max_path) {
-    int tr, be; u64 fa;
-    return graph_find_path_ex(g, from, to, max_depth, direction, (u64)-1,
-                              out_path, max_path, &tr, &be, &fa);
+    if (from == to) { if (max_path >= 1) out_path[0] = from; return 1; }
+    if (max_depth == 0) return 0;
+    u32 rdir = reverse_dir(direction);
+
+    omap pf, pb; omap_init(&pf, 256); omap_init(&pb, 256);
+    omap_put(&pf, from, from);   /* parent-of-root = self (chain sentinel) */
+    omap_put(&pb, to, to);
+
+    u32 fcap = 64, bcap = 64, fn = 1, bn = 1;
+    u64 *fcur = malloc(fcap * 8), *bcur = malloc(bcap * 8);
+    fcur[0] = from; bcur[0] = to;
+    u32 df = 0, db = 0;
+    u64 meet = 0;
+
+    while (fn && bn && df + db < max_depth && !meet) {
+        int fwd = (fn <= bn);                      /* expand the smaller frontier */
+        u64 *cur = fwd ? fcur : bcur; u32 cn = fwd ? fn : bn;
+        omap *mine = fwd ? &pf : &pb, *other = fwd ? &pb : &pf;
+        u32 mydir = fwd ? direction : rdir;
+        u32 ncap = 64, nn = 0; u64 *nxt = malloc(ncap * 8);
+        for (u32 i = 0; i < cn && !meet; i++) {
+            u64 f = cur[i];
+            u32 ec = graph_edge_count(g, f);
+            if (!ec) continue;
+            adj_entry_t *es = malloc((size_t)ec * sizeof(adj_entry_t));
+            graph_read_edges(g, f, es, ec);
+            for (u32 k = 0; k < ec; k++) {
+                if (!dir_match(mydir, es[k].direction)) continue;
+                u64 t = es[k].target_offset;
+                if (omap_has(mine, t)) continue;
+                omap_put(mine, t, f);
+                if (omap_has(other, t)) { meet = t; break; }   /* first meet = shortest */
+                if (nn == ncap) { ncap *= 2; nxt = realloc(nxt, ncap * 8); }
+                nxt[nn++] = t;
+            }
+            free(es);
+        }
+        if (fwd) { free(fcur); fcur = nxt; fn = nn; fcap = ncap; df++; }
+        else     { free(bcur); bcur = nxt; bn = nn; bcap = ncap; db++; }
+    }
+
+    u32 n = 0;
+    if (meet) {
+        /* forward chain meet->from via pf, emitted reversed => from..meet */
+        u32 rc = 0, rcap = 16; u64 *rev = malloc(rcap * 8);
+        for (u64 c = meet; ; c = omap_get(&pf, c)) {
+            if (rc == rcap) { rcap *= 2; rev = realloc(rev, rcap * 8); }
+            rev[rc++] = c;
+            if (c == from) break;
+        }
+        for (u32 i = 0; i < rc; i++) { if (n < max_path) out_path[n] = rev[rc - 1 - i]; n++; }
+        free(rev);
+        /* backward chain pb[meet]..to (pb parents already point toward `to`) */
+        if (meet != to) for (u64 c = omap_get(&pb, meet); ; c = omap_get(&pb, c)) {
+            if (n < max_path) { out_path[n] = c; }
+            n++;
+            if (c == to) break;
+        }
+    }
+    free(fcur); free(bcur); omap_free(&pf); omap_free(&pb);
+    return n;
 }
 
 /* ======================================================================
@@ -911,10 +1256,10 @@ u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_
 
 u32 graph_validate_obs(graph_t *g, u64 *off, u8 *count, u8 *oversize, u32 max) {
     memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 n = rdu32(mf, log + 0), found = 0;
-    for (u32 i = 0; i < n; i++) {
-        u64 e = rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8);
+    u32 bc = ni_bucket_count(g), found = 0;
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
         u8 oc = rdu8(mf, e + E_OBSCNT);
         u32 o0 = rdu32(mf, e + E_OBS0), o1 = rdu32(mf, e + E_OBS1);
         u8 ov = 0; u16 l;
@@ -929,15 +1274,17 @@ u32 graph_validate_obs(graph_t *g, u64 *off, u8 *count, u8 *oversize, u32 max) {
 }
 
 u32 graph_validate_dangling(graph_t *g, u64 *src, u64 *tgt, u32 max) {
-    memfile_t *mf = g->mf;
-    u64 log = node_log_off(g);
-    u32 n = rdu32(mf, log + 0);
+    u32 bc = ni_bucket_count(g);
+    u32 n = ni_entity_count(g);
     omap live; omap_init(&live, n * 2 < 256 ? 256 : n * 2);
-    for (u32 i = 0; i < n; i++)
-        omap_put(&live, rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8), 1);
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (e) omap_put(&live, e, 1);
+    }
     u32 found = 0;
-    for (u32 i = 0; i < n; i++) {
-        u64 e = rdu64(mf, log + NODE_LOG_HEADER_SIZE + (u64)i * 8);
+    for (u32 s = 0; s < bc; s++) {
+        u64 e = ni_slot_entity(g, s);
+        if (!e) continue;
         u32 ec = graph_edge_count(g, e);
         if (!ec) continue;
         adj_entry_t *es = malloc((size_t)ec * sizeof(adj_entry_t));
@@ -960,20 +1307,15 @@ u32 graph_validate_dangling(graph_t *g, u64 *src, u64 *tgt, u32 max) {
 static u64 graph_init(graph_t *g) {
     memfile_t *mf = g->mf;
     u64 hdr = memfile_alloc(mf, GRAPH_HEADER_SIZE);
-    u64 log = memfile_alloc(mf, NODE_LOG_HEADER_SIZE + (u64)INITIAL_LOG_CAPACITY * 8);
     u64 ni_size = 8 + (u64)NI_INITIAL_BUCKETS * NI_BUCKET_SIZE;
     u64 ni = memfile_alloc(mf, ni_size);
-    if (!hdr || !log || !ni) return 0;
-
-    wru32(mf, log + 0, 0);
-    wru32(mf, log + 4, INITIAL_LOG_CAPACITY);
+    if (!hdr || !ni) return 0;
 
     memset(memfile_ptr(mf, ni), 0, ni_size);
     wru32(mf, ni + 0, NI_INITIAL_BUCKETS);
     wru32(mf, ni + 4, 0);
 
-    memset(memfile_ptr(mf, hdr), 0, GRAPH_HEADER_SIZE);
-    wru64(mf, hdr + GH_NODE_LOG_OFF, log);
+    memset(memfile_ptr(mf, hdr), 0, GRAPH_HEADER_SIZE);   /* GH_RESERVED_0 stays 0 (ex node-log slot) */
     wru64(mf, hdr + GH_NAME_INDEX_OFF, ni);
     wru32(mf, hdr + GH_SCHEMA_VERSION, GRAPH_SCHEMA_VERSION);
     return hdr;
@@ -997,6 +1339,12 @@ graph_t *graph_open(const char *graph_path, stringtable_t *st, size_t initial_si
     memfile_unlock(g->mf);
 
     if (g->header_offset == 0) { graph_close(g); return NULL; }
+
+    /* Prefilter built lazily and caught up incrementally at search
+     * (graph_index_sync + dirty-set); writes stay at store speed. The type
+     * index is likewise lazy (built on first entities_by_type, O(1) maintained). */
+    g->tri = NULL;
+    g->type_idx = NULL;
     return g;
 }
 
@@ -1004,6 +1352,9 @@ void graph_sync(graph_t *g) { memfile_sync(g->mf); }
 
 void graph_close(graph_t *g) {
     if (!g) return;
+    if (g->tri) re_trigram_live_free(g->tri);
+    dirty_free(g);
+    tyx_free(g->type_idx);
     if (g->mf) { memfile_close(g->mf); free(g->mf); }
     free(g);   /* string table is shared; not closed here */
 }

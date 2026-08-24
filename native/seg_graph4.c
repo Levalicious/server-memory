@@ -425,14 +425,14 @@ int g4_add_observation(graph4_t *g, u32 eid, const u8 *obs, u16 len, u64 mtime) 
     if (e.obs_count >= 2) return 0;                       /* KB constraint */
     u32 sid = st4_intern(g->st, obs, len);
     if (!sid) return 0;
-    /* dedup: same obs already present? release the extra ref and refuse */
-    if ((e.obs_count >= 1 && e.obs0_sid == sid)) { st4_decref(g->st, sid); return 0; }
+    /* v3 semantics: NO dup check — the same obs may occupy both slots */
     u8 *r = ent_rec_w(g, eid);
     if (!r) { st4_decref(g->st, sid); return 0; }
     if (e.obs_count == 0) g4st32(r + 32, sid);
     else                  g4st32(r + 36, sid);
     r[40] = (u8)(e.obs_count + 1);
     g4st64(r + 24, mtime);                               /* obs_mtime */
+    g4st64(r + 16, mtime);                               /* mtime too (v3) */
     tri_mark(g, eid, TRI_OP_REINDEX);
     return 1;
 }
@@ -456,6 +456,7 @@ int g4_remove_observation(graph4_t *g, u32 eid, const u8 *obs, u16 len, u64 mtim
     }
     r[40] = (u8)(e.obs_count - 1);
     g4st64(r + 24, mtime);
+    g4st64(r + 16, mtime);                               /* mtime too (v3) */
     st4_decref(g->st, sid);
     tri_mark(g, eid, TRI_OP_REINDEX);
     return 1;
@@ -682,6 +683,10 @@ int g4_create_relation(graph4_t *g, u32 from, u32 to,
     if (!adj_add(g, from, &fwd)) { st4_decref(g->st, sid); st4_decref(g->st, sid); return 0; }
     if (!adj_add(g, to, &bwd))   { adj_remove(g, from, to, sid, G4_DIR_FORWARD);
                                    st4_decref(g->st, sid); st4_decref(g->st, sid); return 0; }
+    {   /* v3: a new relation marks the SOURCE entity modified */
+        u8 *r = ent_rec_w(g, from);
+        if (r) g4st64(r + 16, mtime);
+    }
     return 1;
 }
 

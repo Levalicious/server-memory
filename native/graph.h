@@ -5,12 +5,16 @@
  *   EntityRecord: 72 bytes  (name_id, type_id, adj_offset, mtime, obsMtime,
  *                            obs_count, obs0_id, obs1_id, structural/walker visits, psi)
  *   AdjEntry:     24 bytes  (target<<2|dir, relType_id, mtime); bidirectional storage
- *   NodeLog:      [count,capacity][u64 offsets...]
  *
  * v3 additions:
  *   - Graph header carries a PERSISTENT name index (name_id -> entity offset).
  *   - Graph SCHEMA version lives in the graph header, separate from the memfile
  *     FORMAT version (which memfile.c owns and pins to 3).
+ *
+ * 2026-07-13 (schema v3): the node log was ELIMINATED. It was a redundant second
+ * entity registry; the name index already lists every entity, so it is now the
+ * sole registry and all enumeration/scan ops walk its buckets. Enumeration order
+ * is therefore bucket order, NOT insertion order.
  *
  * Refcount discipline (string table): an adj entry owns ONE ref on its relType_id;
  * an entity owns one ref each on name_id, type_id, and its observation ids.
@@ -21,13 +25,11 @@
 #include "memoryfile.h"
 #include "stringtable.h"
 
-#define GRAPH_SCHEMA_VERSION 2u
+#define GRAPH_SCHEMA_VERSION 3u    /* v3: node log eliminated; name index is the sole registry */
 #define ENTITY_RECORD_SIZE   76u   /* [u32 version][72B body] — biscuit-style versioned record */
 #define ADJ_ENTRY_SIZE       24u
 #define ADJ_HEADER_SIZE      8u
-#define NODE_LOG_HEADER_SIZE 8u
 #define INITIAL_ADJ_CAPACITY 4u
-#define INITIAL_LOG_CAPACITY 256u
 #define NI_INITIAL_BUCKETS   4096u
 
 /* direction (low 2 bits of target_and_dir) */
@@ -36,10 +38,23 @@
 #define DIR_BIDIR    2u
 #define DIR_ANY      255u   /* traversal filter: follow edges of any direction */
 
+/* In-memory trigram prefilter (re_trigram.h); opaque here. Rebuilt per process
+ * at graph_open, maintained on writes — NOT persisted. */
+typedef struct ReTrigramLive ReTrigramLive;
+/* In-memory type index (type_id -> set of entity offsets); opaque here. Lazily
+ * built on first entities_by_type, maintained O(1) on create/delete — NOT
+ * persisted. Turns entities_by_type from an O(N) bucket scan into O(result). */
+typedef struct TypeIndex TypeIndex;
+
 typedef struct {
     memfile_t     *mf;            /* graph file */
     stringtable_t *st;            /* shared string table (not owned) */
     u64            header_offset; /* graph header block */
+    ReTrigramLive *tri;           /* trigram prefilter over name+type+obs (lazy) */
+    u64           *tri_dirty;     /* open-addr set of entity offsets changed since sync (0=empty) */
+    u8            *tri_dirty_op;  /* parallel op: 1=reindex, 2=remove (last write wins) */
+    u32            tri_dirty_cap, tri_dirty_cnt;
+    TypeIndex     *type_idx;      /* type_id -> offset postings (lazy; O(1) maintained) */
 } graph_t;
 
 typedef struct {
@@ -97,10 +112,15 @@ u32  graph_relation_count(graph_t *g);
 u32  graph_entity_types(graph_t *g, u32 *out, u32 max);     /* distinct type ids */
 u32  graph_relation_types(graph_t *g, u32 *out, u32 max);   /* distinct relType ids */
 
-/* search: POSIX ERE over name + type + observations; returns all matches */
+/* search: our regex engine over name + type + observations; returns all matches.
+ * Trigram-prefiltered (index caught up lazily at search) then DFA/NFA-verified. */
 u32  graph_search(graph_t *g, const char *pattern, u64 *out, u32 max);
-/* validity of a pattern under the SAME POSIX ERE engine used to match (1 = valid) */
+/* validity of a pattern under the SAME engine used to match (1 = valid) */
 int  graph_regex_valid(const char *pattern);
+/* bring the trigram prefilter current with the store (deferred from writes;
+ * graph_search calls it automatically). Exposed so index-maintenance cost can
+ * be benchmarked on its own. */
+void graph_index_sync(graph_t *g);
 
 /* traversal */
 u32  graph_neighbors(graph_t *g, u64 start, u32 depth, u32 direction, u64 *out, u32 max);
