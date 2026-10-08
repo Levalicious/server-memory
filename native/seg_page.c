@@ -39,30 +39,32 @@ static void st16(u8 *p, u16 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); }
 #define OFF_FLAGS     6u
 /* slot s lives at SEG_PAGE_HDR_SIZE + s*4: [u16 offset][u16 size] */
 
+/* max slots a page could ever hold: (8192-16)/4 = 2044 */
+#define SEG_PAGE_MAX_SLOTS ((SEG_PAGE_SIZE - SEG_PAGE_HDR_SIZE) / SEG_SLOT_SIZE)
+
 /*@ requires \valid_read(pg + (0 .. SEG_PAGE_SIZE-1)); assigns \nothing; */
 static u16 pg_nslots(const u8 *pg)    { return ld16(pg + OFF_NSLOTS); }
 /*@ requires \valid_read(pg + (0 .. SEG_PAGE_SIZE-1)); assigns \nothing; */
 static u16 pg_recfloor(const u8 *pg)  { return ld16(pg + OFF_RECFLOOR); }
 
 /*@ requires \valid_read(pg + (0 .. SEG_PAGE_SIZE-1));
-    requires s < 1020;
+    requires s < SEG_PAGE_MAX_SLOTS;
     assigns \nothing; */
 static u16 slot_off(const u8 *pg, u16 s)  { return ld16(pg + SEG_PAGE_HDR_SIZE + (u32)s * SEG_SLOT_SIZE); }
 /*@ requires \valid_read(pg + (0 .. SEG_PAGE_SIZE-1));
-    requires s < 1020;
+    requires s < SEG_PAGE_MAX_SLOTS;
     assigns \nothing; */
 static u16 slot_size(const u8 *pg, u16 s) { return ld16(pg + SEG_PAGE_HDR_SIZE + (u32)s * SEG_SLOT_SIZE + 2); }
 
 /*@ requires \valid(pg + (0 .. SEG_PAGE_SIZE-1));
-    requires s < 1020;
+    requires s < SEG_PAGE_MAX_SLOTS;
     assigns pg[SEG_PAGE_HDR_SIZE + s*SEG_SLOT_SIZE .. SEG_PAGE_HDR_SIZE + s*SEG_SLOT_SIZE + 3]; */
 static void slot_set(u8 *pg, u16 s, u16 off, u16 size) {
     st16(pg + SEG_PAGE_HDR_SIZE + (u32)s * SEG_SLOT_SIZE, off);
     st16(pg + SEG_PAGE_HDR_SIZE + (u32)s * SEG_SLOT_SIZE + 2, size);
 }
 
-/* max slots a page could ever hold: (4096-16)/4 = 1020 */
-#define SEG_PAGE_MAX_SLOTS ((SEG_PAGE_SIZE - SEG_PAGE_HDR_SIZE) / SEG_SLOT_SIZE)
+/* (SEG_PAGE_MAX_SLOTS is defined above, next to its first use.) */
 
 /*@ requires \valid(dst + (0 .. n-1)) && \valid_read(src + (0 .. n-1));
     requires \separated(dst + (0 .. n-1), src + (0 .. n-1));

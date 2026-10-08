@@ -322,14 +322,21 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         u16 fl, tl;
         const u8 *f = rstr(r, &fl), *t = rstr(r, &tl);
         u32 maxd = r32(r); u8 dir = r8(r);
+        /* v1.3: optional u64 budget trailer (bytes); absent = untracked. */
+        u64 budget = (r->p + 8 <= r->end) ? r64(r) : (u64)-1;
         if (r->err || maxd > 64) { err_reply(w, "bad req"); return ST_ERR; }
         u32 fe = lookup_or0(k, f, fl), te = lookup_or0(k, t, tl);
         if (!fe || !te) { err_reply(w, "no such entity"); return ST_ERR; }
         u32 path[128];
-        u32 n = g4_find_path(k->g, fe, te, maxd, wire_dir(dir), path, 128);
+        int reached = 0, exhausted = 0; u32 farthest = 0;
+        u32 n = g4_find_path_ex(k->g, fe, te, maxd, wire_dir(dir), budget,
+                                path, 128, &reached, &exhausted, &farthest);
+        (void)farthest;
         u32 kept = n < 128 ? n : 128;
         w32(w, n);
         for (u32 i = 0; i < kept; i++) put_name(k, w, path[i]);
+        w8(w, (u8)(reached ? 1 : 0));       /* v1.3 β-contract flags */
+        w8(w, (u8)(exhausted ? 1 : 0));
         return ST_OK;
     }
     case OP_SEARCH: case OP_BY_TYPE: case OP_ORPHANED: {

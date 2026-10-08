@@ -938,6 +938,106 @@ done:
     return result;
 }
 
+/* Unidirectional BFS shortest path with a best-effort fallback + byte budget —
+ * the β-contract (Decision_FindPathBetaContractInC), ported from v3's
+ * graph_find_path_ex; the Jest find_path suite is the behavioral contract.
+ *
+ *  - target_reached: BFS arrived at `to`; out_path = from..to.
+ *  - else best-effort: out_path = from..farthest (the LAST node discovered,
+ *    BFS order) so the caller has a retry anchor; farthest = 0 if no edge
+ *    was expanded at all.
+ *  - budget_exhausted: stopped because per-node bytes crossed budget_bytes.
+ *    The target check fires BEFORE the budget check, so a discovery that IS
+ *    the target succeeds even at budget 0. budget == (u64)-1 = untracked.
+ *  - Per-node cost = name bytes + rel-type bytes + 28 (C BFS bookkeeping) —
+ *    the same mechanism/sizing as v3, not V8 layout constants.
+ *
+ * Returns the emitted path's node count.
+ */
+u32 g4_find_path_ex(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
+                    u64 budget_bytes, u32 *out_path, u32 max_path,
+                    int *target_reached, int *budget_exhausted, u32 *farthest) {
+    *target_reached = 0; *budget_exhausted = 0; *farthest = 0;
+    g4_entity_t e;
+    if (!g4_read_entity(g, from, &e) || !g4_read_entity(g, to, &e)) return 0;
+    if (from == to) { if (max_path >= 1) out_path[0] = from; *target_reached = 1; return 1; }
+
+    pmap_t parent;
+    if (!pmap_init(&parent, 256)) return 0;
+    if (!pmap_put(&parent, from, 0)) { pmap_free(&parent); return 0; }  /* 0 = root sentinel */
+
+    u32 qcap = 256, head = 0, tail = 0;
+    u32 *q  = (u32 *)malloc((size_t)qcap * 4);
+    u32 *qd = (u32 *)malloc((size_t)qcap * 4);
+    if (!q || !qd) { free(q); free(qd); pmap_free(&parent); return 0; }
+    q[tail] = from; qd[tail] = 0; tail++;
+
+    int track = (budget_bytes != (u64)-1);
+    u64 bytes_used = 0;
+    if (track) {
+        u16 fl = 0;
+        const u8 *fb = st4_get(g->st, e.name_sid, &fl);
+        bytes_used = (u64)(fb ? fl : 0) + 28;
+    }
+    int found = 0, exhausted = 0;
+
+    while (head < tail && !found && !exhausted) {
+        u32 f = q[head]; u32 d = qd[head]; head++;
+        if (d >= max_depth) continue;
+        u32 ec = g4_edge_count(g, f);
+        if (!ec) continue;
+        g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+        if (!es) break;
+        g4_edges(g, f, es, ec);
+        for (u32 k = 0; k < ec; k++) {
+            if (!g4_dir_match(direction, es[k].direction)) continue;
+            u32 t = es[k].target_eid;
+            if (pmap_has(&parent, t)) continue;
+            if (!pmap_put(&parent, t, f)) { free(es); goto done; }
+            *farthest = t;
+            if (t == to) { found = 1; break; }              /* target check first */
+            if (track) {                                    /* then the budget */
+                u16 nl = 0, rl = 0;
+                g4_entity_t te;
+                if (g4_read_entity(g, t, &te)) { const u8 *b = st4_get(g->st, te.name_sid, &nl); (void)b; }
+                const u8 *rb = st4_get(g->st, es[k].rel_sid, &rl); (void)rb;
+                bytes_used += (u64)nl + (u64)rl + 28;
+                if (bytes_used >= budget_bytes) { exhausted = 1; break; }
+            }
+            if (tail == qcap) {
+                u32 nc = qcap * 2;
+                u32 *nq = (u32 *)realloc(q, (size_t)nc * 4);
+                if (!nq) { free(es); free(q); free(qd); q = qd = NULL; goto done; }
+                q = nq;
+                u32 *nqd = (u32 *)realloc(qd, (size_t)nc * 4);
+                if (!nqd) { free(es); free(q); free(qd); q = qd = NULL; goto done; }
+                qd = nqd; qcap = nc;
+            }
+            q[tail] = t; qd[tail] = d + 1; tail++;
+        }
+        free(es);
+    }
+
+done:
+    {
+        u32 n = 0;
+        u32 endp = found ? to : *farthest;
+        if (endp) {
+            u32 *rev = (u32 *)malloc((size_t)max_path * 4);
+            if (rev) {
+                for (u32 cur = endp; cur != from && n < max_path; cur = pmap_get(&parent, cur))
+                    rev[n++] = cur;
+                if (n < max_path) rev[n++] = from;
+                for (u32 i = 0; i < n; i++) out_path[i] = rev[n - 1 - i];
+                free(rev);
+            }
+        }
+        free(q); free(qd); pmap_free(&parent);
+        *target_reached = found; *budget_exhausted = exhausted;
+        return n;
+    }
+}
+
 /* ================= indexes + search ================= */
 
 #define G4_DFA_MIN_VERIFY 128u

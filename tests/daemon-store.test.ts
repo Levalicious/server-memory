@@ -92,11 +92,11 @@ describe('DaemonStore adapter', () => {
     const nb2 = (await store.neighbors(p1, 2, 'forward')).map(String);
     expect(new Set(nb2)).toEqual(new Set([String(p2), String(p3)]));
 
-    const fp = await store.findPath(p1, p3, 5, 'forward', 0n);
+    const fp = await store.findPath(p1, p3, 5, 'forward', 1n << 40n);
     expect(fp.targetReached).toBe(true);
     expect(fp.path.map(String)).toEqual([String(p1), String(p2), String(p3)]);
 
-    const fnone = await store.findPath(p3, p1, 5, 'forward', 0n);
+    const fnone = await store.findPath(p3, p1, 5, 'forward', 1n << 40n);
     expect(fnone.targetReached).toBe(false);
     expect(fnone.farthest).toBe(0n);
   });

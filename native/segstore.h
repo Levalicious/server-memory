@@ -44,8 +44,13 @@ typedef uint64_t u64;
 #define SEG_MAGIC        0x53454731u   /* "SEG1" */
 #define SEG_FORMAT_VER   1u
 #ifndef SEG_PAGE_SIZE                  /* overridable (-DSEG_PAGE_SIZE=16384u) for
-                                          the Q1 bench; default = the 4K prior */
-#define SEG_PAGE_SIZE    4096u         /* COW unit; recorded in meta (Q1 prior) */
+                                          the Q1 bench */
+#define SEG_PAGE_SIZE    8192u         /* COW unit; recorded in meta. 8K bumped up
+                                          from the 4K Q1 prior for the v3 long-name
+                                          contract: st4 records cap at
+                                          SEG_PAGE_MAX_REC-4, and the E2E suite
+                                          creates a 4502-byte entity name (4K pages
+                                          cap records at 4072). Re-measured. */
 #endif
 #define SEG_META_PAGES   2u            /* pgno 0 and 1 */
 
@@ -529,6 +534,12 @@ u32 g4_neighbors(graph4_t *g, u32 start, u32 depth, u32 direction,
                  u32 *out, u32 max);
 u32 g4_find_path(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
                  u32 *out_path, u32 max_path);
+/* g4_find_path_ex: unidirectional BFS with the β-contract — best-effort path
+ * to the last discovered node when `to` isn't reached, byte-budget tracking
+ * (budget = (u64)-1 disables), and per-call flags. See seg_graph4.c. */
+u32 g4_find_path_ex(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
+                    u64 budget_bytes, u32 *out_path, u32 max_path,
+                    int *target_reached, int *budget_exhausted, u32 *farthest);
 
 /* ---- indexes + search (minimal-core port: trigram prefilter decoupled
  * from writes via dirty-set, type index O(1)-maintained, both owner-private

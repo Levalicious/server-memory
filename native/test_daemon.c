@@ -531,6 +531,94 @@ int main(void) {
     }
     PASS();
 
+    TEST(find_path_beta_contract);
+    {
+        /* v1.3: the daemon FIND_PATH carries the v3 β-contract
+         * (Decision_FindPathBetaContractInC): optional u64 budget trailer;
+         * reply appends targetReached + budgetExhausted after the names;
+         * best-effort path to the deepest discovered node when unreached. */
+        pl_reset(&pl);
+        w32(&pl, 6);
+        for (int i = 0; i < 5; i++) {
+            char nm[8]; snprintf(nm, sizeof nm, "FP%d", i);
+            pl_str(&pl, nm); pl_str(&pl, "fpt"); w64(&pl, 900 + (u64)i);
+        }
+        pl_str(&pl, "FPIsland"); pl_str(&pl, "fpt"); w64(&pl, 950);
+        assert(cl_call(fd, 200, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 4);
+        for (int i = 0; i < 4; i++) {
+            char a[8], c[8];
+            snprintf(a, sizeof a, "FP%d", i); snprintf(c, sizeof c, "FP%d", i + 1);
+            pl_str(&pl, a); pl_str(&pl, c); pl_str(&pl, "next"); w64(&pl, 960 + (u64)i);
+        }
+        assert(cl_call(fd, 201, OP_CREATE_RELATIONS, &pl, &body) == ST_OK);
+        free(body.b);
+
+        /* (a) reachable + budget trailer: full path, flags (1,0) */
+        pl_reset(&pl);
+        pl_str(&pl, "FP0"); pl_str(&pl, "FP4"); w32(&pl, 4); w8(&pl, 0); w64(&pl, 1ull << 40);
+        assert(cl_call(fd, 202, OP_FIND_PATH, &pl, &body) == ST_OK);
+        {
+            rd_t r = body_rd(&body);
+            assert(r32(&r) == 5);
+            for (int i = 0; i < 5; i++) { char nm[8]; snprintf(nm, sizeof nm, "FP%d", i); expect_name(&r, nm); }
+            assert(r8(&r) == 1 && r8(&r) == 0);
+        }
+        free(body.b);
+
+        /* (b) maxDepth rejection: best-effort partial to FP2, flags (0,0) */
+        pl_reset(&pl);
+        pl_str(&pl, "FP0"); pl_str(&pl, "FP4"); w32(&pl, 2); w8(&pl, 0); w64(&pl, 1ull << 40);
+        assert(cl_call(fd, 203, OP_FIND_PATH, &pl, &body) == ST_OK);
+        {
+            rd_t r = body_rd(&body);
+            assert(r32(&r) == 3);
+            expect_name(&r, "FP0"); expect_name(&r, "FP1"); expect_name(&r, "FP2");
+            assert(r8(&r) == 0 && r8(&r) == 0);
+        }
+        free(body.b);
+
+        /* (c) budget 0: target-check-before-budget -> one discovery, flags (0,1) */
+        pl_reset(&pl);
+        pl_str(&pl, "FP0"); pl_str(&pl, "FP4"); w32(&pl, 10); w8(&pl, 0); w64(&pl, 0);
+        assert(cl_call(fd, 204, OP_FIND_PATH, &pl, &body) == ST_OK);
+        {
+            rd_t r = body_rd(&body);
+            assert(r32(&r) == 2);
+            expect_name(&r, "FP0"); expect_name(&r, "FP1");
+            assert(r8(&r) == 0 && r8(&r) == 1);
+        }
+        free(body.b);
+
+        /* (d) legacy request without the trailer: unbounded, flags (1,0) */
+        pl_reset(&pl);
+        pl_str(&pl, "FP0"); pl_str(&pl, "FP4"); w32(&pl, 4); w8(&pl, 0);
+        assert(cl_call(fd, 205, OP_FIND_PATH, &pl, &body) == ST_OK);
+        {
+            rd_t r = body_rd(&body);
+            assert(r32(&r) == 5);
+            for (int i = 0; i < 5; i++) { char nm[8]; snprintf(nm, sizeof nm, "FP%d", i); expect_name(&r, nm); }
+            assert(r8(&r) == 1 && r8(&r) == 0);
+        }
+        free(body.b);
+
+        /* (e) unreachable target: best-effort to the deepest discovered, flags (0,0) */
+        pl_reset(&pl);
+        pl_str(&pl, "FP0"); pl_str(&pl, "FPIsland"); w32(&pl, 8); w8(&pl, 0); w64(&pl, 1ull << 40);
+        assert(cl_call(fd, 206, OP_FIND_PATH, &pl, &body) == ST_OK);
+        {
+            rd_t r = body_rd(&body);
+            assert(r32(&r) == 5);                  /* FP0..FP4 = the whole reachable chain */
+            expect_name(&r, "FP0"); expect_name(&r, "FP1"); expect_name(&r, "FP2");
+            expect_name(&r, "FP3"); expect_name(&r, "FP4");
+            assert(r8(&r) == 0 && r8(&r) == 0);
+        }
+        free(body.b);
+    }
+    PASS();
+
     TEST(background_rank_slice);
     {
         /* Spec §7 / Design_RankAmortized: rank is the owner's amortized

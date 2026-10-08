@@ -177,7 +177,7 @@ export class DaemonStore implements GraphBackend {
     return names.map((n) => this.handle(n));
   }
 
-  async findPath(from: bigint, to: bigint, maxDepth: number, direction: Direction, _budgetBytes: bigint): Promise<{
+  async findPath(from: bigint, to: bigint, maxDepth: number, direction: Direction, budgetBytes: bigint): Promise<{
     path: bigint[];
     targetReached: boolean;
     budgetExhausted: boolean;
@@ -188,17 +188,24 @@ export class DaemonStore implements GraphBackend {
     const toName = this.nameOf(to);
     const body = await client.callOk(OP.FIND_PATH, (w) => {
       w.str(fromName); w.str(toName); w.u32(maxDepth); w.u8(dirCode(direction));
+      w.u64(budgetBytes);       // v1.3 trailer: per-call BFS byte budget
     });
     const r = new R(body);
     const n = r.u32();
     const names: string[] = [];
     for (let i = 0; i < n; i++) names.push(r.strText());
-    const reached = n > 0 && names[names.length - 1] === toName;
+    // v1.3 β-contract flags (trailing; fall back to the name check if absent).
+    let reached = n > 0 && names[names.length - 1] === toName;
+    let exhausted = false;
+    if (r.remaining >= 2) {
+      reached = r.u8() === 1;
+      exhausted = r.u8() === 1;
+    }
     const farthest = !reached && names.length > 0 ? this.handle(names[names.length - 1]) : 0n;
     return {
       path: names.map((nm) => this.handle(nm)),
       targetReached: reached,
-      budgetExhausted: false,   // the daemon BFS is not budget-capped in v1
+      budgetExhausted: exhausted,
       farthest,
     };
   }

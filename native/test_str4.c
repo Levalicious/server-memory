@@ -127,7 +127,7 @@ int main(void) {
         }
         assert(st4_count(st) == 2000);
         assert(seg_txn_commit(seg));                /* logical_pages is COMMITTED state */
-        assert(segstore_logical_pages(seg) > 10);
+        assert(segstore_logical_pages(seg) > 5);    /* >10 at 4K pages; still multi-page at 8K */
         assert(seg_txn_begin(seg));
         /* max-size string fits; oversize refused */
         memset(buf, 'x', sizeof buf);

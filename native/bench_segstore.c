@@ -1,7 +1,7 @@
 /*
  * bench_segstore.c — Q1 evidence + txn-layer cost profile.
  *
- * Built twice (4K default, -DSEG_PAGE_SIZE=16384u) by `make bench_segstore`.
+ * Built twice (4K explicit, default = 8K) by `make bench_segstore`.
  *
  * Workload = synthetic melt: a segment prefilled with entity-like records
  * (76B), then batches touching K scattered logical pages, inserting ~2 small

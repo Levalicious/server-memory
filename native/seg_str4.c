@@ -120,10 +120,11 @@ st4_t *st4_open(segstore_t *seg) {
         const u8 *pg = segstore_read(seg, l);
         if (!pg) continue;
         st->last_page = l;
-        for (u32 s = 0; s < 4096; s++) {
+        u32 maxslots = (SEG_PAGE_SIZE - SEG_PAGE_HDR_SIZE) / SEG_SLOT_SIZE;
+        for (u32 s = 0; s < maxslots; s++) {
             u16 sz = 0;
             const u8 *r = seg_page_read(pg, (u16)s, &sz);
-            if (!r) { if (s >= 1020) break; continue; }
+            if (!r) continue;
             if (sz < 5) continue;
             if (!map_insert(st, str_hash(r + 4, (u16)(sz - 4)), SID_MAKE(l, s))) {
                 st4_close(st); return NULL;

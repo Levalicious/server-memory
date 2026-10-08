@@ -27,7 +27,7 @@ static u64 rng(void) {
 }
 
 /* ---- shadow model ---- */
-#define MODEL_MAX 1020
+#define MODEL_MAX ((SEG_PAGE_SIZE - SEG_PAGE_HDR_SIZE) / SEG_SLOT_SIZE)
 typedef struct {
     int live[MODEL_MAX];
     u16 size[MODEL_MAX];

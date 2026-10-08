@@ -26,6 +26,10 @@
  * v1.2: adds OP_REGEX_VALID, and optional trailing u32 `skip` on NEIGHBORS /
  * SEARCH / BY_TYPE / ORPHANED, so result sets larger than a frame can be
  * paged (results are stable between calls under the single writer).
+ *
+ * v1.3: OP_FIND_PATH gains an optional trailing u64 `budget` (bytes; absent =
+ * untracked) and its reply appends u8 targetReached + u8 budgetExhausted
+ * after the name list — the v3 β-contract (Decision_FindPathBetaContractInC).
  */
 #ifndef DAEMON_PROTO_H
 #define DAEMON_PROTO_H
