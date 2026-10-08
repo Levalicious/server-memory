@@ -254,16 +254,19 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
     case OP_NEIGHBORS: {
         u16 nl; const u8 *nm = rstr(r, &nl);
         u32 depth = r32(r); u8 dir = r8(r); u32 max = r32(r);
-        if (r->err || max > 100000) { err_reply(w, "bad req"); return ST_ERR; }
+        u32 skip = (r->p + 4 <= r->end) ? r32(r) : 0;   /* v1.2 optional trailer */
+        if (r->err || max > 100000 || skip > 100000) { err_reply(w, "bad req"); return ST_ERR; }
         u32 eid = lookup_or0(k, nm, nl);
         if (!eid) { err_reply(w, "no such entity"); return ST_ERR; }
-        u32 *out = (u32 *)malloc((size_t)(max ? max : 1) * 4);
+        u32 lim = max + skip;
+        u32 *out = (u32 *)malloc((size_t)(lim ? lim : 1) * 4);
         if (!out) { err_reply(w, "oom"); return ST_ERR; }
         /* PUBLIC 0-indexed -> C hop count: THE +1 boundary (spec §6.3) */
-        u32 total = g4_neighbors(k->g, eid, depth + 1, wire_dir(dir), out, max);
-        u32 kept = total < max ? total : max;
+        u32 total = g4_neighbors(k->g, eid, depth + 1, wire_dir(dir), out, lim);
+        u32 from = total < skip ? total : skip;
+        u32 kept = total - from; if (kept > max) kept = max;
         w32(w, total);
-        for (u32 i = 0; i < kept; i++) { put_name(k, w, out[i]); pw_add(k, out[i]); }
+        for (u32 i = from; i < from + kept; i++) { put_name(k, w, out[i]); pw_add(k, out[i]); }
         free(out);
         return ST_OK;
     }
@@ -282,38 +285,52 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         return ST_OK;
     }
     case OP_SEARCH: case OP_BY_TYPE: case OP_ORPHANED: {
-        u32 total = 0, max = 0;
+        u32 total = 0, max = 0, skip = 0;
         u32 *out = NULL;
         if (op == OP_SEARCH) {
             u16 pl; const u8 *pat = rstr(r, &pl);
             max = r32(r);
-            if (r->err || max > 100000) { err_reply(w, "bad req"); return ST_ERR; }
+            skip = (r->p + 4 <= r->end) ? r32(r) : 0;   /* v1.2 optional trailer */
+            if (r->err || max > 100000 || skip > 100000) { err_reply(w, "bad req"); return ST_ERR; }
             char *pz = (char *)malloc((size_t)pl + 1);
             if (!pz) { err_reply(w, "oom"); return ST_ERR; }
             memcpy(pz, pat, pl); pz[pl] = 0;
             if (!g4_regex_valid(pz)) { free(pz); err_reply(w, "invalid pattern"); return ST_ERR; }
-            out = (u32 *)malloc((size_t)(max ? max : 1) * 4);
+            out = (u32 *)malloc((size_t)(max + skip ? max + skip : 1) * 4);
             if (!out) { free(pz); err_reply(w, "oom"); return ST_ERR; }
-            total = g4_search(k->g, pz, out, max);
+            total = g4_search(k->g, pz, out, max + skip);
             free(pz);
         } else if (op == OP_BY_TYPE) {
             u16 tl; const u8 *ty = rstr(r, &tl);
             max = r32(r);
-            if (r->err || max > 100000) { err_reply(w, "bad req"); return ST_ERR; }
-            out = (u32 *)malloc((size_t)(max ? max : 1) * 4);
+            skip = (r->p + 4 <= r->end) ? r32(r) : 0;   /* v1.2 optional trailer */
+            if (r->err || max > 100000 || skip > 100000) { err_reply(w, "bad req"); return ST_ERR; }
+            out = (u32 *)malloc((size_t)(max + skip ? max + skip : 1) * 4);
             if (!out) { err_reply(w, "oom"); return ST_ERR; }
-            total = g4_entities_by_type(k->g, ty, tl, out, max);
+            total = g4_entities_by_type(k->g, ty, tl, out, max + skip);
         } else {
             max = r32(r);
-            if (r->err || max > 100000) { err_reply(w, "bad req"); return ST_ERR; }
-            out = (u32 *)malloc((size_t)(max ? max : 1) * 4);
+            skip = (r->p + 4 <= r->end) ? r32(r) : 0;   /* v1.2 optional trailer */
+            if (r->err || max > 100000 || skip > 100000) { err_reply(w, "bad req"); return ST_ERR; }
+            out = (u32 *)malloc((size_t)(max + skip ? max + skip : 1) * 4);
             if (!out) { err_reply(w, "oom"); return ST_ERR; }
-            total = g4_orphaned(k->g, out, max);
+            total = g4_orphaned(k->g, out, max + skip);
         }
-        u32 kept = total < max ? total : max;
+        u32 from = total < skip ? total : skip;
+        u32 kept = total - from; if (kept > max) kept = max;
         w32(w, total);
-        for (u32 i = 0; i < kept; i++) put_name(k, w, out[i]);
+        for (u32 i = from; i < from + kept; i++) put_name(k, w, out[i]);
         free(out);
+        return ST_OK;
+    }
+    case OP_REGEX_VALID: {
+        u16 pl; const u8 *pat = rstr(r, &pl);
+        if (r->err) { err_reply(w, "trunc"); return ST_ERR; }
+        char *pz = (char *)malloc((size_t)pl + 1);
+        if (!pz) { err_reply(w, "oom"); return ST_ERR; }
+        memcpy(pz, pat, pl); pz[pl] = 0;
+        w8(w, (u8)(g4_regex_valid(pz) ? 1 : 0));
+        free(pz);
         return ST_OK;
     }
     case OP_ENTITY_TYPES: case OP_RELATION_TYPES: {

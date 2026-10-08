@@ -484,6 +484,53 @@ int main(void) {
     }
     PASS();
 
+    TEST(search_skip_paging_and_regex_valid);
+    {
+        pl_reset(&pl);
+        w32(&pl, 4);
+        pl_str(&pl, "Skip1"); pl_str(&pl, "skipT"); w64(&pl, 500);
+        pl_str(&pl, "Skip2"); pl_str(&pl, "skipT"); w64(&pl, 501);
+        pl_str(&pl, "Skip3"); pl_str(&pl, "skipT"); w64(&pl, 502);
+        pl_str(&pl, "Skip4"); pl_str(&pl, "skipT"); w64(&pl, 503);
+        assert(cl_call(fd, 100, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        free(body.b);
+
+        /* page 1 (no skip trailer: old-style) + page 2 (skip=2): disjoint, together all 4 */
+        char got[4][16]; u32 nseen = 0;
+        for (int pg = 0; pg < 2; pg++) {
+            pl_reset(&pl);
+            pl_str(&pl, "skipT"); w32(&pl, 2);
+            if (pg) w32(&pl, 2);                     /* v1.2 skip trailer */
+            assert(cl_call(fd, 101 + (u32)pg, OP_BY_TYPE, &pl, &body) == ST_OK);
+            rd_t r = body_rd(&body);
+            assert(r32(&r) == 4);                    /* total across pages */
+            u32 cnt = 0;
+            while (r.p < r.end) {
+                u16 l; const u8 *s = rstr(&r, &l);
+                assert(s && l < 16);
+                memcpy(got[nseen], s, l); got[nseen][l] = 0; nseen++;
+                cnt++;
+            }
+            assert(cnt == 2);
+            free(body.b);
+        }
+        assert(nseen == 4);
+        for (u32 i = 0; i < 4; i++)
+            for (u32 j = i + 1; j < 4; j++)
+                assert(strcmp(got[i], got[j]) != 0);  /* no overlap across pages */
+
+        /* REGEX_VALID: same ERE dialect as search */
+        pl_reset(&pl); pl_str(&pl, "a+b");
+        assert(cl_call(fd, 110, OP_REGEX_VALID, &pl, &body) == ST_OK);
+        { rd_t r = body_rd(&body); assert(r8(&r) == 1); }
+        free(body.b);
+        pl_reset(&pl); pl_str(&pl, "([bad");
+        assert(cl_call(fd, 111, OP_REGEX_VALID, &pl, &body) == ST_OK);
+        { rd_t r = body_rd(&body); assert(r8(&r) == 0); }
+        free(body.b);
+    }
+    PASS();
+
     close(fd);
     stop_daemon(pid);
     free(pl.buf);

@@ -22,6 +22,10 @@
  * full-corpus iteration for kb_load IDF) and appends optional fields to
  * RANDOM_WALK (avoid_cycles in, uniform_steps out). Trailing-field evolution
  * is per spec r3 §6: the frame header is frozen; payloads may grow.
+ *
+ * v1.2: adds OP_REGEX_VALID, and optional trailing u32 `skip` on NEIGHBORS /
+ * SEARCH / BY_TYPE / ORPHANED, so result sets larger than a frame can be
+ * paged (results are stable between calls under the single writer).
  */
 #ifndef DAEMON_PROTO_H
 #define DAEMON_PROTO_H
@@ -65,6 +69,7 @@ enum {
                                      -> u32 next_eid (0 = drained), u32 n,
                                         n x {u32 eid, str name, str type, u8 obs_count,
                                              obs_count x str obs} */
+    OP_REGEX_VALID      = 0x2d,   /* str pattern -> u8 ok (same ERE dialect as SEARCH) */
 };
 
 /* OPEN_NODES entity blob (per requested name):
