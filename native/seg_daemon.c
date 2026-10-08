@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ---------- little-endian cursor r/w ---------- */
@@ -83,6 +84,10 @@ typedef struct {
     char       token[256]; u16 token_len;
     pend_walk_t pw;                   /* pending walker-visit counts */
     int        dirty_counters;
+    u64        rank_mark;             /* store txid ranks were last maintained at */
+    int64_t    rank_cadence_ms;       /* min gap between rank slices on busy ticks */
+    u32        rank_slice_iters;      /* ψ iters per slice (scheduling chunk only) */
+    int        psi_pending;           /* ψ hit the chunk bound, not yet |Δ|<ε */
 } kbd_t;
 
 static void pw_add(kbd_t *k, u32 eid) {
@@ -106,6 +111,49 @@ static void pw_flush_in_txn(kbd_t *k) {
             g4_inc_walker_visit(k->g, k->pw.eids[i]);
     k->pw.n = 0;
     k->dirty_counters = 0;
+}
+
+/* ---------- background rank (spec §7 / Design_RankAmortized) -------------
+ * Rank is the OWNER's amortized background job — NEVER on an op path.
+ *
+ * MC structural rank: one sampling sweep per edit slice. There is no fixed
+ * target — error ∝ 1/√n and high-rank nodes converge first, so partial work
+ * is useful and samples simply accumulate across slices
+ * (PR_ErrorInverselyProportionalToRank).
+ *
+ * MERW ψ: warm-started power iteration run to MEASURED convergence,
+ * |ψ(t+1) − ψ(t)| < ε (PR_PowerIteration; ε = 1e-8, same triple the v3
+ * store used). The per-slice iteration count is a SCHEDULING chunk only —
+ * if the chunk bound is hit before convergence, psi_pending keeps slicing
+ * on later ticks (warm start resumes from the partial ψ just persisted)
+ * until the criterion is met. Slices run only while there is work: a store
+ * txid watermark (edits) or pending ψ convergence. KBD_RANK_CADENCE_MS
+ * bounds how often a NON-idle tick may slice (default 250; tests set 0 for
+ * eagerly-consistent ranks); the cadence itself is measurement-deferred
+ * (spec §10). */
+
+static int64_t kbd_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+#define KBD_RANK_SLICE_DEFAULT_ITERS 50
+
+static void maybe_rank_slice(kbd_t *k, int idle, int64_t *last_slice) {
+    if (k->rank_mark == mstore_txid(k->ms) && !k->psi_pending) return;
+    int64_t t = kbd_now_ms();
+    if (!idle && t - *last_slice < k->rank_cadence_ms) return;
+    *last_slice = t;
+    if (!mstore_txn_begin(k->ms)) return;
+    if (k->dirty_counters) pw_flush_in_txn(k);
+    int new_edits = (k->rank_mark != mstore_txid(k->ms));
+    if (new_edits) g4_structural_sample(k->g, 1, 0.85);
+    /* iters == chunk is treated as still-pending even when convergence
+     * landed exactly there — one extra slice clears it. */
+    u32 iters = g4_compute_merw_psi(k->g, 0.85, k->rank_slice_iters, 1e-8);
+    k->psi_pending = (iters >= k->rank_slice_iters);
+    if (mstore_txn_commit(k->ms)) k->rank_mark = mstore_txid(k->ms);
 }
 
 /* ---------- op handlers ---------- */
@@ -385,13 +433,16 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         return ST_OK;
     }
     case OP_RESAMPLE: {
-        /* One-shot rank refresh: structural sample + MERW psi in one txn
-         * (the shim's resample() after mutations). */
+        /* Explicit rank refresh — an ADMIN/debug op, NOT part of the op path
+         * contract: spec §7 keeps rank maintenance in the owner's background
+         * idle slices (see maybe_rank_slice). Kept for tests/tooling. */
         if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
         if (k->dirty_counters) pw_flush_in_txn(k);
         g4_structural_sample(k->g, 1, 0.85);
-        g4_compute_merw_psi(k->g, 0.85, 200, 1e-8);
+        u32 iters = g4_compute_merw_psi(k->g, 0.85, 200, 1e-8);
+        k->psi_pending = (iters >= 200);
         if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
+        k->rank_mark = mstore_txid(k->ms);
         return ST_OK;
     }
     case OP_VALIDATE: {
@@ -549,6 +600,7 @@ int kbd_serve(kbd_t *k, int lfd, volatile sig_atomic_t *stop) {
     conn_t conns[MAX_CONNS];
     for (int i = 0; i < MAX_CONNS; i++) { memset(&conns[i], 0, sizeof conns[i]); conns[i].fd = -1; }
     struct pollfd pfds[MAX_CONNS + 1];
+    int64_t last_slice = 0;
 
     while (!*stop) {
         u32 np = 0;
@@ -563,6 +615,10 @@ int kbd_serve(kbd_t *k, int lfd, volatile sig_atomic_t *stop) {
         }
         int rc = poll(pfds, np, 200);
         if (rc < 0) { if (errno == EINTR) continue; return 1; }
+
+        /* Amortized rank: slice on idle ticks (rc == 0), or at the cadence on
+         * busy ticks. Never inside an op handler — the op path stays tax-free. */
+        maybe_rank_slice(k, rc == 0, &last_slice);
         if (pfds[0].revents & POLLIN) {
             int fd = accept(lfd, NULL, NULL);
             if (fd >= 0) {
@@ -631,6 +687,20 @@ kbd_t *kbd_open(const char *dir) {
     if (!k->ms) { free(k); return NULL; }
     k->g = graph4_open(k->ms);
     if (!k->g) { mstore_close(k->ms); free(k); return NULL; }
+    /* Rank is a background job: ψ persists in the store, so nothing to warm
+     * at open — mark the current txid and let slices catch up after edits.
+     * (A restart mid-convergence loses only the pending flag; the persisted
+     * partial ψ warm-starts the next edit-triggered slice.) */
+    k->rank_mark = mstore_txid(k->ms);
+    k->psi_pending = 0;
+    {
+        const char *rc = getenv("KBD_RANK_CADENCE_MS");
+        k->rank_cadence_ms = rc ? atol(rc) : 250;
+        if (k->rank_cadence_ms < 0) k->rank_cadence_ms = 0;
+        const char *ri = getenv("KBD_RANK_SLICE_ITERS");
+        k->rank_slice_iters = ri ? (u32)atol(ri) : KBD_RANK_SLICE_DEFAULT_ITERS;
+        if (k->rank_slice_iters < 1) k->rank_slice_iters = KBD_RANK_SLICE_DEFAULT_ITERS;
+    }
     return k;
 }
 

@@ -11,7 +11,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Store, DIR_FORWARD, DIR_BACKWARD, type NativeEntity } from './src/store.js';
+import { DIR_FORWARD, DIR_BACKWARD } from './src/store.js';
+import { createBackend, type GraphBackend, type BackendEntity } from './src/backend.js';
 import { ensureV3 } from './src/migrate.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
 import { toolDurationHistogram, traced, tracer } from './src/tracing.js';
@@ -405,34 +406,19 @@ function paginateGraph(graph: KnowledgeGraph, entityCursor: number | string = 0,
 
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 export class KnowledgeGraphManager {
-  private db: Store;
+  private db: GraphBackend;
 
   constructor(memoryFilePath: string = DEFAULT_MEMORY_FILE_PATH) {
-    // Derive binary file paths from the base path
-    const dir = path.dirname(memoryFilePath);
-    const base = path.basename(memoryFilePath, path.extname(memoryFilePath));
-    const graphPath = path.join(dir, `${base}.graph`);
-    const strPath = path.join(dir, `${base}.strings`);
+    // Backend selection is environment-driven (see src/backend.ts):
+    // embedded N-API store by default, or a kbd4 owner daemon
+    // (KB_DAEMON_SPAWN=1 for a local child, KB_DAEMON_ADDR for the owner).
+    // The embedded path keeps its transparent v1/v2→v3 auto-migration.
+    this.db = createBackend(memoryFilePath);
 
-    // Auto-migrate an old (v1/v2) KB to v3 in place before opening — the same
-    // transparent-on-open contract the old code used for v1->v2. ensureV3 holds
-    // a migration flock across detection AND migration, so concurrent startups
-    // serialize (no empty-clobber, no double-migrate). The migrator and the old
-    // addon load only if a migration actually fires.
-    ensureV3(graphPath, strPath);
-
-    // The C store opens both files and self-locks around its own init. It owns
-    // the memfile, string table, and name index.
-    this.db = new Store(graphPath, strPath);
-
-    // Initial structural sampling + MERW under an exclusive lock (the C ops
-    // mutate the graph file; withWriteLock syncs on exit).
-    this.withWriteLock(() => {
-      if (this.db.entityCount() > 0) {
-        this.db.structuralSample(1, 0.85);
-        this.db.computeMerwPsi(0.85, 200, 1e-8);
-      }
-    });
+    // Rank maintenance is the store OWNER's amortized background job (spec §7 /
+    // Design_RankAmortized_2026_08_20) — never on an op path. The kbd4 daemon
+    // runs idle-slice samples; the embedded interim path no longer boot-warms
+    // or resamples per mutation (that was v3's rank tax, pulled out in v4).
   }
 
   /**
@@ -451,7 +437,7 @@ export class KnowledgeGraphManager {
    * IDF → TextRank → assemble) so users can attribute time to specific
    * stages without spelunking flame graphs.
    */
-  prepareDocumentLoad(text: string, title: string, topK: number): KbLoadResult {
+  prepareDocumentLoad(text: string, title: string, topK: number): Promise<KbLoadResult> {
     return traced(
       'kb.load_document',
       {
@@ -459,8 +445,12 @@ export class KnowledgeGraphManager {
         'kb.load.input_chars': text.length,
         'kb.load.top_k': topK,
       },
-      (span) => this.withWriteLock(() => {
-        const result = loadDocument(text, title, this.corpusShim() as never, topK);
+      async (span) => this.withWriteLock(async () => {
+        // Prefetch the corpus (paged; works embedded and over the wire), then
+        // run the synchronous pipeline over it.
+        const corpus = await this.prefetchCorpus();
+        const shim = { *entries() { yield* corpus; } };
+        const result = loadDocument(text, title, shim as never, topK);
         span.setAttribute('kb.load.chunks', result.stats.chunks);
         span.setAttribute('kb.load.sentences', result.stats.sentences);
         span.setAttribute('kb.load.unique_words', result.stats.uniqueWords);
@@ -493,18 +483,18 @@ export class KnowledgeGraphManager {
    * how long we blocked acquiring the OS-level shared lock — useful for
    * spotting contention from concurrent writers.
    */
-  private withReadLock<T>(fn: () => T): T {
-    return traced('kb.lock.read', {}, (span) => {
+  private async withReadLock<T>(fn: () => T | Promise<T>): Promise<T> {
+    return traced('kb.lock.read', {}, async (span) => {
       const acquireStart = process.hrtime.bigint();
-      this.db.lockShared();
+      await this.db.lockShared();
       const waitMs = Number(process.hrtime.bigint() - acquireStart) / 1e6;
       span.setAttribute('kb.lock.wait_ms', waitMs);
       try {
-        this.db.refresh();
-        span.setAttribute('kb.entity_count', this.db.entityCount());
-        return fn();
+        await this.db.refresh();
+        span.setAttribute('kb.entity_count', await this.db.entityCount());
+        return await fn();
       } finally {
-        this.db.unlock();
+        await this.db.unlock();
       }
     });
   }
@@ -526,82 +516,61 @@ export class KnowledgeGraphManager {
    * Wrapped in a `kb.lock.write` span. The `kb.lock.wait_ms` attribute records
    * blocking time waiting for the exclusive lock.
    */
-  private withWriteLock<T>(fn: () => T): T {
-    return traced('kb.lock.write', {}, (span) => {
+  private async withWriteLock<T>(fn: () => T | Promise<T>): Promise<T> {
+    return traced('kb.lock.write', {}, async (span) => {
       const acquireStart = process.hrtime.bigint();
-      this.db.lockExclusive();
+      await this.db.lockExclusive();
       const waitMs = Number(process.hrtime.bigint() - acquireStart) / 1e6;
       span.setAttribute('kb.lock.wait_ms', waitMs);
       try {
-        this.db.refresh();
-        span.setAttribute('kb.entity_count', this.db.entityCount());
-        const result = fn();
-        this.db.sync();
+        await this.db.refresh();
+        span.setAttribute('kb.entity_count', await this.db.entityCount());
+        const result = await fn();
+        await this.db.sync();
         return result;
       } finally {
-        this.db.unlock();
+        await this.db.unlock();
       }
     });
   }
 
-  // --- kb_load corpus shim --------------------------------------------------
+  // --- kb_load corpus -------------------------------------------------------
 
   /**
-   * Minimal StringTable-shaped shim for loadDocument's IDF corpus pass: yields
-   * every entity's name/type/observation strings from the C store. The real
-   * string table now lives in C; loadDocument only consumes `entries()`.
+   * Prefetch every entity's name/type/observation strings for loadDocument's
+   * IDF pass (paged under the hood, so it works over the wire too).
    */
-  private corpusShim(): { entries: () => Generator<{ id: bigint; text: string; refcount: number }> } {
-    const db = this.db;
-    return {
-      *entries() {
-        for (const off of db.listEntities()) {
-          const r = db.readEntity(off);
-          yield { id: off, text: r.name, refcount: 1 };
-          yield { id: off, text: r.type, refcount: 1 };
-          for (const o of r.observations) yield { id: off, text: o, refcount: 1 };
-        }
-      },
-    };
+  private async prefetchCorpus(): Promise<{ id: bigint; text: string; refcount: number }[]> {
+    const entries: { id: bigint; text: string; refcount: number }[] = [];
+    let fallbackId = 0n;
+    for await (const row of this.db.scanAll()) {
+      const id = row.eid ?? ++fallbackId;
+      entries.push({ id, text: row.name, refcount: 1 });
+      entries.push({ id, text: row.type, refcount: 1 });
+      for (const o of row.observations) entries.push({ id, text: o, refcount: 1 });
+    }
+    return entries;
   }
 
-  /** Build rank maps from the binary store for pagerank/llmrank sorting.
-   *  NOTE: Must be called inside a lock (read or write).
-   *
-   *  Always-on `kb.rank.read` child span: this is a hot path called from every
-   *  read tool that sorts by rank, and surfaces the cost of reading the
-   *  per-entity rank fields under the active lock.
-   */
-  private getRankMapsUnlocked(): { structural: Map<string, number>; walker: Map<string, number> } {
-    return traced('kb.rank.read', { 'kb.entity_count': this.db.entityCount() }, () => {
-      const structural = new Map<string, number>();
-      const walker = new Map<string, number>();
-      const structTotal = this.db.structuralTotal();
-      const walkerTotal = this.db.walkerTotal();
-
-      for (const offset of this.db.listEntities()) {
-        const rec = this.db.readEntity(offset);
-        structural.set(rec.name, structTotal > 0n ? Number(rec.structuralVisits) / Number(structTotal) : 0);
-        walker.set(rec.name, walkerTotal > 0n ? Number(rec.walkerVisits) / Number(walkerTotal) : 0);
-      }
-
-      return { structural, walker };
+  /** Rank maps for a specific name list (pagerank/llmrank sorting).
+   *  NOTE: Must be called inside a lock (read or write) for the embedded
+   *  backend; the daemon serves it atomically per call. */
+  private async ranksForUnlocked(names: string[]): Promise<{ structural: Map<string, number>; walker: Map<string, number> }> {
+    return traced('kb.rank.read', { 'kb.entity_count': await this.db.entityCount() }, async () => {
+      const r = await this.db.ranksFor(names);
+      return { structural: r.structural, walker: r.walker };
     });
   }
 
-  /** Build rank maps (acquires read lock). */
-  getRankMaps(): { structural: Map<string, number>; walker: Map<string, number> } {
-    return this.withReadLock(() => this.getRankMapsUnlocked());
-  }
-
-  /** Increment walker visit count for a list of entity names */
-  recordWalkerVisits(names: string[]): void {
-    traced('kb.walker.record', { 'kb.walker.count': names.length }, () => {
-      this.withWriteLock(() => {
+  /** Increment walker visit count for a list of entity names (embedded); on
+   *  the daemon backend this is a no-op (the daemon marks its own reads). */
+  async recordWalkerVisits(names: string[]): Promise<void> {
+    await traced('kb.walker.record', { 'kb.walker.count': names.length }, async () => {
+      await this.withWriteLock(async () => {
         for (const name of names) {
-          const offset = this.db.lookup(name);
+          const offset = await this.db.lookup(name);
           if (offset !== 0n) {
-            this.db.incWalkerVisit(offset);
+            await this.db.incWalkerVisit(offset);
           }
         }
       });
@@ -609,32 +578,24 @@ export class KnowledgeGraphManager {
   }
 
   /**
-   * Re-run structural sampling and MERW eigenvector computation (call after
-   * graph mutations).
-   *
-   * Emits two child spans under the active span: `kb.rank.pagerank`
-   * (structural sampling — PageRank-style random walks) and `kb.rank.merw`
-   * (Maximum-Entropy Random Walk eigenvector). Skipped entirely on an empty
-   * graph so the spans aren't emitted for trivial no-op resamples.
+   * Explicit (admin/debug) rank refresh — NEVER on an op path. v4 keeps rank
+   * maintenance in the store owner's amortized background job (spec §7 /
+   * Design_RankAmortized_2026_08_20); this exists for forced refreshes and
+   * tooling. Skipped entirely on an empty graph.
    */
-  resample(): void {
-    this.withWriteLock(() => {
-      if (this.db.entityCount() === 0) return;
-      traced(
+  async resample(): Promise<void> {
+    await this.withWriteLock(async () => {
+      if ((await this.db.entityCount()) === 0) return;
+      await traced(
         'kb.rank.pagerank',
-        { 'kb.entity_count': this.db.entityCount() },
-        () => this.db.structuralSample(1, 0.85),
-      );
-      traced(
-        'kb.rank.merw',
-        { 'kb.entity_count': this.db.entityCount() },
-        () => this.db.computeMerwPsi(0.85, 200, 1e-8),
+        { 'kb.entity_count': await this.db.entityCount() },
+        async () => this.db.resample(),
       );
     });
   }
 
-  /** Convert a native entity record to the public Entity interface */
-  private recordToEntity(rec: NativeEntity): Entity {
+  /** Convert a backend entity record to the public Entity interface */
+  private recordToEntity(rec: BackendEntity): Entity {
     const entity: Entity = { name: rec.name, entityType: rec.type, observations: rec.observations };
     const mtime = Number(rec.mtime);
     const obsMtime = Number(rec.obsMtime);
@@ -643,35 +604,9 @@ export class KnowledgeGraphManager {
     return entity;
   }
 
-  /** Get all entities as Entity objects (preserves node log order = insertion order) */
-  private getAllEntities(): Entity[] {
-    return this.db.listEntities().map(o => this.recordToEntity(this.db.readEntity(o)));
-  }
-
-  /** Get all relations by scanning adjacency lists (forward edges only to avoid duplication) */
-  private getAllRelations(): Relation[] {
-    const relations: Relation[] = [];
-    for (const offset of this.db.listEntities()) {
-      const fromName = this.db.entityName(offset);
-      for (const edge of this.db.edges(offset)) {
-        if (edge.direction !== DIR_FORWARD) continue;
-        const toName = this.db.entityName(edge.target);
-        const r: Relation = { from: fromName, to: toName, relationType: edge.relType };
-        const mtime = Number(edge.mtime);
-        if (mtime > 0) r.mtime = mtime;
-        relations.push(r);
-      }
-    }
-    return relations;
-  }
-
-  /** Load the full graph (entities + relations) */
-  private loadGraph(): KnowledgeGraph {
-    return {
-      entities: this.getAllEntities(),
-      relations: this.getAllRelations(),
-    };
-  }
+  // (The former full-scan helpers — getAllEntities / getAllRelations /
+  // loadGraph — were removed with the async backend sweep: every caller now
+  // uses paged, backend-native operations that also work over the wire.)
 
   async createEntities(entities: Entity[]): Promise<{ created: Entity[]; existing: string[] }> {
     // Validate observation limits across the WHOLE batch first, collecting
@@ -704,7 +639,7 @@ export class KnowledgeGraphManager {
       );
     }
 
-    return this.withWriteLock(() => {
+    return this.withWriteLock(async () => {
       const now = BigInt(Date.now());
 
       // Pass 1 — classify every entity before writing anything. A collision
@@ -713,9 +648,9 @@ export class KnowledgeGraphManager {
       const existingNames: string[] = [];
       const collisions: { entity: string; code: ToolErrorCode; message: string }[] = [];
       for (const e of entities) {
-        const existingOffset = this.db.lookup(e.name);
+        const existingOffset = await this.db.lookup(e.name);
         if (existingOffset !== 0n) {
-          const existing = this.recordToEntity(this.db.readEntity(existingOffset));
+          const existing = this.recordToEntity(await this.db.readEntity(existingOffset));
           const sameType = existing.entityType === e.entityType;
           const sameObs = existing.observations.length === e.observations.length &&
             existing.observations.every((o, i) => o === e.observations[i]);
@@ -740,9 +675,9 @@ export class KnowledgeGraphManager {
       // Pass 2 — create.
       const newEntities: Entity[] = [];
       for (const e of toCreate) {
-        const offset = this.db.createEntity(e.name, e.entityType, now);
+        const offset = await this.db.createEntity(e.name, e.entityType, now);
         for (const obs of e.observations) {
-          this.db.addObservation(offset, obs, now);
+          await this.db.addObservation(offset, obs, now);
         }
 
         const newEntity: Entity = {
@@ -758,7 +693,7 @@ export class KnowledgeGraphManager {
   }
 
   async createRelations(relations: Relation[]): Promise<{ created: Relation[]; skippedDuplicates: Relation[] }> {
-    return this.withWriteLock(() => {
+    return this.withWriteLock(async () => {
       const now = BigInt(Date.now());
 
       // Pass 1 — every endpoint must exist; missing endpoints fail the whole
@@ -767,8 +702,8 @@ export class KnowledgeGraphManager {
       const missing: { from: string; to: string; relationType: string; code: ToolErrorCode; missing: string[]; message: string }[] = [];
       for (const r of relations) {
         const missingEnds: string[] = [];
-        if (this.db.lookup(r.from) === 0n) missingEnds.push('from');
-        if (this.db.lookup(r.to) === 0n) missingEnds.push('to');
+        if ((await this.db.lookup(r.from)) === 0n) missingEnds.push('from');
+        if ((await this.db.lookup(r.to)) === 0n) missingEnds.push('to');
         if (missingEnds.length > 0) {
           missing.push({
             from: r.from,
@@ -793,16 +728,16 @@ export class KnowledgeGraphManager {
       const newRelations: Relation[] = [];
       const skippedDuplicates: Relation[] = [];
       for (const r of relations) {
-        const fromOffset = this.db.lookup(r.from);
-        const toOffset = this.db.lookup(r.to);
+        const fromOffset = await this.db.lookup(r.from);
+        const toOffset = await this.db.lookup(r.to);
 
-        const isDuplicate = this.db.edges(fromOffset).some(e =>
+        const isDuplicate = (await this.db.edges(fromOffset)).some(e =>
           e.direction === DIR_FORWARD && e.target === toOffset && e.relType === r.relationType
         );
         if (isDuplicate) { skippedDuplicates.push(r); continue; }
 
         // C owns the bidirectional edges + relType interning/refcounts.
-        this.db.createRelation(fromOffset, toOffset, r.relationType, now);
+        await this.db.createRelation(fromOffset, toOffset, r.relationType, now);
         newRelations.push({ ...r, mtime: Number(now) });
       }
 
@@ -811,7 +746,7 @@ export class KnowledgeGraphManager {
   }
 
   async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[]; alreadyPresent: string[] }[]> {
-    return this.withWriteLock(() => {
+    return this.withWriteLock(async () => {
       // Pass 1 — validate the WHOLE batch before touching state (R2: atomic;
       // the old code validated inside the write loop, so a late failure left
       // earlier items applied). Collect every violation for one round-trip.
@@ -819,7 +754,7 @@ export class KnowledgeGraphManager {
       const violations: { entityName: string; code: ToolErrorCode; message: string }[] = [];
 
       for (const o of observations) {
-        const offset = this.db.lookup(o.entityName);
+        const offset = await this.db.lookup(o.entityName);
         if (offset === 0n) {
           violations.push({ entityName: o.entityName, code: 'ENTITY_NOT_FOUND', message: 'entity does not exist' });
           continue;
@@ -835,7 +770,7 @@ export class KnowledgeGraphManager {
           }
         });
 
-        const existingObs = this.db.readEntity(offset).observations;
+        const existingObs = (await this.db.readEntity(offset)).observations;
         const newObservations = o.contents.filter(content => !existingObs.includes(content));
         const alreadyPresent = o.contents.filter(content => existingObs.includes(content));
         if (existingObs.length + newObservations.length > 2) {
@@ -862,7 +797,7 @@ export class KnowledgeGraphManager {
       const results: { entityName: string; addedObservations: string[]; alreadyPresent: string[] }[] = [];
       for (const p of pending) {
         for (const obs of p.newObservations) {
-          this.db.addObservation(p.offset, obs, now);
+          await this.db.addObservation(p.offset, obs, now);
         }
         results.push({ entityName: p.entityName, addedObservations: p.newObservations, alreadyPresent: p.alreadyPresent });
       }
@@ -872,15 +807,15 @@ export class KnowledgeGraphManager {
   }
 
   async deleteEntities(entityNames: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
-    return this.withWriteLock(() => {
+    return this.withWriteLock(async () => {
       const deleted: string[] = [];
       const notFound: string[] = [];
       for (const name of entityNames) {
-        const offset = this.db.lookup(name);
+        const offset = await this.db.lookup(name);
         if (offset === 0n) { notFound.push(name); continue; }
         // C deletes the record + adjacency, drops mirror edges, and releases
         // every string ref (name/type/obs + relType per edge + mirror).
-        this.db.deleteEntity(offset);
+        await this.db.deleteEntity(offset);
         deleted.push(name);
       }
       return { deleted, notFound };
@@ -891,18 +826,18 @@ export class KnowledgeGraphManager {
     deleted: { entityName: string; observations: string[] }[];
     notFound: { entityName: string; observation?: string; reason: 'entity' | 'observation' }[];
   }> {
-    return this.withWriteLock(() => {
+    return this.withWriteLock(async () => {
       const now = BigInt(Date.now());
       const deleted: { entityName: string; observations: string[] }[] = [];
       const notFound: { entityName: string; observation?: string; reason: 'entity' | 'observation' }[] = [];
       for (const d of deletions) {
-        const offset = this.db.lookup(d.entityName);
+        const offset = await this.db.lookup(d.entityName);
         if (offset === 0n) { notFound.push({ entityName: d.entityName, reason: 'entity' }); continue; }
-        const existing = this.db.readEntity(offset).observations;
+        const existing = (await this.db.readEntity(offset)).observations;
         const removed: string[] = [];
         for (const obs of d.observations) {
           if (!existing.includes(obs)) { notFound.push({ entityName: d.entityName, observation: obs, reason: 'observation' }); continue; }
-          this.db.removeObservation(offset, obs, now);
+          await this.db.removeObservation(offset, obs, now);
           removed.push(obs);
         }
         if (removed.length > 0) deleted.push({ entityName: d.entityName, observations: removed });
@@ -912,22 +847,22 @@ export class KnowledgeGraphManager {
   }
 
   async deleteRelations(relations: Relation[]): Promise<{ deleted: Relation[]; notFound: { from: string; to: string; relationType: string; reason: 'entity' | 'relation' }[] }> {
-    return this.withWriteLock(() => {
+    return this.withWriteLock(async () => {
       const deleted: Relation[] = [];
       const notFound: { from: string; to: string; relationType: string; reason: 'entity' | 'relation' }[] = [];
       for (const r of relations) {
-        const fromOffset = this.db.lookup(r.from);
-        const toOffset = this.db.lookup(r.to);
+        const fromOffset = await this.db.lookup(r.from);
+        const toOffset = await this.db.lookup(r.to);
         if (fromOffset === 0n || toOffset === 0n) {
           notFound.push({ from: r.from, to: r.to, relationType: r.relationType, reason: 'entity' });
           continue;
         }
-        const exists = this.db.edges(fromOffset).some(e =>
+        const exists = (await this.db.edges(fromOffset)).some(e =>
           e.direction === DIR_FORWARD && e.target === toOffset && e.relType === r.relationType
         );
         if (!exists) { notFound.push({ from: r.from, to: r.to, relationType: r.relationType, reason: 'relation' }); continue; }
         // C removes both directed edges and releases the two relType refs.
-        this.db.deleteRelation(fromOffset, toOffset, r.relationType);
+        await this.db.deleteRelation(fromOffset, toOffset, r.relationType);
         deleted.push(r);
       }
       return { deleted, notFound };
@@ -953,7 +888,7 @@ export class KnowledgeGraphManager {
     // Validate with the SAME engine that matches (C POSIX ERE), so a valid ERE
     // query is never rejected by a divergent JS RegExp dialect, and an invalid one
     // is rejected consistently. Preserves the "Invalid regex pattern" contract.
-    if (!this.db.regexValid(query)) {
+    if (!(await this.db.regexValid(query))) {
       throw new ToolError('INVALID_REGEX', `Invalid regex pattern: ${query}`);
     }
 
@@ -964,24 +899,40 @@ export class KnowledgeGraphManager {
         'kb.search.query_length': query.length,
         ...(sortBy ? { 'kb.search.sort_by': sortBy } : {}),
       },
-      (span) => this.withReadLock(() => {
-        const filteredEntities = this.db.search(query).map(o => this.recordToEntity(this.db.readEntity(o)));
+      async (span) => this.withReadLock(async () => {
+        const matchOffsets = await this.db.search(query);
+        const filteredEntities: Entity[] = [];
+        for (const o of matchOffsets) filteredEntities.push(this.recordToEntity(await this.db.readEntity(o)));
         const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
 
-        const allRelations = this.getAllRelations();
-        const filteredRelations = allRelations.filter(r => {
-          if (direction === 'forward') return filteredEntityNames.has(r.from);
-          if (direction === 'backward') return filteredEntityNames.has(r.to);
-          return filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to);
-        });
+        // Relations for the matched set, rebuilt from each matched entity's
+        // edges. The historical filter semantics are preserved exactly:
+        // forward = from is matched; backward = to is matched; any = BOTH
+        // endpoints matched.
+        const filteredRelations: Relation[] = [];
+        for (const off of matchOffsets) {
+          const fromName = await this.db.entityName(off);
+          for (const edge of await this.db.edges(off)) {
+            if (edge.direction !== DIR_FORWARD && edge.direction !== DIR_BACKWARD) continue;
+            const targetName = await this.db.entityName(edge.target);
+            if (direction === 'forward' && edge.direction !== DIR_FORWARD) continue;
+            if (direction === 'backward' && edge.direction !== DIR_BACKWARD) continue;
+            if (direction === 'any' && !filteredEntityNames.has(targetName)) continue;
+            const rel: Relation = edge.direction === DIR_FORWARD
+              ? { from: fromName, to: targetName, relationType: edge.relType }
+              : { from: targetName, to: fromName, relationType: edge.relType };
+            const mtime = Number(edge.mtime);
+            if (mtime > 0) rel.mtime = mtime;
+            filteredRelations.push(rel);
+          }
+        }
 
         span.setAttribute('kb.search.used_trigram', false);
-        span.setAttribute('kb.search.scanned.entities', this.db.entityCount());
-        span.setAttribute('kb.search.scanned.relations', allRelations.length);
+        span.setAttribute('kb.search.scanned.entities', await this.db.entityCount());
         span.setAttribute('kb.search.matched.entities', filteredEntities.length);
         span.setAttribute('kb.search.matched.relations', filteredRelations.length);
 
-        const rankMaps = this.getRankMapsUnlocked();
+        const rankMaps = await this.ranksForUnlocked(filteredEntities.map(e => e.name));
         return {
           entities: sortEntities(filteredEntities, sortBy, sortDir, rankMaps),
           relations: filteredRelations,
@@ -991,14 +942,14 @@ export class KnowledgeGraphManager {
   }
 
   async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph & { missing: string[] }> {
-    return this.withReadLock(() => {
+    return this.withReadLock(async () => {
       const filteredEntities: Entity[] = [];
       const missing: string[] = [];
       const offsetByName = new Map<string, bigint>();
       for (const name of names) {
-        const offset = this.db.lookup(name);
+        const offset = await this.db.lookup(name);
         if (offset === 0n) { missing.push(name); continue; }
-        filteredEntities.push(this.recordToEntity(this.db.readEntity(offset)));
+        filteredEntities.push(this.recordToEntity(await this.db.readEntity(offset)));
         offsetByName.set(name, offset);
       }
 
@@ -1018,10 +969,10 @@ export class KnowledgeGraphManager {
       const filteredRelations: Relation[] = [];
       for (const name of filteredEntityNames) {
         const offset = offsetByName.get(name)!;
-        for (const edge of this.db.edges(offset)) {
+        for (const edge of await this.db.edges(offset)) {
           if (edge.direction !== DIR_FORWARD && edge.direction !== DIR_BACKWARD) continue;
 
-          const targetName = this.db.entityName(edge.target);
+          const targetName = await this.db.entityName(edge.target);
           const relationType = edge.relType;
           const mtime = Number(edge.mtime);
 
@@ -1052,36 +1003,37 @@ export class KnowledgeGraphManager {
     direction: 'forward' | 'backward' | 'any' = 'forward'
   ): Promise<Neighbor[]> {
     return traced(
-      'kb.',
+      'kb.get_neighbors',
       {
         'kb.traversal.depth': depth,
         'kb.traversal.direction': direction,
         ...(sortBy ? { 'kb.traversal.sort_by': sortBy } : {}),
       },
-      (span) => this.withReadLock(() => {
-        const startOffset = this.db.lookup(entityName);
+      async (span) => this.withReadLock(async () => {
+        const startOffset = await this.db.lookup(entityName);
         if (startOffset === 0n) {
           span.setAttribute('kb.traversal.start_found', false);
           throw new ToolError('ENTITY_NOT_FOUND', `Start entity not found: ${entityName}`);
         }
         span.setAttribute('kb.traversal.start_found', true);
 
-        // C BFS returns neighbor offsets within `depth` hops, excluding start.
-        // The old TS semantics were one hop deeper (depth=0 returned immediate
-        // neighbors), so request depth+1 from C to match.
-        const neighbors: Neighbor[] = this.db.neighbors(startOffset, depth + 1, direction).map(off => {
-          const rec = this.db.readEntity(off);
+        // Backend hop semantics: one hop deeper than the schema's depth
+        // (depth=0 returns immediate neighbors).
+        const neighborOffsets = await this.db.neighbors(startOffset, depth + 1, direction);
+        const neighbors: Neighbor[] = [];
+        for (const off of neighborOffsets) {
+          const rec = await this.db.readEntity(off);
           const mtime = Number(rec.mtime);
           const obsMtime = Number(rec.obsMtime);
           const n: Neighbor = { name: rec.name };
           if (mtime > 0) n.mtime = mtime;
           if (obsMtime > 0) n.obsMtime = obsMtime;
-          return n;
-        });
+          neighbors.push(n);
+        }
 
         span.setAttribute('kb.traversal.neighbor_count', neighbors.length);
 
-        const rankMaps = this.getRankMapsUnlocked();
+        const rankMaps = await this.ranksForUnlocked(neighbors.map(n => n.name));
         return sortNeighbors(neighbors, sortBy, sortDir, rankMaps);
       }),
     );
@@ -1143,7 +1095,7 @@ export class KnowledgeGraphManager {
       // what users expect from a tool literally called `find_path` with a
       // `maxDepth` arg. DFS gave the first path the recursion discovered,
       // not the shortest.
-      (span) => this.withReadLock(() => {
+      (span) => this.withReadLock(async () => {
         const budgetBytes = findPathBudgetBytes();
 
         // from === to: trivial 0-hop path; no edges. Only path-length-zero
@@ -1155,19 +1107,17 @@ export class KnowledgeGraphManager {
           return { path: [], targetReached: true, budgetExhausted: false, budgetBytes };
         }
 
-        const fromOffset = this.db.lookup(fromEntity);
-        const toOffset = this.db.lookup(toEntity);
+        const fromOffset = await this.db.lookup(fromEntity);
+        const toOffset = await this.db.lookup(toEntity);
         if (fromOffset === 0n || toOffset === 0n) {
           span.setAttribute('kb.traversal.path_found', false);
           span.setAttribute('kb.traversal.target_reached', false);
           return { path: [], targetReached: false, budgetExhausted: false, budgetBytes };
         }
 
-        // C BFS: shortest path to target, or a best-effort path to the
+        // Backend BFS: shortest path to target, or a best-effort path to the
         // farthest-discovered node when the target isn't reached (β-contract).
-        // The byte budget bounds the C BFS just as it bounded the old JS BFS;
-        // KB_FIND_PATH_BUDGET_BYTES flows in via findPathBudgetBytes().
-        const res = this.db.findPath(fromOffset, toOffset, maxDepth, direction, BigInt(budgetBytes));
+        const res = await this.db.findPath(fromOffset, toOffset, maxDepth, direction, BigInt(budgetBytes));
         const found = res.targetReached;
         const nodePath = res.path;
 
@@ -1175,14 +1125,14 @@ export class KnowledgeGraphManager {
         for (let i = 0; i + 1 < nodePath.length; i++) {
           const cur = nodePath[i];
           const next = nodePath[i + 1];
-          const e = this.db.edges(cur).find(ed => ed.target === next && (
+          const e = (await this.db.edges(cur)).find(ed => ed.target === next && (
             direction === 'forward' ? ed.direction === DIR_FORWARD :
             direction === 'backward' ? ed.direction === DIR_BACKWARD :
             (ed.direction === DIR_FORWARD || ed.direction === DIR_BACKWARD)
           ));
           if (!e) continue;
-          const curName = this.db.entityName(cur);
-          const nextName = this.db.entityName(next);
+          const curName = await this.db.entityName(cur);
+          const nextName = await this.db.entityName(next);
           const rel: Relation = e.direction === DIR_FORWARD
             ? { from: curName, to: nextName, relationType: e.relType }
             : { from: nextName, to: curName, relationType: e.relType };
@@ -1192,7 +1142,7 @@ export class KnowledgeGraphManager {
         }
 
         const farthestDiscovered = (!found && res.farthest !== 0n)
-          ? this.db.entityName(res.farthest) : undefined;
+          ? await this.db.entityName(res.farthest) : undefined;
 
         span.setAttribute('kb.traversal.path_length', path.length);
         span.setAttribute('kb.traversal.path_found', found);
@@ -1212,49 +1162,44 @@ export class KnowledgeGraphManager {
   }
 
   async getEntitiesByType(entityType: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
-    return this.withReadLock(() => {
-      const all = this.getAllEntities();
+    return this.withReadLock(async () => {
       // Q3 (docs/api-error-policy.md): the type set is data-derived, so an
       // absent type can never have entities — a miss is a typo/desync, not an
       // empty result.
-      if (!all.some(e => e.entityType === entityType)) {
+      const types = await this.db.entityTypes();
+      if (!types.includes(entityType)) {
         throw new ToolError(
           'TYPE_NOT_FOUND',
           `Entity type "${entityType}" is not present in the graph. See get_entity_types for the full list.`,
         );
       }
-      const filtered = all.filter(e => e.entityType === entityType);
-      const rankMaps = this.getRankMapsUnlocked();
+      const offsets = await this.db.entitiesByType(entityType);
+      const filtered: Entity[] = [];
+      for (const o of offsets) filtered.push(this.recordToEntity(await this.db.readEntity(o)));
+      const rankMaps = await this.ranksForUnlocked(filtered.map(e => e.name));
       return sortEntities(filtered, sortBy, sortDir, rankMaps);
     });
   }
 
   async getEntityTypes(): Promise<string[]> {
-    return this.withReadLock(() => {
-      const types = new Set(this.getAllEntities().map(e => e.entityType));
-      return Array.from(types).sort();
+    return this.withReadLock(async () => {
+      return (await this.db.entityTypes()).sort();
     });
   }
 
   async getRelationTypes(): Promise<string[]> {
-    return this.withReadLock(() => {
-      const types = new Set(this.getAllRelations().map(r => r.relationType));
-      return Array.from(types).sort();
+    return this.withReadLock(async () => {
+      return (await this.db.relationTypes()).sort();
     });
   }
 
   async getStats(): Promise<{ entityCount: number; relationCount: number; entityTypes: number; relationTypes: number }> {
-    return this.withReadLock(() => {
-      const entities = this.getAllEntities();
-      const relations = this.getAllRelations();
-      const entityTypes = new Set(entities.map(e => e.entityType));
-      const relationTypes = new Set(relations.map(r => r.relationType));
-
+    return this.withReadLock(async () => {
       return {
-        entityCount: entities.length,
-        relationCount: relations.length,
-        entityTypes: entityTypes.size,
-        relationTypes: relationTypes.size,
+        entityCount: await this.db.entityCount(),
+        relationCount: await this.db.relationCount(),
+        entityTypes: (await this.db.entityTypes()).length,
+        relationTypes: (await this.db.relationTypes()).length,
       };
     });
   }
@@ -1263,90 +1208,57 @@ export class KnowledgeGraphManager {
     return traced(
       'kb.get_orphaned_entities',
       { 'kb.orphan.strict': strict },
-      (span) => this.withReadLock(() => {
-        const entities = this.getAllEntities();
+      async (span) => this.withReadLock(async () => {
+        span.setAttribute('kb.entity_count', await this.db.entityCount());
 
         if (!strict) {
-          const connectedEntityNames = new Set<string>();
-          const relations = this.getAllRelations();
-          relations.forEach(r => {
-            connectedEntityNames.add(r.from);
-            connectedEntityNames.add(r.to);
-          });
-          const orphans = entities.filter(e => !connectedEntityNames.has(e.name));
-          span.setAttribute('kb.entity_count', entities.length);
-          span.setAttribute('kb.relation_count', relations.length);
+          // Backend-native orphan set: entities with no relations at all.
+          const offsets = await this.db.orphaned();
+          const orphans: Entity[] = [];
+          for (const o of offsets) orphans.push(this.recordToEntity(await this.db.readEntity(o)));
           span.setAttribute('kb.orphan.count', orphans.length);
-          const rankMaps = this.getRankMapsUnlocked();
+          const rankMaps = await this.ranksForUnlocked(orphans.map(e => e.name));
           return sortEntities(orphans, sortBy, sortDir, rankMaps);
         }
 
-        const neighbors = new Map<string, Set<string>>();
-        entities.forEach(e => neighbors.set(e.name, new Set()));
-        const relations = this.getAllRelations();
-        relations.forEach(r => {
-          neighbors.get(r.from)?.add(r.to);
-          neighbors.get(r.to)?.add(r.from);
-        });
-
+        // Strict: lazy BFS from 'Self' over per-node neighbor sets (works on
+        // both backends), keeping the "connected to Self" semantics.
+        const allOffsets = await this.db.listEntities();
         const connectedToSelf = new Set<string>();
-        const queue: string[] = ['Self'];
-
+        const queue: bigint[] = [];
+        const selfOffset = await this.db.lookup('Self');
+        if (selfOffset !== 0n) queue.push(selfOffset);
         while (queue.length > 0) {
-          const current = queue.shift()!;
-          if (connectedToSelf.has(current)) continue;
-          connectedToSelf.add(current);
-
-          const currentNeighbors = neighbors.get(current);
-          if (currentNeighbors) {
-            for (const neighbor of currentNeighbors) {
-              if (!connectedToSelf.has(neighbor)) {
-                queue.push(neighbor);
-              }
-            }
+          const cur = queue.shift()!;
+          const curName = await this.db.entityName(cur);
+          if (connectedToSelf.has(curName)) continue;
+          connectedToSelf.add(curName);
+          for (const nb of await this.db.neighbors(cur, 1, 'any')) {
+            const nbName = await this.db.entityName(nb);
+            if (!connectedToSelf.has(nbName)) queue.push(nb);
           }
         }
 
-        const orphans = entities.filter(e => !connectedToSelf.has(e.name));
-        span.setAttribute('kb.entity_count', entities.length);
-        span.setAttribute('kb.relation_count', relations.length);
+        const orphans: Entity[] = [];
+        for (const off of allOffsets) {
+          const e = await this.db.readEntity(off);
+          if (!connectedToSelf.has(e.name)) orphans.push(this.recordToEntity(e));
+        }
         span.setAttribute('kb.orphan.count', orphans.length);
         span.setAttribute('kb.orphan.connected_to_self', connectedToSelf.size);
-        const rankMaps = this.getRankMapsUnlocked();
+        const rankMaps = await this.ranksForUnlocked(orphans.map(e => e.name));
         return sortEntities(orphans, sortBy, sortDir, rankMaps);
       }),
     );
   }
 
   async validateGraph(): Promise<{ missingEntities: string[]; observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] }> {
-    return this.withReadLock(() => {
-      const entities = this.getAllEntities();
-      const relations = this.getAllRelations();
-      const entityNames = new Set(entities.map(e => e.name));
-      const missingEntities = new Set<string>();
-      const observationViolations: { entity: string; count: number; oversizedObservations: number[] }[] = [];
-
-      relations.forEach(r => {
-        if (!entityNames.has(r.from)) missingEntities.add(r.from);
-        if (!entityNames.has(r.to)) missingEntities.add(r.to);
-      });
-
-      entities.forEach(e => {
-        const oversizedObservations: number[] = [];
-        e.observations.forEach((obs, idx) => {
-          if (obs.length > 140) oversizedObservations.push(idx);
-        });
-
-        if (e.observations.length > 2 || oversizedObservations.length > 0) {
-          observationViolations.push({
-            entity: e.name,
-            count: e.observations.length,
-            oversizedObservations,
-          });
-        }
-      });
-
-      return { missingEntities: Array.from(missingEntities), observationViolations };
+    return this.withReadLock(async () => {
+      const report = await this.db.validate();
+      return {
+        missingEntities: report.missing,
+        observationViolations: report.violations,
+      };
     });
   }
 
@@ -1367,8 +1279,8 @@ export class KnowledgeGraphManager {
         'kb.walker.seeded': seed !== undefined,
         'kb.walker.avoid_cycles': avoidCycles,
       },
-      (span) => this.withReadLock(() => {
-        const startOffset = this.db.lookup(start);
+      async (span) => this.withReadLock(async () => {
+        const startOffset = await this.db.lookup(start);
         if (startOffset === 0n) {
           throw new ToolError('ENTITY_NOT_FOUND', `Start entity not found: ${start}`);
         }
@@ -1377,8 +1289,9 @@ export class KnowledgeGraphManager {
         // seed of 0 means "use the global RNG" (unseeded), so hashSeed (never
         // 0) keeps seeded walks reproducible.
         const seedU64 = seed !== undefined ? BigInt(this.hashSeed(seed) >>> 0) : 0n;
-        const walk = this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64, avoidCycles);
-        const pathNames = walk.path.map(o => this.db.entityName(o));
+        const walk = await this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64, avoidCycles);
+        const pathNames: string[] = [];
+        for (const o of walk.path) pathNames.push(await this.db.entityName(o));
 
         span.setAttribute('kb.walker.steps_taken', pathNames.length - 1);
         span.setAttribute('kb.walker.truncated', pathNames.length - 1 < depth);
@@ -1457,7 +1370,7 @@ export class KnowledgeGraphManager {
       throw new ToolError('LIMIT_EXCEEDED', `${violations.length} limit violation(s); nothing was created (details below).`, violations);
     }
 
-    return this.withWriteLock(() => {
+    return this.withWriteLock(async () => {
       const now = BigInt(Date.now());
 
       // Validate the chain link BEFORE creating the thought (R2: atomic; a
@@ -1465,32 +1378,32 @@ export class KnowledgeGraphManager {
       // chain exists to prevent).
       let prevOffset = 0n;
       if (previousCtxId) {
-        prevOffset = this.db.lookup(previousCtxId);
+        prevOffset = await this.db.lookup(previousCtxId);
         if (prevOffset === 0n) {
           throw new ToolError('ENTITY_NOT_FOUND', `previousCtxId "${previousCtxId}" does not exist; refusing to create an unlinked thought.`);
         }
       }
 
       const ctxId = randomBytes(12).toString('hex');
-      const offset = this.db.createEntity(ctxId, 'Thought', now);
+      const offset = await this.db.createEntity(ctxId, 'Thought', now);
       for (const obs of observations) {
-        this.db.addObservation(offset, obs, now);
+        await this.db.addObservation(offset, obs, now);
       }
 
       if (previousCtxId) {
         // prev --follows--> new, and new --preceded_by--> prev. C creates
         // both directed edges per relation and owns the refcounts.
-        this.db.createRelation(prevOffset, offset, 'follows', now);
-        this.db.createRelation(offset, prevOffset, 'preceded_by', now);
+        await this.db.createRelation(prevOffset, offset, 'follows', now);
+        await this.db.createRelation(offset, prevOffset, 'preceded_by', now);
       }
 
       return { ctxId, linkedTo: previousCtxId ?? null };
     });
   }
 
-  /** Close the underlying binary store files */
-  close(): void {
-    this.db.close();
+  /** Close the backend (embedded store handles, or the daemon connection). */
+  async close(): Promise<void> {
+    await this.db.close();
   }
 }
 
@@ -1516,9 +1429,9 @@ export function createServer(memoryFilePath?: string): Server {
     },
   });
 
-  // Close binary store on server close
+  // Close backend resources (daemon child / store handles) on server close
   server.onclose = () => {
-    knowledgeGraphManager.close();
+    void knowledgeGraphManager.close();
   };
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -1892,19 +1805,16 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
     switch (name) {
       case "create_entities": {
         const result = await knowledgeGraphManager.createEntities(args.entities as Entity[]);
-        knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
       case "create_relations": {
         const result = await knowledgeGraphManager.createRelations(args.relations as Relation[]);
-        knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
       case "add_observations":
         return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[]), null, 2) }] };
       case "delete_entities": {
         const result = await knowledgeGraphManager.deleteEntities(args.entityNames as string[]);
-        knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
       case "delete_observations": {
@@ -1913,7 +1823,6 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
       }
       case "delete_relations": {
         const result = await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
-        knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
       case "search_nodes": {
@@ -1950,13 +1859,13 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         }
 
         // Record walker visits for entities that will be returned to the LLM
-        knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
+        await knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
         return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, (args.entityCursor as number | string | undefined) ?? 0, (args.relationCursor as number | string | undefined) ?? 0)) }] };
       }
       case "open_nodes": {
         const graph = await knowledgeGraphManager.openNodes(args.names as string[], (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
         // Record walker visits for opened nodes
-        knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
+        await knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
         // R3: report partial misses alongside the (paginated) graph.
         const paginated = paginateGraph(graph, (args.entityCursor as number | string | undefined) ?? 0, (args.relationCursor as number | string | undefined) ?? 0);
         return { content: [{ type: "text", text: JSON.stringify({ ...paginated, missing: graph.missing }) }] };
@@ -1964,7 +1873,7 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
       case "get_neighbors": {
         const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 0, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
         // Record walker visits for returned neighbors
-        knowledgeGraphManager.recordWalkerVisits(neighbors.map(n => n.name));
+        await knowledgeGraphManager.recordWalkerVisits(neighbors.map(n => n.name));
         return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "find_path": {
@@ -2071,7 +1980,7 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         const topK = (args.topK as number) ?? 15;
 
         // Run the pipeline (reads string table under read lock)
-        const loadResult = knowledgeGraphManager.prepareDocumentLoad(text, title, topK);
+        const loadResult = await knowledgeGraphManager.prepareDocumentLoad(text, title, topK);
 
         // Insert into KB
         const entities = await knowledgeGraphManager.createEntities(
@@ -2088,7 +1997,6 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
             relationType: r.relationType,
           }))
         );
-        knowledgeGraphManager.resample();
 
         return {
           content: [{

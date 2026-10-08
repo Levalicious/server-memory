@@ -1,41 +1,19 @@
 /**
- * daemon_store.ts — Store-shaped async backend over the kbd4 wire client.
+ * daemon_store.ts — GraphBackend over the kbd4 wire client.
  *
  * The daemon speaks NAMES (and returns name lists); this adapter presents the
- * offset-flavoured surface `server.ts`'s KnowledgeGraphManager expects by
- * keeping a per-client handle table: handle ↔ name (handles are client-local
- * bigints; 0n means absent, matching the embedded store's convention).
+ * offset-flavoured surface the manager expects by keeping a per-client handle
+ * table: handle ↔ name (handles are client-local bigints; 0n means absent,
+ * matching the embedded store's convention).
  *
- * Consistency note: each call is its own daemon transaction, so this adapter
- * offers per-call freshness, not cross-call snapshots. Reads never cache.
- * (The embedded store gets its snapshot property from the server-held flock;
- * under the single writer we take per-op atomicity instead.)
+ * Connection is deferred: pass a DaemonClient or a promise of one (e.g.
+ * DaemonClient.spawn(...) — kicked off synchronously, awaited by the first
+ * operation via `ready`). Consistency is per-call (each daemon request is its
+ * own transaction): reads are never cached.
  */
-import { DaemonClient, OP, R, W, ST_OK } from './daemon_client.js';
+import { DaemonClient, OP, R, ST_OK } from './daemon_client.js';
 import { DIR_FORWARD, DIR_BACKWARD, type Direction } from './store.js';
-
-export interface DaemonEntity {
-  name: string;
-  type: string;
-  observations: string[];
-  mtime: bigint;
-  obsMtime: bigint;
-}
-
-export interface DaemonEdge {
-  target: bigint;
-  direction: number; // DIR_FORWARD | DIR_BACKWARD
-  relType: string;
-  mtime: bigint;
-}
-
-export interface DaemonRanks {
-  structural: Map<string, number>;
-  walker: Map<string, number>;
-  psi: Map<string, number>;
-  structuralTotal: bigint;
-  walkerTotal: bigint;
-}
+import type { GraphBackend, BackendEntity, BackendEdge, BackendRanks, BackendValidation, ScanRow } from './backend.js';
 
 /** Results-paging chunk size (frames are capped at 1 MiB by the daemon). */
 const FETCH_CHUNK = 10_000;
@@ -45,18 +23,35 @@ function dirCode(d: Direction): 0 | 1 | 2 {
   return d === 'forward' ? 0 : d === 'backward' ? 1 : 2;
 }
 
-export class DaemonStore {
-  private readonly client: DaemonClient;
+export class DaemonStore implements GraphBackend {
+  private client: DaemonClient | null = null;
+  private readonly ready: Promise<void>;
   private nextHandle = 1n;
   private byName = new Map<string, bigint>();
   private byHandle = new Map<bigint, string>();
 
-  constructor(client: DaemonClient) {
-    this.client = client;
+  constructor(client: DaemonClient | Promise<DaemonClient>) {
+    this.ready = Promise.resolve(client).then((c) => {
+      this.client = c;
+      // Rank is the daemon's own background job (spec §7 / Design_RankAmortized):
+      // no boot resample here, and none on the op path — the owner maintains
+      // rank in amortized idle slices.
+    });
+  }
+
+  /** Await the connection. Exposed for tests/bootstraps. */
+  async waitReady(): Promise<void> {
+    await this.ready;
+  }
+
+  private async conn(): Promise<DaemonClient> {
+    await this.ready;
+    return this.client!;
   }
 
   async close(): Promise<void> {
-    await this.client.close();
+    try { await this.ready; } catch { /* connection never came up */ }
+    if (this.client) await this.client.close();
   }
 
   // ------------------------------------------------------------- handles
@@ -79,11 +74,12 @@ export class DaemonStore {
 
   // ------------------------------------------------------------- blobs
 
-  private async openBlob(name: string): Promise<{ entity: DaemonEntity; edges: DaemonEdge[] } | null> {
-    const body = await this.client.callOk(OP.OPEN_NODES, (w) => { w.u32(1); w.str(name); });
+  private async openBlob(name: string): Promise<{ entity: BackendEntity; edges: BackendEdge[] } | null> {
+    const client = await this.conn();
+    const body = await client.callOk(OP.OPEN_NODES, (w) => { w.u32(1); w.str(name); });
     const r = new R(body);
     if (r.u8() === 0) return null;
-    const entity: DaemonEntity = {
+    const entity: BackendEntity = {
       name: r.strText(),
       type: r.strText(),
       mtime: r.u64(),
@@ -92,7 +88,7 @@ export class DaemonStore {
     };
     const oc = r.u8();
     for (let i = 0; i < oc; i++) entity.observations.push(r.strText());
-    const edges: DaemonEdge[] = [];
+    const edges: BackendEdge[] = [];
     const ec = r.u32();
     for (let i = 0; i < ec; i++) {
       const relType = r.strText();
@@ -111,7 +107,7 @@ export class DaemonStore {
     return blob ? this.handle(name) : 0n;
   }
 
-  async readEntity(h: bigint): Promise<DaemonEntity> {
+  async readEntity(h: bigint): Promise<BackendEntity> {
     const blob = await this.openBlob(this.nameOf(h));
     if (!blob) throw new Error(`daemon store: entity missing for handle ${h}`);
     return blob.entity;
@@ -121,7 +117,7 @@ export class DaemonStore {
     return this.nameOf(h);
   }
 
-  async edges(h: bigint): Promise<DaemonEdge[]> {
+  async edges(h: bigint): Promise<BackendEdge[]> {
     const blob = await this.openBlob(this.nameOf(h));
     return blob ? blob.edges : [];
   }
@@ -129,7 +125,8 @@ export class DaemonStore {
   // ------------------------------------------------------------- writes
 
   async createEntity(name: string, type: string, mtime: bigint): Promise<bigint> {
-    const body = await this.client.callOk(OP.CREATE_ENTITIES, (w) => {
+    const client = await this.conn();
+    const body = await client.callOk(OP.CREATE_ENTITIES, (w) => {
       w.u32(1); w.str(name); w.str(type); w.u64(mtime);
     });
     const eid = new R(body).u32();
@@ -138,25 +135,30 @@ export class DaemonStore {
   }
 
   async deleteEntity(h: bigint): Promise<void> {
-    await this.client.callOk(OP.DELETE_ENTITIES, (w) => { w.u32(1); w.str(this.nameOf(h)); });
+    const client = await this.conn();
+    await client.callOk(OP.DELETE_ENTITIES, (w) => { w.u32(1); w.str(this.nameOf(h)); });
   }
 
   async addObservation(h: bigint, text: string, mtime: bigint): Promise<void> {
-    await this.client.callOk(OP.ADD_OBS, (w) => { w.u32(1); w.str(this.nameOf(h)); w.str(text); w.u64(mtime); });
+    const client = await this.conn();
+    await client.callOk(OP.ADD_OBS, (w) => { w.u32(1); w.str(this.nameOf(h)); w.str(text); w.u64(mtime); });
   }
 
   async removeObservation(h: bigint, text: string, mtime: bigint): Promise<void> {
-    await this.client.callOk(OP.DEL_OBS, (w) => { w.u32(1); w.str(this.nameOf(h)); w.str(text); w.u64(mtime); });
+    const client = await this.conn();
+    await client.callOk(OP.DEL_OBS, (w) => { w.u32(1); w.str(this.nameOf(h)); w.str(text); w.u64(mtime); });
   }
 
   async createRelation(from: bigint, to: bigint, relType: string, mtime: bigint): Promise<void> {
-    await this.client.callOk(OP.CREATE_RELATIONS, (w) => {
+    const client = await this.conn();
+    await client.callOk(OP.CREATE_RELATIONS, (w) => {
       w.u32(1); w.str(this.nameOf(from)); w.str(this.nameOf(to)); w.str(relType); w.u64(mtime);
     });
   }
 
   async deleteRelation(from: bigint, to: bigint, relType: string): Promise<void> {
-    await this.client.callOk(OP.DELETE_RELATIONS, (w) => {
+    const client = await this.conn();
+    await client.callOk(OP.DELETE_RELATIONS, (w) => {
       w.u32(1); w.str(this.nameOf(from)); w.str(this.nameOf(to)); w.str(relType);
     });
   }
@@ -165,9 +167,10 @@ export class DaemonStore {
 
   /** `hops` counts hops from the start (wire depth = hops - 1, PUBLIC 0-indexed). */
   async neighbors(start: bigint, hops: number, direction: Direction): Promise<bigint[]> {
+    const client = await this.conn();
     const name = this.nameOf(start);
     const names = await this.fetchPaged(
-      (skip, max) => this.client.callOk(OP.NEIGHBORS, (w) => {
+      (skip, max) => client.callOk(OP.NEIGHBORS, (w) => {
         w.str(name); w.u32(Math.max(0, hops - 1)); w.u8(dirCode(direction)); w.u32(max); w.u32(skip);
       }),
     );
@@ -180,9 +183,10 @@ export class DaemonStore {
     budgetExhausted: boolean;
     farthest: bigint;
   }> {
+    const client = await this.conn();
     const fromName = this.nameOf(from);
     const toName = this.nameOf(to);
-    const body = await this.client.callOk(OP.FIND_PATH, (w) => {
+    const body = await client.callOk(OP.FIND_PATH, (w) => {
       w.str(fromName); w.str(toName); w.u32(maxDepth); w.u8(dirCode(direction));
     });
     const r = new R(body);
@@ -200,7 +204,8 @@ export class DaemonStore {
   }
 
   async randomWalk(start: bigint, depth: number, direction: Direction, merwMode: boolean, seed: bigint, avoidCycles: boolean): Promise<{ path: bigint[]; uniformSteps: number }> {
-    const body = await this.client.callOk(OP.RANDOM_WALK, (w) => {
+    const client = await this.conn();
+    const body = await client.callOk(OP.RANDOM_WALK, (w) => {
       w.str(this.nameOf(start)); w.u32(depth); w.u8(dirCode(direction)); w.u8(merwMode ? 1 : 0); w.u64(seed);
       w.u8(avoidCycles ? 1 : 0);
     });
@@ -215,52 +220,61 @@ export class DaemonStore {
   // ------------------------------------------------------------- queries
 
   async search(pattern: string): Promise<bigint[]> {
+    const client = await this.conn();
     const names = await this.fetchPaged(
-      (skip, max) => this.client.callOk(OP.SEARCH, (w) => { w.str(pattern); w.u32(max); w.u32(skip); }),
+      (skip, max) => client.callOk(OP.SEARCH, (w) => { w.str(pattern); w.u32(max); w.u32(skip); }),
     );
     return names.map((n) => this.handle(n));
   }
 
   async regexValid(pattern: string): Promise<boolean> {
-    const body = await this.client.callOk(OP.REGEX_VALID, (w) => w.str(pattern));
+    const client = await this.conn();
+    const body = await client.callOk(OP.REGEX_VALID, (w) => w.str(pattern));
     return new R(body).u8() === 1;
   }
 
   async entitiesByType(type: string): Promise<bigint[]> {
+    const client = await this.conn();
     const names = await this.fetchPaged(
-      (skip, max) => this.client.callOk(OP.BY_TYPE, (w) => { w.str(type); w.u32(max); w.u32(skip); }),
+      (skip, max) => client.callOk(OP.BY_TYPE, (w) => { w.str(type); w.u32(max); w.u32(skip); }),
     );
     return names.map((n) => this.handle(n));
   }
 
   async orphaned(): Promise<bigint[]> {
+    const client = await this.conn();
     const names = await this.fetchPaged(
-      (skip, max) => this.client.callOk(OP.ORPHANED, (w) => { w.u32(max); w.u32(skip); }),
+      (skip, max) => client.callOk(OP.ORPHANED, (w) => { w.u32(max); w.u32(skip); }),
     );
     return names.map((n) => this.handle(n));
   }
 
   async entityTypes(): Promise<string[]> {
-    return this.fetchStrings(OP.ENTITY_TYPES);
+    const client = await this.conn();
+    return this.fetchStrings(client, OP.ENTITY_TYPES);
   }
 
   async relationTypes(): Promise<string[]> {
-    return this.fetchStrings(OP.RELATION_TYPES);
+    const client = await this.conn();
+    return this.fetchStrings(client, OP.RELATION_TYPES);
   }
 
   async entityCount(): Promise<number> {
-    return (await this.client.stats()).entities;
+    const client = await this.conn();
+    return (await client.stats()).entities;
   }
 
   async relationCount(): Promise<number> {
-    return (await this.client.stats()).relations;
+    const client = await this.conn();
+    return (await client.stats()).relations;
   }
 
   // ------------------------------------------------------------- ranks / resample
 
   /** Rank maps for a name list (totals included). */
-  async ranksFor(names: string[]): Promise<DaemonRanks> {
-    const body = await this.client.callOk(OP.RANKS, (w) => {
+  async ranksFor(names: string[]): Promise<BackendRanks> {
+    const client = await this.conn();
+    const body = await client.callOk(OP.RANKS, (w) => {
       w.u32(names.length);
       for (const n of names) w.str(n);
     });
@@ -278,24 +292,24 @@ export class DaemonStore {
     return { structural, walker, psi, structuralTotal, walkerTotal };
   }
 
-  /** One-shot structural sample + MERW psi (post-mutation rank refresh). */
+  /** Forced (admin/debug) rank refresh via OP_RESAMPLE — NOT called on the op
+   * path: the daemon maintains rank in background idle slices (spec §7). */
   async resample(): Promise<void> {
-    await this.client.callOk(OP.RESAMPLE);
+    const client = await this.conn();
+    await client.callOk(OP.RESAMPLE);
   }
 
   // ------------------------------------------------------------- validate
 
-  async validate(): Promise<{
-    missing: string[];
-    violations: { entity: string; count: number; oversizedObservations: number[] }[];
-  }> {
-    const body = await this.client.callOk(OP.VALIDATE);
+  async validate(): Promise<BackendValidation> {
+    const client = await this.conn();
+    const body = await client.callOk(OP.VALIDATE);
     const r = new R(body);
     const missing: string[] = [];
     const nmiss = r.u32();
     for (let i = 0; i < nmiss; i++) missing.push(r.strText());
     const nviol = r.u32();
-    const violations: { entity: string; count: number; oversizedObservations: number[] }[] = [];
+    const violations: BackendValidation['violations'] = [];
     for (let i = 0; i < nviol; i++) {
       const entity = r.strText();
       const count = r.u8();
@@ -311,10 +325,11 @@ export class DaemonStore {
   // ------------------------------------------------------------- corpus / enumeration
 
   /** Paged full-corpus iteration (kb_load corpus pass, listEntities). */
-  async *scanAll(): AsyncGenerator<{ eid: bigint; name: string; type: string; observations: string[] }> {
+  async *scanAll(): AsyncGenerator<ScanRow> {
+    const client = await this.conn();
     let after = 0;
     for (;;) {
-      const body = await this.client.callOk(OP.SCAN, (w) => { w.u32(after); w.u32(SCAN_CHUNK); });
+      const body = await client.callOk(OP.SCAN, (w) => { w.u32(after); w.u32(SCAN_CHUNK); });
       const r = new R(body);
       after = r.u32();
       const n = r.u32();
@@ -338,7 +353,7 @@ export class DaemonStore {
     return out;
   }
 
-  // ------------------------------------------------------------- no-ops (daemon owns these)
+  // ------------------------------------------------------------- daemon-owned no-ops
 
   async lockShared(): Promise<void> {}
   async lockExclusive(): Promise<void> {}
@@ -347,9 +362,6 @@ export class DaemonStore {
   async sync(): Promise<void> {}
   async incWalkerVisit(_h: bigint): Promise<void> {}      // daemon marks visits on its own reads
   async incStructuralVisit(_h: bigint): Promise<void> {}
-  async structuralSample(_iterations: number, _damping: number): Promise<number> { return 0; }
-  async computeMerwPsi(_alpha: number, _maxIter: number, _tol: number): Promise<number> { return 0; }
-  async seedRng(_seed: bigint): Promise<void> {}
 
   // ------------------------------------------------------------- internals
 
@@ -370,8 +382,8 @@ export class DaemonStore {
     }
   }
 
-  private async fetchStrings(op: number): Promise<string[]> {
-    const body = await this.client.callOk(op, (w) => w.u32(100_000));
+  private async fetchStrings(client: DaemonClient, op: number): Promise<string[]> {
+    const body = await client.callOk(op, (w) => w.u32(100_000));
     const r = new R(body);
     const total = r.u32();
     const out: string[] = [];
@@ -380,4 +392,4 @@ export class DaemonStore {
   }
 }
 
-export { W }; // convenience re-export for tests building raw payloads
+export { ST_OK };

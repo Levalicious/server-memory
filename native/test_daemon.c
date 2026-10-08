@@ -531,6 +531,82 @@ int main(void) {
     }
     PASS();
 
+    TEST(background_rank_slice);
+    {
+        /* Spec §7 / Design_RankAmortized: rank is the owner's amortized
+         * BACKGROUND job — this test never sends OP_RESAMPLE. cadence 0 makes
+         * every dirty poll tick slice; a 4-iteration chunk forces the
+         * warm-started ψ iteration to CONTINUE across ticks until the measured
+         * |Δψ| < ε convergence (PR_PowerIteration), rather than stopping at
+         * the chunk bound. */
+        setenv("KBD_RANK_CADENCE_MS", "0", 1);
+        setenv("KBD_RANK_SLICE_ITERS", "4", 1);
+        char bdir[] = "/tmp/kbd4_test_XXXXXX";
+        assert(mkdtemp(bdir));
+        unsigned short bport = 0;
+        pid_t bpid = spawn_daemon(bdir, TOKEN, &bport);
+        unsetenv("KBD_RANK_CADENCE_MS");
+        unsetenv("KBD_RANK_SLICE_ITERS");
+        usleep(100000);
+
+        int bfd = cl_connect(bport);
+        assert(bfd >= 0);
+        pl_reset(&pl); pl_str(&pl, TOKEN);
+        assert(cl_call(bfd, 1, OP_AUTH, &pl, &body) == ST_OK);
+        free(body.b);
+
+        /* chain RB0→RB1→…→RB5: slow enough to need multiple slices at tol 1e-8 */
+        pl_reset(&pl);
+        w32(&pl, 6);
+        for (int i = 0; i < 6; i++) {
+            char nm[8]; snprintf(nm, sizeof nm, "RB%d", i);
+            pl_str(&pl, nm); pl_str(&pl, "rankbg"); w64(&pl, 600 + (u64)i);
+        }
+        assert(cl_call(bfd, 2, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 5);
+        for (int i = 0; i < 5; i++) {
+            char a[8], c[8];
+            snprintf(a, sizeof a, "RB%d", i); snprintf(c, sizeof c, "RB%d", i + 1);
+            pl_str(&pl, a); pl_str(&pl, c); pl_str(&pl, "NEXT"); w64(&pl, 700 + (u64)i);
+        }
+        assert(cl_call(bfd, 3, OP_CREATE_RELATIONS, &pl, &body) == ST_OK);
+        free(body.b);
+
+        /* Each RANKS round-trip is a poll tick; while dirty a slice runs before
+         * the request is served. Track max |ψ change| between ticks. */
+        double prev[6] = {0}, cur[6] = {0};
+        int stable_at = -1;
+        for (int tick = 0; tick < 400 && stable_at < 0; tick++) {
+            pl_reset(&pl);
+            w32(&pl, 6);
+            for (int i = 0; i < 6; i++) { char nm[8]; snprintf(nm, sizeof nm, "RB%d", i); pl_str(&pl, nm); }
+            assert(cl_call(bfd, 10 + (u32)tick, OP_RANKS, &pl, &body) == ST_OK);
+            rd_t rr = body_rd(&body);
+            (void)r64(&rr); (void)r64(&rr);            /* totals */
+            double maxd = 0;
+            for (int i = 0; i < 6; i++) {
+                (void)r64(&rr); (void)r64(&rr);        /* walker, structural */
+                u64 pb = r64(&rr);
+                memcpy(&cur[i], &pb, 8);
+                if (tick > 0) { double d = cur[i] - prev[i]; if (d < 0) d = -d; if (d > maxd) maxd = d; }
+            }
+            free(body.b);
+            if (tick > 0 && maxd < 1e-9) stable_at = tick;
+            memcpy(prev, cur, sizeof cur);
+        }
+        assert(stable_at >= 2);        /* converged over MULTIPLE slices, not one chunk */
+        assert(cur[0] > 0.0 && cur[5] > 0.0);   /* ψ maintained with no op-path resample */
+
+        close(bfd);
+        stop_daemon(bpid);
+        char bcmd[600];
+        snprintf(bcmd, sizeof bcmd, "rm -rf %s", bdir);
+        assert(system(bcmd) == 0);
+    }
+    PASS();
+
     close(fd);
     stop_daemon(pid);
     free(pl.buf);
