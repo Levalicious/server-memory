@@ -27,7 +27,11 @@ jobs:
 
       - name: Build head benchmark
         run: |
-          make -C native bench >/dev/null 2>&1
+          if ! make -C native bench >/tmp/head_build.log 2>&1; then
+            echo "Head bench build/run failed:"
+            tail -50 /tmp/head_build.log
+            exit 1
+          fi
           cp /tmp/mf_test_bench /tmp/bench_head
 
       - name: Build base benchmark (head harness, base store sources)
