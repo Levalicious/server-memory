@@ -822,7 +822,7 @@ export class KnowledgeGraphManager {
 
   async getNeighbors(
     entityName: string,
-    depth: number = 1,
+    depth: number = 0,
     sortBy?: EntitySortField,
     sortDir?: SortDirection,
     direction: 'forward' | 'backward' | 'any' = 'forward'
@@ -1697,7 +1697,7 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
       }
       case "get_neighbors": {
-        const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 1, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 0, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
         // Record walker visits for returned neighbors
         knowledgeGraphManager.recordWalkerVisits(neighbors.map(n => n.name));
         return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
