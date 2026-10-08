@@ -866,9 +866,11 @@ u32 graph_compute_merw_psi(graph_t *g, double alpha, u32 max_iter, double tol) {
 }
 
 u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_mode,
-                      u64 seed, u64 *out_path, u32 max_path) {
+                      u64 seed, int avoid_cycles, u64 *out_path, u32 max_path,
+                      u32 *out_uniform_steps) {
     u64 st = seed ? seed : g_rng;
     u32 plen = 0;
+    u32 uniform_steps = 0;
     if (max_path >= 1) out_path[plen] = start;
     plen = 1;
     u64 cur = start;
@@ -881,6 +883,17 @@ u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_
         for (u32 k = 0; k < ec; k++) {
             if (!dir_match(direction, es[k].direction)) continue;
             u64 t = es[k].target_offset; if (t == cur) continue;
+            if (avoid_cycles) {
+                /* Self-avoiding walk: skip any node already on the path. The
+                 * path prefix doubles as the visited set (callers pass
+                 * max_path >= depth+1, so plen never exceeds max_path and the
+                 * prefix in out_path is complete). All neighbors visited ->
+                 * nc == 0 below -> stops early. */
+                u32 vmax = plen < max_path ? plen : max_path;
+                int seen = 0;
+                for (u32 j = 0; j < vmax; j++) if (out_path[j] == t) { seen = 1; break; }
+                if (seen) continue;
+            }
             double p = rdf64(g->mf, t + E_PSI);
             int found = 0;
             for (u32 j = 0; j < nc; j++) if (cand[j] == t) { if (p > cpsi[j]) cpsi[j] = p; found = 1; break; }
@@ -894,6 +907,7 @@ u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_
             double r = rng_d(&st) * total_psi, cum = 0; chosen = cand[nc - 1];
             for (u32 j = 0; j < nc; j++) { cum += cpsi[j]; if (r <= cum) { chosen = cand[j]; break; } }
         } else {
+            if (merw_mode) uniform_steps++;   /* psi unavailable at this step: fallback */
             u32 ix = (u32)(rng_d(&st) * nc); if (ix >= nc) ix = nc - 1; chosen = cand[ix];
         }
         free(cand); free(cpsi);
@@ -902,6 +916,7 @@ u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_
         plen++;
     }
     if (!seed) g_rng = st;
+    if (out_uniform_steps) *out_uniform_steps = uniform_steps;
     return plen;
 }
 

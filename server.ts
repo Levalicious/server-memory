@@ -19,13 +19,48 @@ import { toolDurationHistogram, traced, tracer } from './src/tracing.js';
 /**
  * Result envelope for a single tool dispatch. Mirrors the MCP CallToolResult
  * shape we return from every case; `isError: true` signals a tool-level error
- * that the LLM should see (vs. a thrown error which becomes a hidden JSON-RPC
- * protocol error).
+ * that the LLM should see. Caller-actionable failures are thrown as
+ * {@link ToolError} and converted into that visible shape by the request
+ * handler; any other exception propagates as a protocol error and is reserved
+ * for genuine server faults.
  */
 type ToolDispatchResult = {
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
 };
+
+/**
+ * Stable, machine-readable error codes carried in the tool-error envelope.
+ * This list is part of the public contract (docs/api-error-policy.md).
+ */
+export type ToolErrorCode =
+  | 'ENTITY_NOT_FOUND'
+  | 'TYPE_NOT_FOUND'
+  | 'ENDPOINT_MISSING'
+  | 'COLLISION'
+  | 'LIMIT_EXCEEDED'
+  | 'INVALID_REGEX'
+  | 'INVALID_FILE'
+  | 'NO_MATCHES'
+  | 'CURSOR_STALE'
+  | 'VALIDATION_FAILED';
+
+/**
+ * A failure the CALLER can act on. The request handler converts these into a
+ * VISIBLE, structured tool error (`isError: true` with a JSON envelope) —
+ * never a protocol error. Protocol errors stay reserved for genuine server
+ * faults. See docs/api-error-policy.md (R1).
+ */
+export class ToolError extends Error {
+  constructor(
+    public code: ToolErrorCode,
+    message: string,
+    public details?: unknown,
+  ) {
+    super(message);
+    this.name = 'ToolError';
+  }
+}
 
 /**
  * True if the query contains any regex metacharacter. Used to gate the
@@ -123,7 +158,8 @@ export interface KnowledgeGraph {
 
 export interface PaginatedResult<T> {
   items: T[];
-  nextCursor: number | null;
+  /** Opaque "<index>:<fingerprint>" token, or null when the drain is complete. */
+  nextCursor: string | null;
   totalCount: number;
 }
 
@@ -178,7 +214,7 @@ function sortEntities(
       const bRank = rankMaps?.structural.get(b.name) ?? 0;
       const diff = aRank - bRank;
       if (diff !== 0) return mult * diff;
-      return Math.random() - 0.5; // random tiebreak
+      return a.name.localeCompare(b.name); // deterministic tiebreak (R5: total order keeps pagination stable)
     }
     if (sortBy === "llmrank") {
       // Primary: walker rank
@@ -191,8 +227,8 @@ function sortEntities(
       const bStruct = rankMaps?.structural.get(b.name) ?? 0;
       const structDiff = aStruct - bStruct;
       if (structDiff !== 0) return mult * structDiff;
-      // Final: random tiebreak
-      return Math.random() - 0.5;
+      // Final: deterministic tiebreak — a total order keeps pagination stable (R5)
+      return a.name.localeCompare(b.name);
     }
     // For timestamps, treat undefined as 0 (oldest)
     const aVal = a[sortBy] ?? 0;
@@ -223,7 +259,7 @@ function sortNeighbors(
       const bRank = rankMaps?.structural.get(b.name) ?? 0;
       const diff = aRank - bRank;
       if (diff !== 0) return mult * diff;
-      return Math.random() - 0.5;
+      return a.name.localeCompare(b.name);
     }
     if (sortBy === "llmrank") {
       const aWalker = rankMaps?.walker.get(a.name) ?? 0;
@@ -234,7 +270,7 @@ function sortNeighbors(
       const bStruct = rankMaps?.structural.get(b.name) ?? 0;
       const structDiff = aStruct - bStruct;
       if (structDiff !== 0) return mult * structDiff;
-      return Math.random() - 0.5;
+      return a.name.localeCompare(b.name);
     }
     const aVal = a[sortBy] ?? 0;
     const bVal = b[sortBy] ?? 0;
@@ -245,8 +281,41 @@ function sortNeighbors(
 export const MAX_CHARS = 4096;
 
 /**
+ * FNV-1a (32-bit) over a string; `seed` lets callers stream multiple strings
+ * into one hash. Used for result-set fingerprints.
+ */
+function fnv1a32(s: string, seed = 0x811c9dc5): number {
+  let h = seed;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Fingerprint of a result set: FNV-1a over every item's serialized form — the
+ * exact bytes pagination boundaries are computed over — so any change to the
+ * set's content or order changes the fingerprint.
+ */
+function resultSetFingerprint<T>(items: T[]): string {
+  let h = 0x811c9dc5;
+  for (const item of items) {
+    h = fnv1a32(JSON.stringify(item), h);
+    h = fnv1a32('\u001f', h);
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+/**
  * Paginate `items` starting at `cursor`, producing a page no larger than
  * `maxChars` (best-effort).
+ *
+ * Policy R5 (docs/api-error-policy.md): a cursor is `"<index>:<fingerprint>"`
+ * for the result set it came from. If the set has changed since the cursor was
+ * issued (content or order), the page boundaries have silently shifted, so the
+ * call errors with CURSOR_STALE rather than serving a wrong page. Bare numbers
+ * are accepted as legacy cursors and are NOT staleness-checked.
  *
  * Forward-progress invariant: every call advances the cursor by at least one
  * item, even when that item's JSON exceeds `maxChars`. Without this guarantee,
@@ -259,12 +328,37 @@ export const MAX_CHARS = 4096;
  * alternative (skipping the item, or returning an error) hides data from the
  * caller and makes downstream pagination inconsistent.
  */
-function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
+function paginateItems<T>(items: T[], cursor: number | string = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
+  // Parse the cursor first; a malformed one is a stale/invalid cursor.
+  let i = 0;
+  let expected: string | null = null;
+  if (typeof cursor === 'string') {
+    const sep = cursor.indexOf(':');
+    const idx = sep >= 0 ? Number(cursor.slice(0, sep)) : NaN;
+    if (!Number.isInteger(idx) || idx < 0) {
+      throw new ToolError('CURSOR_STALE', `Malformed cursor ${JSON.stringify(cursor)}; re-run the query and page from the start.`);
+    }
+    i = idx;
+    expected = cursor.slice(sep + 1);
+  } else if (typeof cursor === 'number' && Number.isFinite(cursor) && cursor >= 0) {
+    i = Math.floor(cursor);
+  } else {
+    throw new ToolError('CURSOR_STALE', 'Invalid cursor value; re-run the query and page from the start.');
+  }
+
+  const fingerprint = resultSetFingerprint(items);
+  if (expected !== null && expected !== fingerprint) {
+    throw new ToolError(
+      'CURSOR_STALE',
+      `Result set changed since this cursor was issued (fingerprint ${expected} -> ${fingerprint}); re-run the query and page from the start.`,
+      { cursorIndex: i, totalCount: items.length },
+    );
+  }
+
   const result: T[] = [];
-  let i = cursor;
 
   // Calculate overhead for wrapper: {"items":[],"nextCursor":null,"totalCount":123}
-  const wrapperTemplate = { items: [] as T[], nextCursor: null as number | null, totalCount: items.length };
+  const wrapperTemplate = { items: [] as T[], nextCursor: null as string | null, totalCount: items.length };
   const overhead = JSON.stringify(wrapperTemplate).length;
   let charCount = overhead;
 
@@ -289,8 +383,7 @@ function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX
     i++;
   }
 
-  // Update nextCursor - recalculate if we stopped early (cursor digits may differ from null)
-  const nextCursor = i < items.length ? i : null;
+  const nextCursor = i < items.length ? `${i}:${fingerprint}` : null;
 
   return {
     items: result,
@@ -299,7 +392,7 @@ function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX
   };
 }
 
-function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relationCursor: number = 0): { entities: PaginatedResult<Entity>; relations: PaginatedResult<Relation> } {
+function paginateGraph(graph: KnowledgeGraph, entityCursor: number | string = 0, relationCursor: number | string = 0): { entities: PaginatedResult<Entity>; relations: PaginatedResult<Relation> } {
   // Entities and relations have independent cursors, so paginate them
   // independently — each gets the full budget.  The caller already has
   // previously-returned pages and only needs the next page of whichever
@@ -580,23 +673,45 @@ export class KnowledgeGraphManager {
     };
   }
 
-  async createEntities(entities: Entity[]): Promise<Entity[]> {
-    // Validate observation limits (can do outside lock)
+  async createEntities(entities: Entity[]): Promise<{ created: Entity[]; existing: string[] }> {
+    // Validate observation limits across the WHOLE batch first, collecting
+    // every violation rather than stopping at the first (R2: validate-first;
+    // the caller gets all offenders in one round-trip).
+    const limitViolations: { entity: string; code: ToolErrorCode; message: string }[] = [];
     for (const entity of entities) {
       if (entity.observations.length > 2) {
-        throw new Error(`Entity "${entity.name}" has ${entity.observations.length} observations. Maximum allowed is 2.`);
+        limitViolations.push({
+          entity: entity.name,
+          code: 'LIMIT_EXCEEDED',
+          message: `has ${entity.observations.length} observations; maximum allowed is 2`,
+        });
       }
-      for (const obs of entity.observations) {
+      entity.observations.forEach((obs, index) => {
         if (obs.length > 140) {
-          throw new Error(`Observation in entity "${entity.name}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+          limitViolations.push({
+            entity: entity.name,
+            code: 'LIMIT_EXCEEDED',
+            message: `observation #${index + 1} is ${obs.length} chars (140 max, ${obs.length - 140} over)`,
+          });
         }
-      }
+      });
+    }
+    if (limitViolations.length > 0) {
+      throw new ToolError(
+        'LIMIT_EXCEEDED',
+        `${limitViolations.length} limit violation(s) in the batch; nothing was created (details below).`,
+        limitViolations,
+      );
     }
 
     return this.withWriteLock(() => {
       const now = BigInt(Date.now());
-      const newEntities: Entity[] = [];
 
+      // Pass 1 — classify every entity before writing anything. A collision
+      // fails the whole batch (R2: atomic) and lists every offender.
+      const toCreate: Entity[] = [];
+      const existingNames: string[] = [];
+      const collisions: { entity: string; code: ToolErrorCode; message: string }[] = [];
       for (const e of entities) {
         const existingOffset = this.db.lookup(e.name);
         if (existingOffset !== 0n) {
@@ -604,10 +719,27 @@ export class KnowledgeGraphManager {
           const sameType = existing.entityType === e.entityType;
           const sameObs = existing.observations.length === e.observations.length &&
             existing.observations.every((o, i) => o === e.observations[i]);
-          if (sameType && sameObs) continue;
-          throw new Error(`Entity "${e.name}" already exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`);
+          if (sameType && sameObs) { existingNames.push(e.name); continue; } // exact duplicate: intent satisfied (R3 ledger)
+          collisions.push({
+            entity: e.name,
+            code: 'COLLISION',
+            message: `exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`,
+          });
+        } else {
+          toCreate.push(e);
         }
+      }
+      if (collisions.length > 0) {
+        throw new ToolError(
+          'COLLISION',
+          `${collisions.length} entity name collision(s); nothing was created (details below).`,
+          collisions,
+        );
+      }
 
+      // Pass 2 — create.
+      const newEntities: Entity[] = [];
+      for (const e of toCreate) {
         const offset = this.db.createEntity(e.name, e.entityType, now);
         for (const obs of e.observations) {
           this.db.addObservation(offset, obs, now);
@@ -621,104 +753,184 @@ export class KnowledgeGraphManager {
         newEntities.push(newEntity);
       }
 
-      return newEntities;
+      return { created: newEntities, existing: existingNames };
     });
   }
 
-  async createRelations(relations: Relation[]): Promise<Relation[]> {
+  async createRelations(relations: Relation[]): Promise<{ created: Relation[]; skippedDuplicates: Relation[] }> {
     return this.withWriteLock(() => {
       const now = BigInt(Date.now());
-      const newRelations: Relation[] = [];
 
+      // Pass 1 — every endpoint must exist; missing endpoints fail the whole
+      // batch (R2/R4: a relation to a nonexistent entity is a state desync,
+      // never a silent drop).
+      const missing: { from: string; to: string; relationType: string; code: ToolErrorCode; missing: string[]; message: string }[] = [];
+      for (const r of relations) {
+        const missingEnds: string[] = [];
+        if (this.db.lookup(r.from) === 0n) missingEnds.push('from');
+        if (this.db.lookup(r.to) === 0n) missingEnds.push('to');
+        if (missingEnds.length > 0) {
+          missing.push({
+            from: r.from,
+            to: r.to,
+            relationType: r.relationType,
+            code: 'ENDPOINT_MISSING',
+            missing: missingEnds,
+            message: `endpoint(s) not found: ${missingEnds.join(', ')}`,
+          });
+        }
+      }
+      if (missing.length > 0) {
+        throw new ToolError(
+          'ENDPOINT_MISSING',
+          `${missing.length} relation(s) reference nonexistent entities; nothing was created (details below).`,
+          missing,
+        );
+      }
+
+      // Pass 2 — create. Duplicates are already-satisfied intent and are
+      // skipped (they become part of the result ledger under policy R3).
+      const newRelations: Relation[] = [];
+      const skippedDuplicates: Relation[] = [];
       for (const r of relations) {
         const fromOffset = this.db.lookup(r.from);
         const toOffset = this.db.lookup(r.to);
-        if (fromOffset === 0n || toOffset === 0n) continue;
 
         const isDuplicate = this.db.edges(fromOffset).some(e =>
           e.direction === DIR_FORWARD && e.target === toOffset && e.relType === r.relationType
         );
-        if (isDuplicate) continue;
+        if (isDuplicate) { skippedDuplicates.push(r); continue; }
 
         // C owns the bidirectional edges + relType interning/refcounts.
         this.db.createRelation(fromOffset, toOffset, r.relationType, now);
         newRelations.push({ ...r, mtime: Number(now) });
       }
 
-      return newRelations;
+      return { created: newRelations, skippedDuplicates };
     });
   }
 
-  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
+  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[]; alreadyPresent: string[] }[]> {
     return this.withWriteLock(() => {
-      const results: { entityName: string; addedObservations: string[] }[] = [];
+      // Pass 1 — validate the WHOLE batch before touching state (R2: atomic;
+      // the old code validated inside the write loop, so a late failure left
+      // earlier items applied). Collect every violation for one round-trip.
+      const pending: { entityName: string; offset: bigint; newObservations: string[]; alreadyPresent: string[] }[] = [];
+      const violations: { entityName: string; code: ToolErrorCode; message: string }[] = [];
 
       for (const o of observations) {
         const offset = this.db.lookup(o.entityName);
         if (offset === 0n) {
-          throw new Error(`Entity with name ${o.entityName} not found`);
+          violations.push({ entityName: o.entityName, code: 'ENTITY_NOT_FOUND', message: 'entity does not exist' });
+          continue;
         }
 
-        for (const obs of o.contents) {
+        o.contents.forEach((obs, index) => {
           if (obs.length > 140) {
-            throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+            violations.push({
+              entityName: o.entityName,
+              code: 'LIMIT_EXCEEDED',
+              message: `observation #${index + 1} is ${obs.length} chars (140 max, ${obs.length - 140} over)`,
+            });
           }
-        }
+        });
 
         const existingObs = this.db.readEntity(offset).observations;
         const newObservations = o.contents.filter(content => !existingObs.includes(content));
-
+        const alreadyPresent = o.contents.filter(content => existingObs.includes(content));
         if (existingObs.length + newObservations.length > 2) {
-          throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${existingObs.length}).`);
+          violations.push({
+            entityName: o.entityName,
+            code: 'LIMIT_EXCEEDED',
+            message: `adding ${newObservations.length} observation(s) would give ${existingObs.length + newObservations.length} total; maximum is 2`,
+          });
         }
+        pending.push({ entityName: o.entityName, offset, newObservations, alreadyPresent });
+      }
 
-        const now = BigInt(Date.now());
-        for (const obs of newObservations) {
-          this.db.addObservation(offset, obs, now);
+      if (violations.length > 0) {
+        const codes = new Set(violations.map(v => v.code));
+        throw new ToolError(
+          codes.size === 1 ? violations[0].code : 'VALIDATION_FAILED',
+          `${violations.length} observation(s) failed validation; nothing was written (details below).`,
+          violations,
+        );
+      }
+
+      // Pass 2 — apply.
+      const now = BigInt(Date.now());
+      const results: { entityName: string; addedObservations: string[]; alreadyPresent: string[] }[] = [];
+      for (const p of pending) {
+        for (const obs of p.newObservations) {
+          this.db.addObservation(p.offset, obs, now);
         }
-
-        results.push({ entityName: o.entityName, addedObservations: newObservations });
+        results.push({ entityName: p.entityName, addedObservations: p.newObservations, alreadyPresent: p.alreadyPresent });
       }
 
       return results;
     });
   }
 
-  async deleteEntities(entityNames: string[]): Promise<void> {
-    this.withWriteLock(() => {
+  async deleteEntities(entityNames: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
+    return this.withWriteLock(() => {
+      const deleted: string[] = [];
+      const notFound: string[] = [];
       for (const name of entityNames) {
         const offset = this.db.lookup(name);
-        if (offset === 0n) continue;
+        if (offset === 0n) { notFound.push(name); continue; }
         // C deletes the record + adjacency, drops mirror edges, and releases
         // every string ref (name/type/obs + relType per edge + mirror).
         this.db.deleteEntity(offset);
+        deleted.push(name);
       }
+      return { deleted, notFound };
     });
   }
 
-  async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
-    this.withWriteLock(() => {
+  async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<{
+    deleted: { entityName: string; observations: string[] }[];
+    notFound: { entityName: string; observation?: string; reason: 'entity' | 'observation' }[];
+  }> {
+    return this.withWriteLock(() => {
       const now = BigInt(Date.now());
+      const deleted: { entityName: string; observations: string[] }[] = [];
+      const notFound: { entityName: string; observation?: string; reason: 'entity' | 'observation' }[] = [];
       for (const d of deletions) {
         const offset = this.db.lookup(d.entityName);
-        if (offset === 0n) continue;
-
+        if (offset === 0n) { notFound.push({ entityName: d.entityName, reason: 'entity' }); continue; }
+        const existing = this.db.readEntity(offset).observations;
+        const removed: string[] = [];
         for (const obs of d.observations) {
+          if (!existing.includes(obs)) { notFound.push({ entityName: d.entityName, observation: obs, reason: 'observation' }); continue; }
           this.db.removeObservation(offset, obs, now);
+          removed.push(obs);
         }
+        if (removed.length > 0) deleted.push({ entityName: d.entityName, observations: removed });
       }
+      return { deleted, notFound };
     });
   }
 
-  async deleteRelations(relations: Relation[]): Promise<void> {
-    this.withWriteLock(() => {
+  async deleteRelations(relations: Relation[]): Promise<{ deleted: Relation[]; notFound: { from: string; to: string; relationType: string; reason: 'entity' | 'relation' }[] }> {
+    return this.withWriteLock(() => {
+      const deleted: Relation[] = [];
+      const notFound: { from: string; to: string; relationType: string; reason: 'entity' | 'relation' }[] = [];
       for (const r of relations) {
         const fromOffset = this.db.lookup(r.from);
         const toOffset = this.db.lookup(r.to);
-        if (fromOffset === 0n || toOffset === 0n) continue;
+        if (fromOffset === 0n || toOffset === 0n) {
+          notFound.push({ from: r.from, to: r.to, relationType: r.relationType, reason: 'entity' });
+          continue;
+        }
+        const exists = this.db.edges(fromOffset).some(e =>
+          e.direction === DIR_FORWARD && e.target === toOffset && e.relType === r.relationType
+        );
+        if (!exists) { notFound.push({ from: r.from, to: r.to, relationType: r.relationType, reason: 'relation' }); continue; }
         // C removes both directed edges and releases the two relType refs.
         this.db.deleteRelation(fromOffset, toOffset, r.relationType);
+        deleted.push(r);
       }
+      return { deleted, notFound };
     });
   }
 
@@ -742,7 +954,7 @@ export class KnowledgeGraphManager {
     // query is never rejected by a divergent JS RegExp dialect, and an invalid one
     // is rejected consistently. Preserves the "Invalid regex pattern" contract.
     if (!this.db.regexValid(query)) {
-      throw new Error(`Invalid regex pattern: ${query}`);
+      throw new ToolError('INVALID_REGEX', `Invalid regex pattern: ${query}`);
     }
 
     return traced(
@@ -778,15 +990,27 @@ export class KnowledgeGraphManager {
     );
   }
 
-  async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
+  async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph & { missing: string[] }> {
     return this.withReadLock(() => {
       const filteredEntities: Entity[] = [];
+      const missing: string[] = [];
       const offsetByName = new Map<string, bigint>();
       for (const name of names) {
         const offset = this.db.lookup(name);
-        if (offset === 0n) continue;
+        if (offset === 0n) { missing.push(name); continue; }
         filteredEntities.push(this.recordToEntity(this.db.readEntity(offset)));
         offsetByName.set(name, offset);
+      }
+
+      // Q2 (docs/api-error-policy.md): when NONE of the requested names exist,
+      // the request is a typo/desync — error instead of returning an empty
+      // graph (a partial miss is reported via the R3 ledger).
+      if (names.length > 0 && filteredEntities.length === 0) {
+        throw new ToolError(
+          'ENTITY_NOT_FOUND',
+          `None of the ${names.length} requested entities exist.`,
+          { missing: names },
+        );
       }
 
       const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
@@ -816,13 +1040,13 @@ export class KnowledgeGraphManager {
         }
       }
 
-      return { entities: filteredEntities, relations: filteredRelations };
+      return { entities: filteredEntities, relations: filteredRelations, missing };
     });
   }
 
   async getNeighbors(
     entityName: string,
-    depth: number = 1,
+    depth: number = 0,
     sortBy?: EntitySortField,
     sortDir?: SortDirection,
     direction: 'forward' | 'backward' | 'any' = 'forward'
@@ -838,7 +1062,7 @@ export class KnowledgeGraphManager {
         const startOffset = this.db.lookup(entityName);
         if (startOffset === 0n) {
           span.setAttribute('kb.traversal.start_found', false);
-          return [];
+          throw new ToolError('ENTITY_NOT_FOUND', `Start entity not found: ${entityName}`);
         }
         span.setAttribute('kb.traversal.start_found', true);
 
@@ -989,7 +1213,17 @@ export class KnowledgeGraphManager {
 
   async getEntitiesByType(entityType: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
     return this.withReadLock(() => {
-      const filtered = this.getAllEntities().filter(e => e.entityType === entityType);
+      const all = this.getAllEntities();
+      // Q3 (docs/api-error-policy.md): the type set is data-derived, so an
+      // absent type can never have entities — a miss is a typo/desync, not an
+      // empty result.
+      if (!all.some(e => e.entityType === entityType)) {
+        throw new ToolError(
+          'TYPE_NOT_FOUND',
+          `Entity type "${entityType}" is not present in the graph. See get_entity_types for the full list.`,
+        );
+      }
+      const filtered = all.filter(e => e.entityType === entityType);
       const rankMaps = this.getRankMapsUnlocked();
       return sortEntities(filtered, sortBy, sortDir, rankMaps);
     });
@@ -1122,7 +1356,8 @@ export class KnowledgeGraphManager {
     seed?: string,
     direction: 'forward' | 'backward' | 'any' = 'forward',
     mode: RandomWalkMode = 'merw',
-  ): Promise<{ entity: string; path: string[] }> {
+    avoidCycles: boolean = false,
+  ): Promise<{ entity: string; path: string[]; modeUsed: 'merw' | 'uniform' | 'merw+fallback'; fallbackSteps: number }> {
     return traced(
       'kb.random_walk',
       {
@@ -1130,23 +1365,30 @@ export class KnowledgeGraphManager {
         'kb.traversal.direction': direction,
         'kb.walker.mode': mode,
         'kb.walker.seeded': seed !== undefined,
+        'kb.walker.avoid_cycles': avoidCycles,
       },
       (span) => this.withReadLock(() => {
         const startOffset = this.db.lookup(start);
         if (startOffset === 0n) {
-          throw new Error(`Start entity not found: ${start}`);
+          throw new ToolError('ENTITY_NOT_FOUND', `Start entity not found: ${start}`);
         }
 
         // Seeded walk: hash the string seed to a u64 the C RNG can use. A
         // seed of 0 means "use the global RNG" (unseeded), so hashSeed (never
         // 0) keeps seeded walks reproducible.
         const seedU64 = seed !== undefined ? BigInt(this.hashSeed(seed) >>> 0) : 0n;
-        const pathOffsets = this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64);
-        const pathNames = pathOffsets.map(o => this.db.entityName(o));
+        const walk = this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64, avoidCycles);
+        const pathNames = walk.path.map(o => this.db.entityName(o));
 
         span.setAttribute('kb.walker.steps_taken', pathNames.length - 1);
         span.setAttribute('kb.walker.truncated', pathNames.length - 1 < depth);
-        return { entity: pathNames[pathNames.length - 1], path: pathNames };
+        span.setAttribute('kb.walker.fallback_steps', walk.uniformSteps);
+        // R3 report (docs/api-error-policy.md): which policy actually ran.
+        // 'merw+fallback' = psi weighting was unavailable at some steps, so
+        // those steps sampled uniformly instead.
+        const modeUsed: 'merw' | 'uniform' | 'merw+fallback' =
+          mode === 'uniform' ? 'uniform' : (walk.uniformSteps === 0 ? 'merw' : 'merw+fallback');
+        return { entity: pathNames[pathNames.length - 1], path: pathNames, modeUsed, fallbackSteps: walk.uniformSteps };
       }),
     );
   }
@@ -1200,37 +1442,49 @@ export class KnowledgeGraphManager {
     return result;
   }
 
-  async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string }> {
-    // Validate observations (can do outside lock)
+  async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string; linkedTo: string | null }> {
+    // Validate observation limits across the whole request first.
+    const violations: { code: ToolErrorCode; message: string }[] = [];
     if (observations.length > 2) {
-      throw new Error(`Thought has ${observations.length} observations. Maximum allowed is 2.`);
+      violations.push({ code: 'LIMIT_EXCEEDED', message: `Thought has ${observations.length} observations; maximum allowed is 2` });
     }
-    for (const obs of observations) {
+    observations.forEach((obs, index) => {
       if (obs.length > 140) {
-        throw new Error(`Observation exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+        violations.push({ code: 'LIMIT_EXCEEDED', message: `observation #${index + 1} is ${obs.length} chars (140 max, ${obs.length - 140} over)` });
       }
+    });
+    if (violations.length > 0) {
+      throw new ToolError('LIMIT_EXCEEDED', `${violations.length} limit violation(s); nothing was created (details below).`, violations);
     }
 
     return this.withWriteLock(() => {
       const now = BigInt(Date.now());
-      const ctxId = randomBytes(12).toString('hex');
 
+      // Validate the chain link BEFORE creating the thought (R2: atomic; a
+      // silently-unlinked thought is exactly the FORGOT_EVIDENCE failure the
+      // chain exists to prevent).
+      let prevOffset = 0n;
+      if (previousCtxId) {
+        prevOffset = this.db.lookup(previousCtxId);
+        if (prevOffset === 0n) {
+          throw new ToolError('ENTITY_NOT_FOUND', `previousCtxId "${previousCtxId}" does not exist; refusing to create an unlinked thought.`);
+        }
+      }
+
+      const ctxId = randomBytes(12).toString('hex');
       const offset = this.db.createEntity(ctxId, 'Thought', now);
       for (const obs of observations) {
         this.db.addObservation(offset, obs, now);
       }
 
       if (previousCtxId) {
-        const prevOffset = this.db.lookup(previousCtxId);
-        if (prevOffset !== 0n) {
-          // prev --follows--> new, and new --preceded_by--> prev. C creates
-          // both directed edges per relation and owns the refcounts.
-          this.db.createRelation(prevOffset, offset, 'follows', now);
-          this.db.createRelation(offset, prevOffset, 'preceded_by', now);
-        }
+        // prev --follows--> new, and new --preceded_by--> prev. C creates
+        // both directed edges per relation and owns the refcounts.
+        this.db.createRelation(prevOffset, offset, 'follows', now);
+        this.db.createRelation(offset, prevOffset, 'preceded_by', now);
       }
 
-      return { ctxId };
+      return { ctxId, linkedTo: previousCtxId ?? null };
     });
   }
 
@@ -1255,7 +1509,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.29",
+    version: "0.0.30",
   }, {
     capabilities: {
       tools: {},
@@ -1417,8 +1671,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction filter for returned relations. Default: forward" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
-            entityCursor: { type: "number", description: "Cursor for entity pagination (from previous response's nextCursor)" },
-            relationCursor: { type: "number", description: "Cursor for relation pagination" },
+            entityCursor: { type: ["number", "string"], description: "Opaque entity page cursor; pass back exactly what nextCursor returned" },
+            relationCursor: { type: ["number", "string"], description: "Opaque relation page cursor; pass back exactly what nextCursor returned" },
           },
           required: ["query"],
         },
@@ -1435,8 +1689,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "An array of entity names to retrieve",
             },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction filter for returned relations. Default: forward" },
-            entityCursor: { type: "number", description: "Cursor for entity pagination" },
-            relationCursor: { type: "number", description: "Cursor for relation pagination" },
+            entityCursor: { type: ["number", "string"], description: "Opaque entity page cursor; pass back exactly what nextCursor returned" },
+            relationCursor: { type: ["number", "string"], description: "Opaque relation page cursor; pass back exactly what nextCursor returned" },
           },
           required: ["names"],
         },
@@ -1452,7 +1706,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for neighbors. Omit for arbitrary order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
           required: ["entityName"],
         },
@@ -1467,7 +1721,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             toEntity: { type: "string", description: "The name of the target entity" },
             maxDepth: { type: "number", description: "Maximum depth to search (default: 5)", default: 5 },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
           required: ["fromEntity", "toEntity"],
         },
@@ -1481,7 +1735,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             entityType: { type: "string", description: "The type of entities to retrieve" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
           required: ["entityType"],
         },
@@ -1492,7 +1746,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
         },
       },
@@ -1502,7 +1756,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
         },
       },
@@ -1523,7 +1777,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             strict: { type: "boolean", description: "If true, returns entities not connected to 'Self' (directly or indirectly). Default: false" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
         },
       },
@@ -1533,8 +1787,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            entitiesCursor: { type: "number", description: "Cursor for the missingEntities list" },
-            violationsCursor: { type: "number", description: "Cursor for the observationViolations list" },
+            entitiesCursor: { type: ["number", "string"], description: "Opaque cursor for the missingEntities list; pass back exactly what nextCursor returned" },
+            violationsCursor: { type: ["number", "string"], description: "Opaque cursor for the observationViolations list; pass back exactly what nextCursor returned" },
           },
         },
       },
@@ -1564,6 +1818,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               enum: ["merw", "uniform"],
               description:
                 "Transition policy. 'merw' (default) weights each step by ψ (the cached Maximum-Entropy Random Walk eigenvector), biasing the walk toward structurally important nodes; falls back to uniform if ψ is not yet computed. 'uniform' samples each eligible neighbor with equal probability — useful for unbiased exploration or as a baseline for comparison.",
+            },
+            avoidCycles: {
+              type: "boolean",
+              description:
+                "If true, the walk never revisits a node (self-avoiding — the path contains no cycles) and stops early when every neighbor is already on the path. Default: false",
             },
           },
           required: ["start"],
@@ -1622,9 +1881,12 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
   /**
    * Dispatch a single tool call. Extracted from the request handler so the
    * handler can wrap it with span/metric instrumentation without duplicating
-   * the per-tool logic. Returns the MCP `CallToolResult` shape; thrown errors
-   * become JSON-RPC protocol errors (hidden from the model), while
-   * `{ isError: true }` returns are visible tool-level errors.
+   * the per-tool logic. Returns the MCP `CallToolResult` shape.
+   *
+   * Error policy (docs/api-error-policy.md): caller-actionable failures are
+   * thrown as `ToolError`s — the request handler converts them into VISIBLE
+   * structured tool errors (`isError: true` + JSON envelope). Any other throw
+   * remains a JSON-RPC protocol error and is reserved for server faults.
    */
   async function dispatch(name: string, args: Record<string, unknown>): Promise<ToolDispatchResult> {
     switch (name) {
@@ -1640,17 +1902,20 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
       }
       case "add_observations":
         return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[]), null, 2) }] };
-      case "delete_entities":
-        await knowledgeGraphManager.deleteEntities(args.entityNames as string[]);
+      case "delete_entities": {
+        const result = await knowledgeGraphManager.deleteEntities(args.entityNames as string[]);
         knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
-        return { content: [{ type: "text", text: "Entities deleted successfully" }] };
-      case "delete_observations":
-        await knowledgeGraphManager.deleteObservations(args.deletions as { entityName: string; observations: string[] }[]);
-        return { content: [{ type: "text", text: "Observations deleted successfully" }] };
-      case "delete_relations":
-        await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+      case "delete_observations": {
+        const result = await knowledgeGraphManager.deleteObservations(args.deletions as { entityName: string; observations: string[] }[]);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+      case "delete_relations": {
+        const result = await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
         knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
-        return { content: [{ type: "text", text: "Relations deleted successfully" }] };
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
       case "search_nodes": {
         const query = args.query as string;
         const graph = await knowledgeGraphManager.searchNodes(
@@ -1670,35 +1935,42 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
           const suggestion = suggested && suggested !== query
             ? ` For multiple terms try ${JSON.stringify(suggested)}.`
             : '';
+          const envelope = {
+            error: {
+              tool: 'search_nodes',
+              code: 'NO_MATCHES',
+              message: `No matches for ${JSON.stringify(query)}. search_nodes uses POSIX Extended Regular Expressions (ERE), case-sensitive — not natural language, and not JS/PCRE regex (use [0-9] not \\d, [[:alpha:]] not \\w; no lookahead or backreferences).${suggestion} You can also browse with get_entities_by_type, get_neighbors, or random_walk.`,
+              ...(suggestion && { details: { suggestedRegex: suggested } }),
+            },
+          };
           return {
-            content: [{
-              type: "text",
-              text: `No matches for ${JSON.stringify(query)}. search_nodes uses POSIX Extended Regular Expressions (ERE), case-sensitive — not natural language, and not JS/PCRE regex (use [0-9] not \\d, [[:alpha:]] not \\w; no lookahead or backreferences).${suggestion} You can also browse with get_entities_by_type, get_neighbors, or random_walk.`,
-            }],
+            content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }],
             isError: true,
           };
         }
 
         // Record walker visits for entities that will be returned to the LLM
         knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
-        return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, (args.entityCursor as number | string | undefined) ?? 0, (args.relationCursor as number | string | undefined) ?? 0)) }] };
       }
       case "open_nodes": {
         const graph = await knowledgeGraphManager.openNodes(args.names as string[], (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
         // Record walker visits for opened nodes
         knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
-        return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+        // R3: report partial misses alongside the (paginated) graph.
+        const paginated = paginateGraph(graph, (args.entityCursor as number | string | undefined) ?? 0, (args.relationCursor as number | string | undefined) ?? 0);
+        return { content: [{ type: "text", text: JSON.stringify({ ...paginated, missing: graph.missing }) }] };
       }
       case "get_neighbors": {
-        const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 1, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
+        const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 0, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
         // Record walker visits for returned neighbors
         knowledgeGraphManager.recordWalkerVisits(neighbors.map(n => n.name));
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "find_path": {
         const toEntityName = args.toEntity as string;
         const result = await knowledgeGraphManager.findPath(args.fromEntity as string, toEntityName, args.maxDepth as number, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
-        const paginated = paginateItems(result.path, args.cursor as number ?? 0);
+        const paginated = paginateItems(result.path, (args.cursor as number | string | undefined) ?? 0);
         // β-contract response. Pagination of `path` is unchanged; the
         // result wrapper additionally carries `targetReached` (did we
         // actually reach `toEntity`?), `budgetExhausted` (did we stop
@@ -1733,27 +2005,27 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
       }
       case "get_entities_by_type": {
         const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "get_entity_types": {
         const types = await knowledgeGraphManager.getEntityTypes();
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "get_relation_types": {
         const types = await knowledgeGraphManager.getRelationTypes();
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "get_stats":
         return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
       case "get_orphaned_entities": {
         const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "validate_graph": {
         const report = await knowledgeGraphManager.validateGraph();
         return { content: [{ type: "text", text: JSON.stringify({
-          missingEntities: paginateItems(report.missingEntities, args.entitiesCursor as number ?? 0),
-          observationViolations: paginateItems(report.observationViolations, args.violationsCursor as number ?? 0),
+          missingEntities: paginateItems(report.missingEntities, (args.entitiesCursor as number | string | undefined) ?? 0),
+          observationViolations: paginateItems(report.observationViolations, (args.violationsCursor as number | string | undefined) ?? 0),
         }) }] };
       }
       case "decode_timestamp":
@@ -1765,6 +2037,7 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
           args.seed as string | undefined,
           (args.direction as 'forward' | 'backward' | 'any') ?? 'forward',
           (args.mode as RandomWalkMode) ?? 'merw',
+          (args.avoidCycles as boolean) ?? false,
         );
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       }
@@ -1779,14 +2052,18 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         const filePath = args.filePath as string;
 
         // Validate extension
-        validateExtension(filePath);
+        try {
+          validateExtension(filePath);
+        } catch (err: unknown) {
+          throw new ToolError('INVALID_FILE', err instanceof Error ? err.message : String(err));
+        }
 
         // Read file
         let text: string;
         try {
           text = fs.readFileSync(filePath, 'utf-8');
         } catch (err: unknown) {
-          throw new Error(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
+          throw new ToolError('INVALID_FILE', `Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
         }
 
         // Derive title
@@ -1819,8 +2096,8 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
             text: JSON.stringify({
               document: title,
               stats: loadResult.stats,
-              entitiesCreated: entities.length,
-              relationsCreated: relations.length,
+              entities: { created: entities.created.length, existing: entities.existing.length },
+              relations: { created: relations.created.length, skippedDuplicates: relations.skippedDuplicates.length },
             }, null, 2),
           }],
         };
@@ -1879,6 +2156,26 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
           }
           return result;
         } catch (err) {
+          if (err instanceof ToolError) {
+            // Policy R1 (docs/api-error-policy.md): caller-actionable failures
+            // surface as VISIBLE tool errors with a structured envelope —
+            // never as protocol errors.
+            errorType = `tool_error:${err.code}`;
+            span.setAttribute('error.type', errorType);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+            const envelope = {
+              error: {
+                tool: name,
+                code: err.code,
+                message: err.message,
+                ...(err.details !== undefined && { details: err.details }),
+              },
+            };
+            return {
+              content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }],
+              isError: true,
+            };
+          }
           errorType = (err as Error)?.constructor?.name ?? 'Error';
           span.setAttribute('error.type', errorType);
           span.recordException(err as Error);
