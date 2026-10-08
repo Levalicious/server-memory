@@ -1509,7 +1509,7 @@ export function createServer(memoryFilePath?: string): Server {
         sizes: ["any"]
       }
     ],
-    version: "0.0.29",
+    version: "0.0.30",
   }, {
     capabilities: {
       tools: {},
