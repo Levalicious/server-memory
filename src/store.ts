@@ -82,7 +82,7 @@ interface NativeStore {
   structuralSample(h: unknown, iterations: number, damping: number): number;
   computeMerwPsi(h: unknown, alpha: number, maxIter: number, tol: number): number;
   seedRng(h: unknown, seed: bigint): void;
-  randomWalk(h: unknown, start: bigint, depth: number, direction: number, merwMode: number, seed: bigint, avoidCycles: number): bigint[];
+  randomWalk(h: unknown, start: bigint, depth: number, direction: number, merwMode: number, seed: bigint, avoidCycles: number): { path: bigint[]; uniformSteps: number };
   validateObs(h: unknown): { offset: bigint; count: number; oversize: number }[];
   validateDangling(h: unknown): { src: bigint; target: bigint }[];
   setEntityFields(h: unknown, off: bigint, mtime: bigint, obsMtime: bigint, structuralVisits: bigint, walkerVisits: bigint, psi: number): void;
@@ -171,7 +171,7 @@ export class Store {
   structuralSample(iterations: number, damping: number): number { return native.structuralSample(this.h, iterations, damping); }
   computeMerwPsi(alpha: number, maxIter: number, tol: number): number { return native.computeMerwPsi(this.h, alpha, maxIter, tol); }
   seedRng(seed: bigint): void { native.seedRng(this.h, seed); }
-  randomWalk(start: bigint, depth: number, direction: Direction, merwMode: boolean, seed: bigint, avoidCycles: boolean): bigint[] {
+  randomWalk(start: bigint, depth: number, direction: Direction, merwMode: boolean, seed: bigint, avoidCycles: boolean): { path: bigint[]; uniformSteps: number } {
     return native.randomWalk(this.h, start, depth, dirCode(direction), merwMode ? 1 : 0, seed, avoidCycles ? 1 : 0);
   }
 

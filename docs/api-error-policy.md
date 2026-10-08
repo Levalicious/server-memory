@@ -63,12 +63,12 @@ txid once the owner daemon lands). A stale/mismatched cursor returns a
 | `add_observations` | unknown entity → `ENTITY_NOT_FOUND`; limit breaches → `LIMIT_EXCEEDED` (atomic, all offenders) | per-entity `{entityName, addedObservations, alreadyPresent}` |
 | `delete_entities` / `delete_relations` / `delete_observations` | nothing errors — absence is `notFound` (R4) | `{deleted, notFound}` ledgers |
 | `sequentialthinking` | unknown `previousCtxId` → `ENTITY_NOT_FOUND` (chain integrity); limits → `LIMIT_EXCEEDED` | `{ctxId, linkedTo}` |
-| `kb_load` | bad extension / unreadable file → `INVALID_FILE`; entity & relation stages per their rows | per-stage ledger (document, stats, entity/relation outcomes) |
+| `kb_load` | bad extension / unreadable file → `INVALID_FILE`; entity & relation stages per their rows | counts per stage: `entities {created, existing}`, `relations {created, skippedDuplicates}` |
 | `open_nodes` | ALL requested names missing → `ENTITY_NOT_FOUND` | graph result + `missing[]` for partial misses |
 | `get_neighbors` | unknown start → `ENTITY_NOT_FOUND` | neighbors (depth 0 = immediate) |
 | `search_nodes` | invalid ERE → `INVALID_REGEX`; literal query, zero matches → `NO_MATCHES` | paginated graph |
 | `get_entities_by_type` | type absent from the data-derived type set → `TYPE_NOT_FOUND` | entities of that type |
-| `random_walk` | unknown start → `ENTITY_NOT_FOUND` | `{entity, path, modeUsed, stopReason}` |
+| `random_walk` | unknown start → `ENTITY_NOT_FOUND` | `{entity, path, modeUsed, fallbackSteps}` (`modeUsed` = `merw` \| `uniform` \| `merw+fallback`) |
 | `find_path` | — (β-contract already reports `targetReached` / `budgetExhausted` / `note`) | unchanged — the reference pattern for R1-style reporting |
 | reads (`get_entity_types`, `get_relation_types`, `get_stats`, `get_orphaned_entities`, `validate_graph`, `decode_timestamp`) | unchanged | unchanged |
 
@@ -78,12 +78,16 @@ faults; Q1 = atomic-fail on missing endpoints; Q2/Q3 = error.
 
 ## Status
 
-- **This change (envelope PR):** R1 (envelope + codes + dispatch conversion),
-  R2 (validate-first atomicity for `create_entities`, `create_relations`,
-  `add_observations`, `sequentialthinking`), R4 (drops→errors:
-  `ENDPOINT_MISSING`, all-missing `open_nodes`, `TYPE_NOT_FOUND`, unknown
-  starts), `INVALID_FILE`, `INVALID_REGEX`, `NO_MATCHES` envelope.
-- **Ledger PR (next):** R3 result ledgers + report fields (`missing[]`,
-  `modeUsed`, `alreadyPresent`), R5 cursor fingerprinting.
+- **Envelope PR (#247, merged):** R1 (envelope + codes + dispatch
+  conversion), R2 (validate-first atomicity for `create_entities`,
+  `create_relations`, `add_observations`, `sequentialthinking`), R4
+  (drops→errors: `ENDPOINT_MISSING`, all-missing `open_nodes`,
+  `TYPE_NOT_FOUND`, unknown starts), `INVALID_FILE`, `INVALID_REGEX`,
+  `NO_MATCHES` envelope.
+- **Ledger PR:** R3 result ledgers + report fields
+  (`created`/`existing`/`skippedDuplicates`/`notFound`/`alreadyPresent`,
+  `open_nodes.missing[]`, `random_walk.modeUsed`/`fallbackSteps`,
+  `sequentialthinking.linkedTo`).
+- **Next:** R5 cursor fingerprinting (`CURSOR_STALE`).
 - **v4 line (`feat/libsegstore`):** inherits this policy at reconciliation;
   kbd4's batch=txn=commit model is the natural home for R2 atomicity.
