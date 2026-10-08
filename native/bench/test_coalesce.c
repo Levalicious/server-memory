@@ -12,13 +12,14 @@
 #include <unistd.h>
 #include "substrate.h"
 #include "mf_radix.h"
+#include "../tmputil.h"
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("  FAIL: %s\n", msg); fails++; } \
                            else printf("  ok:   %s\n", msg); } while (0)
 
 int main(void) {
-    const char *p = "/tmp/mf_coal_test.dat";
+    const char *p = MF_TMP("mf_coal_test.dat");
     unlink(p);
     mf_t *mf = mf_open(p, 1u << 16);
     if (!mf) { perror("mf_open"); return 2; }

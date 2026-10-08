@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include "memoryfile.h"
+#include "tmputil.h"
 
 static u64 g = 0x123456789abcdefull;
 static u64 xs(void) { u64 x = g; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g = x; }
@@ -18,7 +19,7 @@ static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  FAIL: %s\n", m); fails++; } else printf("  ok:   %s\n", m); } while (0)
 
 int main(void) {
-    const char *p = "/tmp/memfile_v3_test.dat";
+    const char *p = MF_TMP("memfile_v3_test.dat");
     unlink(p);
     memfile_t *mf = memfile_open(p, 1u << 16);
     if (!mf) { printf("open failed\n"); return 2; }
@@ -57,7 +58,7 @@ int main(void) {
     free(live);
 
     /* version-refuse guard: a non-v3 file must be rejected, never opened. */
-    const char *p2 = "/tmp/memfile_v3_badver.dat";
+    const char *p2 = MF_TMP("memfile_v3_badver.dat");
     unlink(p2);
     memfile_t *m2 = memfile_open(p2, 1u << 16);
     CHECK(m2 != NULL, "create fresh v3 file");

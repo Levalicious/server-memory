@@ -10,6 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "stringtable.h"
+#include "tmputil.h"
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  FAIL: %s\n", m); fails++; } else printf("  ok:   %s\n", m); } while (0)
@@ -18,7 +19,7 @@ static u64 g = 0xabcdef0123ull;
 static u64 xs(void) { u64 x = g; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g = x; }
 
 int main(void) {
-    const char *p = "/tmp/st_test.dat";
+    const char *p = MF_TMP("st_test.dat");
     unlink(p);
     stringtable_t *st = st_open(p, 1u << 16);
     if (!st) { printf("st_open failed\n"); return 2; }

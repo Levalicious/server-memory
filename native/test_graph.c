@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include "stringtable.h"
 #include "graph.h"
+#include "tmputil.h"
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  FAIL: %s\n", m); fails++; } else printf("  ok:   %s\n", m); } while (0)
@@ -69,7 +70,7 @@ static int pick_alive(void) {
 }
 
 int main(void) {
-    const char *gp = "/tmp/graph_test.dat", *sp = "/tmp/graph_test.strings.dat";
+    const char *gp = MF_TMP("graph_test.dat"), *sp = MF_TMP("graph_test.strings.dat");
     unlink(gp); unlink(sp);
     st = st_open(sp, 1u << 16);
     gr = graph_open(gp, st, 1u << 16);

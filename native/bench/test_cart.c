@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include "substrate.h"
 #include "mf_cart.h"
+#include "../tmputil.h"
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("  FAIL: %s\n", msg); fails++; } \
@@ -20,7 +21,7 @@ static u64 g = 0x243f6a8885a308d3ull;
 static u64 xs(void) { u64 x = g; x ^= x << 13; x ^= x >> 7; x ^= x << 17; return g = x; }
 
 int main(void) {
-    const char *p = "/tmp/mf_cart_test.dat";
+    const char *p = MF_TMP("mf_cart_test.dat");
     unlink(p);
     mf_t *mf = mf_open(p, 1u << 16);
     if (!mf) { perror("mf_open"); return 2; }

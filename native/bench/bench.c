@@ -17,6 +17,7 @@
 #include <sched.h>
 
 #include "substrate.h"
+#include "../tmputil.h"
 
 #if defined(ALLOC_RADIX)
 #  include "mf_radix.h"
@@ -92,7 +93,7 @@ int main(int argc, char **argv) {
     u64 threshold  = (argc > 4) ? strtoull(argv[4], NULL, 10) : 0;
     A_SET_THRESHOLD(threshold);
 
-    const char *path = "/tmp/mfbench.dat";
+    const char *path = MF_TMP("mfbench.dat");
     unlink(path);
     mf_t *mf = mf_open(path, 1u << 20);
     if (!mf) { perror("mf_open"); return 1; }

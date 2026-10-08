@@ -6,9 +6,10 @@
  */
 #include "memoryfile.h"
 #include <unistd.h>
+#include "tmputil.h"
 
 int main(void) {
-    const char *path = "/tmp/mf_doublefree_scratch.dat";
+    const char *path = MF_TMP("mf_doublefree_scratch.dat");
     unlink(path);
     memfile_t *mf = memfile_open(path, 65536);
     if (!mf) return 2;

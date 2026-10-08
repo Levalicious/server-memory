@@ -30,6 +30,7 @@
 #include <sched.h>
 #include <math.h>
 #include "graph.h"
+#include "tmputil.h"
 
 static inline u64 tsc_begin(void) {
     unsigned a, d; __asm__ __volatile__("lfence\n\trdtsc" : "=a"(a), "=d"(d)); return ((u64)d << 32) | a;
@@ -111,7 +112,7 @@ int main(int argc, char **argv) {
     size_t N = (argc > 1) ? strtoul(argv[1], NULL, 10) : 2000;
     rng       = (argc > 2) ? strtoull(argv[2], NULL, 10) : 0x9e3779b97f4a7c15ull;
 
-    const char *gp = "/tmp/opbench.graph", *sp = "/tmp/opbench.strings";
+    const char *gp = MF_TMP("opbench.graph"), *sp = MF_TMP("opbench.strings");
     unlink(gp); unlink(sp);
     stringtable_t *st = st_open(sp, 1u << 20);
     graph_t *g = graph_open(gp, st, 1u << 20);
