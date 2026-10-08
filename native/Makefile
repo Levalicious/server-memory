@@ -11,10 +11,10 @@ CFLAGS = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 LIBS = -lm
 OUT = /tmp/mf_test
 
-.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon bench proofs proofs-eva wp-segmeta clean
+.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon test_regex regex_cli bench bench_regex bench_sheng bench_widesheng proofs proofs-eva wp-segmeta clean
 
 # `make test` = prove the detector fires, then run every harness with it active.
-test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon
+test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon test_regex
 
 test_segmeta: test_segmeta.c seg_meta.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_segmeta && $(OUT)_segmeta
@@ -54,6 +54,30 @@ test_entity: test_entity.c
 BENCH_CFLAGS = -std=c11 -O2 -march=native -Wall -D_GNU_SOURCE -I.
 bench: op_bench.c graph.c stringtable.c memoryfile.c regex.c re_dfa.c re_trigram.c
 	$(CC) $(BENCH_CFLAGS) $^ -lm -o $(OUT)_bench && $(OUT)_bench
+
+# ---- Regex engine: standalone tests + explorers (ported from feat/regex-engine) ----
+# Engine + determinizer + Sheng + lazy Sheng (standalone). ASan+UBSan; -mssse3 for PSHUFB.
+test_regex: test_regex.c regex.c re_dfa.c re_sheng.c re_lsheng.c
+	$(CC) $(CFLAGS) -mssse3 $^ $(LIBS) -o $(OUT)_regex && $(OUT)_regex
+
+# CLI driver for the Python differential fuzzer (scripts/regex_diff.py):
+# pattern = argv[1], text read from stdin; exit 0 = match, 1 = no match, 2 = error.
+# REGEX_ENGINE=nfa|dfa|sheng|ldfa|lsheng selects the engine, so the fuzzer oracles all.
+regex_cli: regex_cli.c regex.c re_dfa.c re_sheng.c re_lsheng.c
+	$(CC) $(CFLAGS) -mssse3 $^ $(LIBS) -o $(OUT)_regex_cli
+
+# Regex compile + match microbench (rdtsc, adaptive sampling; same conventions
+# as op_bench). Emits per-case cycle stats as JSON.
+bench_regex: bench_regex.c regex.c
+	$(CC) $(BENCH_CFLAGS) $^ -lm -o $(OUT)_regex_bench && $(OUT)_regex_bench
+
+# Quiet-Sheng (PSHUFB DFA) vs scalar BasicDFA throughput. Needs SSSE3.
+bench_sheng: bench_sheng.c re_sheng.c re_dfa.c regex.c
+	$(CC) $(BENCH_CFLAGS) -mssse3 $^ -lm -o $(OUT)_sheng_bench && $(OUT)_sheng_bench
+
+# Cost of scaling Sheng past 16 states (general-gather, N/16 PSHUFB/byte). SSE4.1 for blendv.
+bench_widesheng: bench_widesheng.c
+	$(CC) $(BENCH_CFLAGS) -msse4.1 $^ -lm -o $(OUT)_widesheng_bench && $(OUT)_widesheng_bench
 
 # ---- Frama-C/WP + EVA proofs ----------------------------------------------
 # Memory-model-clean abstractions in fc_*.c (NEVER compiled into the build):
