@@ -62,14 +62,15 @@ section fixes the commitments.
 
 ### 2.1 Constants and refs — FROZEN
 
-- `SEG_PAGE_SIZE = 8192`. Q1 closed 4K vs 16K on the 500/5K/50K/500K ladder
-  (bytes/commit 2.8–3.4× better than 16K, touch 3× cheaper, recover 2.4×
-  faster @500K; co-location edge of 16K negligible). Post-freeze 4K→8K bump
-  for the v3 long-name behavioral contract: st4 records cap at
-  `SEG_PAGE_MAX_REC-4` and the E2E suite creates a 4502-byte entity name (4K
-  caps records at 4072). Re-measured on the same bench: ~1.6× bytes/commit
-  and amp @500K (187K/amp 91 vs 118K/amp 57), recover @500K BETTER (17.4K vs
-  28.8K cyc, half the pages). Page = COW unit; **extent**
+- `SEG_PAGE_SIZE = 4096`. Closed by `bench_segstore` on the 500/5K/50K/500K
+  ladder: bytes/commit 2.8–3.4× better than 16K, touch 3× cheaper, recover
+  2.4× faster @500K; 16K's sole theoretical edge (co-location) measures
+  negligible (E[distinct pages | K=16] 15.9 vs 15.5). 8K was re-evaluated
+  2026-10-08 for longer records and REJECTED: ~1.6× bytes/commit & amp
+  @500K for +2× record capacity. Record-cap note: st4 caps records at
+  `SEG_PAGE_MAX_REC-4` (4072 B); entity names beyond that are a recorded
+  contract delta vs v3 (E2E long-name case = expected-fail under the daemon
+  backend until multi-page records land). Page = COW unit; **extent**
   (`extent_pages_log2`, per-segment) = allocation/locality unit.
 - Packed ref: `(u16 seg | u32 pgno | u16 slot)` in a u64. pgno is LOGICAL
   (§2.3). 16TB/segment address space; byte-clean fields.

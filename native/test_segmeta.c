@@ -24,7 +24,7 @@ int main(void) {
     assert(offsetof(seg_meta_t, checksum) == sizeof(seg_meta_t) - 4);
     assert(sizeof(seg_page_hdr_t) == 16);
     assert(sizeof(seg_slot_t) == 4);
-    assert(SEG_PAGE_MAX_REC == 8192 - 16 - 4);
+    assert(SEG_PAGE_MAX_REC == 4096 - 16 - 4);
     assert(sizeof(seg_meta_t) <= SEG_PAGE_SIZE);
     PASS();
 

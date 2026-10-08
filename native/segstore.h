@@ -44,13 +44,13 @@ typedef uint64_t u64;
 #define SEG_MAGIC        0x53454731u   /* "SEG1" */
 #define SEG_FORMAT_VER   1u
 #ifndef SEG_PAGE_SIZE                  /* overridable (-DSEG_PAGE_SIZE=16384u) for
-                                          the Q1 bench */
-#define SEG_PAGE_SIZE    8192u         /* COW unit; recorded in meta. 8K bumped up
-                                          from the 4K Q1 prior for the v3 long-name
-                                          contract: st4 records cap at
-                                          SEG_PAGE_MAX_REC-4, and the E2E suite
-                                          creates a 4502-byte entity name (4K pages
-                                          cap records at 4072). Re-measured. */
+                                          the Q1 bench; default = the 4K prior */
+#define SEG_PAGE_SIZE    4096u         /* COW unit; recorded in meta. KEPT at 4K:
+                                          8K re-measured 2026-10-08 (~1.6x
+                                          bytes/commit & amp @500K) and rejected.
+                                          Names beyond SEG_PAGE_MAX_REC-4 stay
+                                          unsupported (multi-page records = the
+                                          future option; E2E case expected-fail). */
 #endif
 #define SEG_META_PAGES   2u            /* pgno 0 and 1 */
 

@@ -447,6 +447,26 @@ describe('MCP Memory Server E2E Tests', () => {
       // in a while-loop with a hard iteration cap. Pre-fix, the loop never
       // terminates and Jest's per-test timeout kills the suite.
       const longName = 'L_' + 'x'.repeat(4500);  // single entity JSON > 4096 chars
+      if (process.env.KB_DAEMON_SPAWN === '1') {
+        // Known v4 contract delta vs v3: daemon stores cap st4 records at
+        // SEG_PAGE_MAX_REC-4 (4072 B), so this 4502-byte name cannot be
+        // created there (create returns no eid -> protocol rejection today;
+        // an isError envelope would also count). Assert the documented
+        // limitation and stop — this branch must FLIP to a hard failure
+        // when multi-page records land (then the drain below is reachable).
+        // The embedded v3 store accepts it (u16 lengths).
+        let failed = false;
+        try {
+          const r = await callToolRaw(client, 'create_entities', {
+            entities: [{ name: longName, entityType: 'BigName', observations: ['recent'] }],
+          });
+          failed = r.isError === true;
+        } catch {
+          failed = true;
+        }
+        expect(failed).toBe(true);
+        return;
+      }
       await callTool(client, 'create_entities', {
         entities: [{ name: longName, entityType: 'BigName', observations: ['recent'] }],
       });
