@@ -147,3 +147,33 @@ export async function callToolRaw(
     isError: (result as { isError?: boolean }).isError,
   };
 }
+
+/**
+ * The structured body of a tool-level error, per policy R1
+ * (docs/api-error-policy.md): `{ tool, code, message, details? }`.
+ */
+export interface ToolErrorEnvelope {
+  tool: string;
+  code: string;
+  message: string;
+  details?: unknown;
+}
+
+/**
+ * Parse the JSON envelope out of a `callToolRaw` result. Throws if the result
+ * isn't a tool-error envelope, so tests fail loudly when a call unexpectedly
+ * succeeds or returns something unstructured.
+ */
+export function parseToolError(raw: RawToolResult): ToolErrorEnvelope {
+  const text = raw.content[0]?.text ?? '';
+  let parsed: { error?: ToolErrorEnvelope };
+  try {
+    parsed = JSON.parse(text) as { error?: ToolErrorEnvelope };
+  } catch {
+    throw new Error(`Expected a JSON tool-error envelope, got non-JSON: ${text.slice(0, 200)}`);
+  }
+  if (!parsed.error) {
+    throw new Error(`Expected a tool-error envelope, got: ${text.slice(0, 200)}`);
+  }
+  return parsed.error;
+}
