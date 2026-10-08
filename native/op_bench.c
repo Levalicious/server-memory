@@ -166,7 +166,7 @@ int main(int argc, char **argv) {
     ADAPT("find_path_d6",      sink32 = graph_find_path(g, off[idx[_k]], off[idx2[_k]], 6, DIR_ANY, out, cap));
     ADAPT("search",            sink32 = graph_search(g, pat[_k], out, cap));
     ADAPT("entities_by_type",  sink32 = graph_entities_by_type(g, (const u8 *)tynames[tpix[_k]], tylen[tpix[_k]], out, cap));
-    ADAPT("random_walk_d5",    sink32 = graph_random_walk(g, off[idx[_k]], 5, DIR_ANY, 1, seed[_k], out, 8));
+    ADAPT("random_walk_d5",    sink32 = graph_random_walk(g, off[idx[_k]], 5, DIR_ANY, 1, seed[_k], 0, out, 8));
     ADAPT("inc_walker_visit",  graph_inc_walker_visit(g, off[idx[_k]]));
     ADAPT("structural_sample", graph_structural_sample(g, 1, 0.85));
     ADAPT("compute_merw_psi",  graph_compute_merw_psi(g, 0.85, 100, 1e-8));
