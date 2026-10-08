@@ -232,7 +232,7 @@ static void compare_walks(world_t *w) {
         u64 seed = rng() | 1;
         u32 dir = (u32)(rng() % 2) ? DIR_ANY : DIR_FORWARD;
         u64 pv[24]; u32 pg[24];
-        u32 nv = graph_random_walk(w->v3, w->off[i], 10, dir, 0, seed, pv, 24);
+        u32 nv = graph_random_walk(w->v3, w->off[i], 10, dir, 0, seed, 0, pv, 24, NULL);
         u32 ng = g4_random_walk(w->g4, w->eid[i], 10, dir, 0, seed, pg, 24);
         assert(nv == ng);
         char n1[24], n2[24];

@@ -12,7 +12,7 @@
  *   1. extractor  ReNode AST  -> ReTrigramQuery  (boolean expr over trigrams)
  *   2. index      documents   -> ReTrigramIndex  (trigram -> posting list)
  *   3. pipeline   (re, ast, index, docs) -> matching doc ids, by narrowing the
- *                 scan to candidates and then verifying each with re_search.
+ *                 scan to candidates and then verifying each with re_nfa_search.
  *
  * DELTA from the orphaned TS reference (src/trigram.ts + src/regex_query.ts):
  * search is case-SENSITIVE (Decision_CaseSensitiveSearch_2026_07_14), so NO
@@ -75,7 +75,7 @@ void         re_candidates_free(ReCandidates *c);
 typedef struct {
     uint32_t total;      /* docs in the corpus                                   */
     uint32_t candidates; /* docs the prefilter kept (== total on a full scan)    */
-    uint32_t verified;   /* docs actually run through re_search                  */
+    uint32_t verified;   /* docs actually run through re_nfa_search                  */
     uint32_t matched;    /* docs that matched                                    */
     int      filtered;   /* 1 if the prefilter narrowed the scan, else 0         */
 } ReTrigramStats;
@@ -84,7 +84,7 @@ typedef struct {
  * runs the real matcher `re` on each candidate, and writes matching doc ids in
  * ascending order into out_ids[0..out_cap). Returns the total match count (which
  * may exceed out_cap; only the first out_cap ids are stored). `stats` may be
- * NULL. The returned set is IDENTICAL to running re_search over every doc. */
+ * NULL. The returned set is IDENTICAL to running re_nfa_search over every doc. */
 uint32_t re_trigram_search(const Regex *re, const ReNode *ast,
                            const ReTrigramIndex *idx,
                            const ReDoc *docs, uint32_t ndocs,

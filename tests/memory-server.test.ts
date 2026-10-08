@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { createServer, type Entity, type Relation, type Neighbor } from '../server.js';
-import { createTestClient, callTool, callToolRaw, type PaginatedGraph, type PaginatedResult, type FindPathResult } from './test-utils.js';
+import { createTestClient, callTool, callToolRaw, parseToolError, type PaginatedGraph, type PaginatedResult, type FindPathResult } from './test-utils.js';
 
 describe('MCP Memory Server E2E Tests', () => {
   let testDir: string;
@@ -39,11 +39,12 @@ describe('MCP Memory Server E2E Tests', () => {
           { name: 'Alice', entityType: 'Person', observations: ['Likes coding'] },
           { name: 'Bob', entityType: 'Person', observations: ['Likes music'] }
         ]
-      }) as Entity[];
+      }) as { created: Entity[]; existing: string[] };
 
-      expect(result).toHaveLength(2);
-      expect(result[0].name).toBe('Alice');
-      expect(result[1].name).toBe('Bob');
+      expect(result.created).toHaveLength(2);
+      expect(result.created[0].name).toBe('Alice');
+      expect(result.created[1].name).toBe('Bob');
+      expect(result.existing).toEqual([]);
     });
 
     it('should not duplicate existing entities', async () => {
@@ -51,62 +52,61 @@ describe('MCP Memory Server E2E Tests', () => {
         entities: [{ name: 'Alice', entityType: 'Person', observations: ['First'] }]
       });
 
-      // Exact same entity should be silently skipped
+      // Exact same entity is reported in `existing`, not created again (R3).
       const result = await callTool(client, 'create_entities', {
         entities: [
           { name: 'Alice', entityType: 'Person', observations: ['First'] },
           { name: 'Bob', entityType: 'Person', observations: ['New'] }
         ]
-      }) as Entity[];
+      }) as { created: Entity[]; existing: string[] };
 
-      // Only Bob should be returned as new
-      expect(result).toHaveLength(1);
-      expect(result[0].name).toBe('Bob');
+      expect(result.created.map(e => e.name)).toEqual(['Bob']);
+      expect(result.existing).toEqual(['Alice']);
     });
 
-    it('should error on duplicate name with different data', async () => {
+    it('should error on duplicate name with different data (COLLISION, visible)', async () => {
       await callTool(client, 'create_entities', {
         entities: [{ name: 'Alice', entityType: 'Person', observations: ['First'] }]
       });
 
-      // Same name, different type — should error
-      await expect(
-        callTool(client, 'create_entities', {
-          entities: [{ name: 'Alice', entityType: 'Organization', observations: ['First'] }]
-        })
-      ).rejects.toThrow(/already exists/);
+      // Same name, different type — visible tool error (policy R1)
+      const rawType = await callToolRaw(client, 'create_entities', {
+        entities: [{ name: 'Alice', entityType: 'Organization', observations: ['First'] }]
+      });
+      expect(rawType.isError).toBe(true);
+      expect(parseToolError(rawType).code).toBe('COLLISION');
 
-      // Same name, different observations — should error
-      await expect(
-        callTool(client, 'create_entities', {
-          entities: [{ name: 'Alice', entityType: 'Person', observations: ['Different'] }]
-        })
-      ).rejects.toThrow(/already exists/);
+      // Same name, different observations — also visible
+      const rawObs = await callToolRaw(client, 'create_entities', {
+        entities: [{ name: 'Alice', entityType: 'Person', observations: ['Different'] }]
+      });
+      expect(rawObs.isError).toBe(true);
+      expect(parseToolError(rawObs).code).toBe('COLLISION');
     });
 
-    it('should reject entities with more than 2 observations', async () => {
-      await expect(
-        callTool(client, 'create_entities', {
-          entities: [{
-            name: 'TooMany',
-            entityType: 'Test',
-            observations: ['One', 'Two', 'Three']
-          }]
-        })
-      ).rejects.toThrow(/Maximum allowed is 2/);
+    it('should reject entities with more than 2 observations (LIMIT_EXCEEDED, visible)', async () => {
+      const raw = await callToolRaw(client, 'create_entities', {
+        entities: [{
+          name: 'TooMany',
+          entityType: 'Test',
+          observations: ['One', 'Two', 'Three']
+        }]
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('LIMIT_EXCEEDED');
     });
 
-    it('should reject observations longer than 140 characters', async () => {
+    it('should reject observations longer than 140 characters (LIMIT_EXCEEDED, visible)', async () => {
       const longObservation = 'x'.repeat(141);
-      await expect(
-        callTool(client, 'create_entities', {
-          entities: [{
-            name: 'LongObs',
-            entityType: 'Test',
-            observations: [longObservation]
-          }]
-        })
-      ).rejects.toThrow(/exceeds 140 characters/);
+      const raw = await callToolRaw(client, 'create_entities', {
+        entities: [{
+          name: 'LongObs',
+          entityType: 'Test',
+          observations: [longObservation]
+        }]
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('LIMIT_EXCEEDED');
     });
 
     it('should delete entities and their relations', async () => {
@@ -158,16 +158,16 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(result[0].addedObservations).toEqual(['New']);
     });
 
-    it('should reject adding observations that would exceed limit', async () => {
+    it('should reject adding observations that would exceed limit (LIMIT_EXCEEDED, visible)', async () => {
       await callTool(client, 'add_observations', {
         observations: [{ entityName: 'TestEntity', contents: ['One', 'Two'] }]
       });
 
-      await expect(
-        callTool(client, 'add_observations', {
-          observations: [{ entityName: 'TestEntity', contents: ['Three'] }]
-        })
-      ).rejects.toThrow(/would exceed limit of 2/);
+      const raw = await callToolRaw(client, 'add_observations', {
+        observations: [{ entityName: 'TestEntity', contents: ['Three'] }]
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('LIMIT_EXCEEDED');
     });
 
     it('should delete specific observations', async () => {
@@ -201,9 +201,10 @@ describe('MCP Memory Server E2E Tests', () => {
           { from: 'A', to: 'B', relationType: 'connects' },
           { from: 'B', to: 'C', relationType: 'connects' }
         ]
-      }) as Relation[];
+      }) as { created: Relation[]; skippedDuplicates: Relation[] };
 
-      expect(result).toHaveLength(2);
+      expect(result.created).toHaveLength(2);
+      expect(result.skippedDuplicates).toEqual([]);
     });
 
     it('should not duplicate relations', async () => {
@@ -216,10 +217,12 @@ describe('MCP Memory Server E2E Tests', () => {
           { from: 'A', to: 'B', relationType: 'connects' },
           { from: 'A', to: 'C', relationType: 'connects' }
         ]
-      }) as Relation[];
+      }) as { created: Relation[]; skippedDuplicates: Relation[] };
 
-      expect(result).toHaveLength(1);
-      expect(result[0].to).toBe('C');
+      expect(result.created).toHaveLength(1);
+      expect(result.created[0].to).toBe('C');
+      expect(result.skippedDuplicates).toHaveLength(1);
+      expect(result.skippedDuplicates[0].to).toBe('B');
     });
 
     it('should delete relations', async () => {
@@ -256,7 +259,7 @@ describe('MCP Memory Server E2E Tests', () => {
     it('should search by regex pattern', async () => {
       // Accumulate all entities across pagination
       const allEntities: Entity[] = [];
-      let entityCursor: number | null = 0;
+      let entityCursor: string | number | null = 0;
 
       while (entityCursor !== null) {
         const result = await callTool(client, 'search_nodes', {
@@ -276,7 +279,7 @@ describe('MCP Memory Server E2E Tests', () => {
     it('should search with alternation', async () => {
       // Accumulate all entities across pagination
       const allEntities: Entity[] = [];
-      let entityCursor: number | null = 0;
+      let entityCursor: string | number | null = 0;
 
       while (entityCursor !== null) {
         const result = await callTool(client, 'search_nodes', {
@@ -300,10 +303,10 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(result.entities.items[0].name).toBe('TypeScript');
     });
 
-    it('should reject invalid regex', async () => {
-      await expect(
-        callTool(client, 'search_nodes', { query: '[invalid' })
-      ).rejects.toThrow(/Invalid regex pattern/);
+    it('should reject invalid regex (INVALID_REGEX, visible)', async () => {
+      const raw = await callToolRaw(client, 'search_nodes', { query: '[invalid' });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('INVALID_REGEX');
     });
 
     it('accepts ERE-valid patterns that JS RegExp rejects (validator uses the C ERE engine)', async () => {
@@ -315,11 +318,11 @@ describe('MCP Memory Server E2E Tests', () => {
     });
 
     it('rejects ERE-invalid patterns even when JS RegExp accepts them', async () => {
-      // '(?:x)' is a valid JS non-capturing group but invalid POSIX ERE — must throw,
-      // not silently return zero matches.
-      await expect(
-        callTool(client, 'search_nodes', { query: '(?:x)' })
-      ).rejects.toThrow(/Invalid regex pattern/);
+      // '(?:x)' is a valid JS non-capturing group but invalid POSIX ERE — must
+      // be a visible error, not silently zero matches.
+      const raw = await callToolRaw(client, 'search_nodes', { query: '(?:x)' });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('INVALID_REGEX');
     });
 
     it('trigram path: regex-extractable queries return the same results as before', async () => {
@@ -342,7 +345,7 @@ describe('MCP Memory Server E2E Tests', () => {
       // result sets, not nondeterministic top-llmrank pages.
       async function drainAll(query: string): Promise<Set<string>> {
         const out = new Set<string>();
-        let cursor: number | null = 0;
+        let cursor: string | number | null = 0;
         while (cursor !== null) {
           const r = await callTool(client, 'search_nodes', {
             query, sortBy: 'name', sortDir: 'asc', entityCursor: cursor,
@@ -449,7 +452,7 @@ describe('MCP Memory Server E2E Tests', () => {
       });
 
       const allEntities: Entity[] = [];
-      let entityCursor: number | null = 0;
+      let entityCursor: string | number | null = 0;
       let iterations = 0;
       const ITERATION_CAP = 50;  // any healthy graph fits in << 50 pages here
 
@@ -495,11 +498,12 @@ describe('MCP Memory Server E2E Tests', () => {
       });
 
       expect(raw.isError).toBe(true);
-      const text = raw.content[0]?.text ?? '';
-      expect(text).toContain('knowledge graph features');
-      expect(text).toContain('regex');
+      const err = parseToolError(raw);
+      expect(err.code).toBe('NO_MATCHES');
+      expect(err.message).toContain('knowledge graph features');
+      expect(err.message).toContain('regex');
       // Auto-suggested |-joined regex should appear.
-      expect(text).toContain('knowledge|graph|features');
+      expect(err.message).toContain('knowledge|graph|features');
     });
 
     it('does NOT flag a regex query with anchors that simply misses', async () => {
@@ -539,11 +543,12 @@ describe('MCP Memory Server E2E Tests', () => {
       });
 
       expect(raw.isError).toBe(true);
-      const text = raw.content[0]?.text ?? '';
-      expect(text).toContain('Slef');
-      expect(text).toContain('regex');
+      const err = parseToolError(raw);
+      expect(err.code).toBe('NO_MATCHES');
+      expect(err.message).toContain('Slef');
+      expect(err.message).toContain('regex');
       // No multi-term suggestion because there's only one term.
-      expect(text).not.toContain('"Slef|');
+      expect(err.message).not.toContain('"Slef|');
     });
 
     // Note: a "walker bias" test is intentionally omitted because the guard
@@ -1201,29 +1206,25 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(neighbors.items.some(n => n.name === second.ctxId)).toBe(true);
     });
 
-    it('should ignore invalid previousCtxId gracefully', async () => {
-      const result = await callTool(client, 'sequentialthinking', {
+    it('should refuse an invalid previousCtxId (visible ENTITY_NOT_FOUND)', async () => {
+      // Policy R4: a silently-unlinked thought is exactly the evidence-loss
+      // failure the chain exists to prevent — an unknown link is an error.
+      const raw = await callToolRaw(client, 'sequentialthinking', {
         previousCtxId: 'nonexistent_thought',
         observations: ['Orphaned thought']
-      }) as { ctxId: string };
-
-      expect(result.ctxId).toMatch(/^[0-9a-f]{24}$/);
-
-      // Verify no neighbors (no valid relations were created)
-      const neighbors = await callTool(client, 'get_neighbors', {
-        entityName: result.ctxId,
-        depth: 1
-      }) as PaginatedResult<Neighbor>;
-
-      expect(neighbors.items).toHaveLength(0);
+      });
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('ENTITY_NOT_FOUND');
+      expect(err.message).toContain('nonexistent_thought');
     });
 
-    it('should enforce observation limits on thoughts', async () => {
-      await expect(
-        callTool(client, 'sequentialthinking', {
-          observations: ['One', 'Two', 'Three']
-        })
-      ).rejects.toThrow(/Maximum allowed is 2/);
+    it('should enforce observation limits on thoughts (LIMIT_EXCEEDED, visible)', async () => {
+      const raw = await callToolRaw(client, 'sequentialthinking', {
+        observations: ['One', 'Two', 'Three']
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('LIMIT_EXCEEDED');
     });
 
     it('should set mtime and obsMtime on thought entities', async () => {
@@ -1293,6 +1294,12 @@ describe('MCP Memory Server E2E Tests', () => {
           { name: 'South', entityType: 'Node', observations: ['South node'] },
           { name: 'East', entityType: 'Node', observations: ['East node'] },
           { name: 'Isolated', entityType: 'Node', observations: ['No connections'] },
+          { name: 'Ping', entityType: 'Node', observations: ['2-cycle pair'] },
+          { name: 'Pong', entityType: 'Node', observations: ['2-cycle pair'] },
+          { name: 'LoopA', entityType: 'Node', observations: ['Chain head'] },
+          { name: 'LoopB', entityType: 'Node', observations: ['Chain cycle'] },
+          { name: 'LoopC', entityType: 'Node', observations: ['Chain cycle'] },
+          { name: 'LoopD', entityType: 'Node', observations: ['Chain tail'] },
         ]
       });
       await callTool(client, 'create_relations', {
@@ -1301,6 +1308,17 @@ describe('MCP Memory Server E2E Tests', () => {
           { from: 'Center', to: 'South', relationType: 'connects' },
           { from: 'Center', to: 'East', relationType: 'connects' },
           { from: 'North', to: 'South', relationType: 'connects' },
+          // Cycle fixtures for the avoidCycles tests: Ping<->Pong is a 2-cycle;
+          // LoopA->LoopB->LoopC->LoopD with back-edges B->A and C->B, so an
+          // unguarded walk can cycle but a self-avoiding one is forced along
+          // the chain.
+          { from: 'Ping', to: 'Pong', relationType: 'connects' },
+          { from: 'Pong', to: 'Ping', relationType: 'connects' },
+          { from: 'LoopA', to: 'LoopB', relationType: 'connects' },
+          { from: 'LoopB', to: 'LoopA', relationType: 'connects' },
+          { from: 'LoopB', to: 'LoopC', relationType: 'connects' },
+          { from: 'LoopC', to: 'LoopB', relationType: 'connects' },
+          { from: 'LoopC', to: 'LoopD', relationType: 'connects' },
         ]
       });
     });
@@ -1343,10 +1361,10 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(result1.path).toEqual(result2.path);
     });
 
-    it('should throw on non-existent start entity', async () => {
-      await expect(
-        callTool(client, 'random_walk', { start: 'NonExistent', depth: 2 })
-      ).rejects.toThrow(/not found/);
+    it('should return a visible ENTITY_NOT_FOUND for a non-existent start entity', async () => {
+      const raw = await callToolRaw(client, 'random_walk', { start: 'NonExistent', depth: 2 });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('ENTITY_NOT_FOUND');
     });
 
     it('should accept mode=uniform and produce a valid walk', async () => {
@@ -1400,6 +1418,60 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(visited.has('North')).toBe(true);
       expect(visited.has('South')).toBe(true);
       expect(visited.has('East')).toBe(true);
+    });
+
+    it('avoidCycles=true produces a simple, cycle-free path', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'LoopA',
+        depth: 6,
+        avoidCycles: true,
+      }) as { entity: string; path: string[] };
+
+      // LoopA -> LoopB -> LoopC -> LoopD: back-edges are blocked by the visited
+      // set, so the walk is forced along the chain and then stops at the tail.
+      expect(result.path).toEqual(['LoopA', 'LoopB', 'LoopC', 'LoopD']);
+      expect(new Set(result.path).size).toBe(result.path.length);
+    });
+
+    it('avoidCycles=true stops when every neighbor is already on the path', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'Ping',
+        depth: 5,
+        avoidCycles: true,
+      }) as { entity: string; path: string[] };
+
+      // Ping <-> Pong is a 2-cycle; the self-avoiding walk takes one step and
+      // stops rather than bouncing.
+      expect(result.path).toEqual(['Ping', 'Pong']);
+      expect(result.entity).toBe('Pong');
+    });
+
+    it('without avoidCycles the walk may still revisit nodes (default unchanged)', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'Ping',
+        depth: 5,
+      }) as { entity: string; path: string[] };
+
+      // Single candidate at every step, so the default walk alternates
+      // deterministically — proof that revisits are still permitted.
+      expect(result.path).toEqual(['Ping', 'Pong', 'Ping', 'Pong', 'Ping', 'Pong']);
+    });
+
+    it('avoidCycles=true walks stay reproducible under a seed', async () => {
+      const r1 = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 3,
+        seed: 'cycle-seed',
+        avoidCycles: true,
+      }) as { entity: string; path: string[] };
+      const r2 = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 3,
+        seed: 'cycle-seed',
+        avoidCycles: true,
+      }) as { entity: string; path: string[] };
+
+      expect(r1.path).toEqual(r2.path);
     });
   });
 
@@ -1768,7 +1840,7 @@ describe('MCP Memory Server E2E Tests', () => {
 
         // Fetch all pages sorted by name descending
         const allEntities: Entity[] = [];
-        let entityCursor: number | null = 0;
+        let entityCursor: string | number | null = 0;
 
         while (entityCursor !== null) {
           const result = await callTool(client, 'search_nodes', {
@@ -1894,28 +1966,30 @@ describe('MCP Memory Server E2E Tests', () => {
       docFile = path.join(testDir, 'test-doc.txt');
     });
 
-    it('should reject non-plaintext extensions', async () => {
+    it('should reject non-plaintext extensions (INVALID_FILE, visible)', async () => {
       const pdfPath = path.join(testDir, 'test.pdf');
       await fs.writeFile(pdfPath, 'fake pdf content');
 
-      await expect(
-        callTool(client, 'kb_load', { filePath: pdfPath })
-      ).rejects.toThrow(/Unsupported file extension/);
+      const raw = await callToolRaw(client, 'kb_load', { filePath: pdfPath });
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('INVALID_FILE');
+      expect(err.message).toContain('Unsupported file extension');
     });
 
-    it('should reject files with no extension', async () => {
+    it('should reject files with no extension (INVALID_FILE, visible)', async () => {
       const noExtPath = path.join(testDir, 'noext');
       await fs.writeFile(noExtPath, 'some content');
 
-      await expect(
-        callTool(client, 'kb_load', { filePath: noExtPath })
-      ).rejects.toThrow(/no extension/);
+      const raw = await callToolRaw(client, 'kb_load', { filePath: noExtPath });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('INVALID_FILE');
     });
 
-    it('should reject missing files', async () => {
-      await expect(
-        callTool(client, 'kb_load', { filePath: path.join(testDir, 'nonexistent.txt') })
-      ).rejects.toThrow(/Failed to read file/);
+    it('should reject missing files (INVALID_FILE, visible)', async () => {
+      const raw = await callToolRaw(client, 'kb_load', { filePath: path.join(testDir, 'nonexistent.txt') });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('INVALID_FILE');
     });
 
     it('should load a small document and create entities + relations', async () => {
@@ -1931,8 +2005,8 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'kb_load', { filePath: docFile }) as any;
 
       expect(result.document).toBe('test-doc');
-      expect(result.entitiesCreated).toBeGreaterThan(0);
-      expect(result.relationsCreated).toBeGreaterThan(0);
+      expect(result.entities.created).toBeGreaterThan(0);
+      expect(result.relations.created).toBeGreaterThan(0);
       expect(result.stats.chunks).toBeGreaterThan(0);
       expect(result.stats.sentences).toBeGreaterThan(0);
     });
@@ -2024,14 +2098,14 @@ describe('MCP Memory Server E2E Tests', () => {
       await fs.writeFile(docFile, 'Short doc for dedup testing purposes here.');
       await callTool(client, 'kb_load', { filePath: docFile });
 
-      // Second load with different content but same title — Document entity
-      // already exists with entityType 'Document' and no observations,
-      // so it gets silently skipped. But the index entities already exist
-      // with different observations, so it should error.
+      // Second load with different content but same title: the Document entity
+      // is an exact duplicate (intent satisfied), but the index entities collide
+      // with different observations → visible COLLISION (policy R1), and the
+      // failed load is atomic per op.
       await fs.writeFile(docFile, 'Completely different content for dedup testing now.');
-      await expect(
-        callTool(client, 'kb_load', { filePath: docFile })
-      ).rejects.toThrow(/already exists/);
+      const raw = await callToolRaw(client, 'kb_load', { filePath: docFile });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('COLLISION');
     });
 
     it('should enforce observation length limits', async () => {
@@ -2040,7 +2114,7 @@ describe('MCP Memory Server E2E Tests', () => {
       await fs.writeFile(docFile, `${longWord} is a very long word that tests our splitting logic handles edge cases.`);
 
       const result = await callTool(client, 'kb_load', { filePath: docFile }) as any;
-      expect(result.entitiesCreated).toBeGreaterThan(0);
+      expect(result.entities.created).toBeGreaterThan(0);
 
       // All observations should be within limits
       const chunks = await callTool(client, 'get_entities_by_type', { entityType: 'TextChunk' }) as PaginatedResult<Entity>;
@@ -2062,8 +2136,329 @@ describe('MCP Memory Server E2E Tests', () => {
           filePath,
           title: `ext-test-${ext.slice(1)}`,
         }) as any;
-        expect(result.entitiesCreated).toBeGreaterThan(0);
+        expect(result.entities.created).toBeGreaterThan(0);
       }
+    });
+  });
+
+  describe('API error policy (R1/R2/R4)', () => {
+    it('create_entities collision is atomic: nothing in the batch is created', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'PolicyDup', entityType: 'PolicyTag', observations: ['base'] }],
+      });
+
+      const raw = await callToolRaw(client, 'create_entities', {
+        entities: [
+          { name: 'PolicyFresh', entityType: 'PolicyTag', observations: ['new'] },
+          { name: 'PolicyDup', entityType: 'PolicyTag', observations: ['changed'] },
+        ],
+      });
+
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('COLLISION');
+      expect(Array.isArray(err.details)).toBe(true);
+
+      // Atomicity: PolicyFresh must NOT exist. Anchored regex → plain empty
+      // result (a literal query would route through the NL guard instead).
+      const fresh = await callTool(client, 'search_nodes', { query: '^PolicyFresh$' }) as PaginatedGraph;
+      expect(fresh.entities.items).toEqual([]);
+    });
+
+    it('create_relations with a missing endpoint errors and writes nothing', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'PolicyX', entityType: 'PolicyTag', observations: [] },
+          { name: 'PolicyY', entityType: 'PolicyTag', observations: [] },
+        ],
+      });
+
+      const raw = await callToolRaw(client, 'create_relations', {
+        relations: [
+          { from: 'PolicyX', to: 'PolicyY', relationType: 'LINKS' },
+          { from: 'PolicyX', to: 'PolicyGhost', relationType: 'LINKS' },
+        ],
+      });
+
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('ENDPOINT_MISSING');
+
+      // Atomicity: the valid relation in the same batch was not created.
+      const after = await callTool(client, 'open_nodes', { names: ['PolicyX'] }) as PaginatedGraph;
+      expect(after.relations.items).toEqual([]);
+    });
+
+    it('add_observations validates the whole batch first (atomic)', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'PolicyObs', entityType: 'PolicyTag', observations: [] }],
+      });
+
+      const raw = await callToolRaw(client, 'add_observations', {
+        observations: [
+          { entityName: 'PolicyObs', contents: ['would-have-been-added'] },
+          { entityName: 'PolicyGhost', contents: ['x'] },
+        ],
+      });
+
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('ENTITY_NOT_FOUND');
+
+      // Atomicity: the first item must not have been applied.
+      const after = await callTool(client, 'open_nodes', { names: ['PolicyObs'] }) as PaginatedGraph;
+      expect(after.entities.items[0]?.observations).toEqual([]);
+    });
+
+    it('add_observations limit errors carry exact char counts', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'PolicyObs2', entityType: 'PolicyTag', observations: [] }],
+      });
+
+      const raw = await callToolRaw(client, 'add_observations', {
+        observations: [{ entityName: 'PolicyObs2', contents: ['y'.repeat(151)] }],
+      });
+
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('LIMIT_EXCEEDED');
+      // Precise counts live in the per-item details: "151 chars (…11 over)".
+      expect(JSON.stringify(err.details)).toContain('151');
+    });
+
+    it('open_nodes errors when ALL requested names are missing', async () => {
+      const raw = await callToolRaw(client, 'open_nodes', { names: ['NoSuchOne', 'NoSuchTwo'] });
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('ENTITY_NOT_FOUND');
+      expect(err.details).toEqual({ missing: ['NoSuchOne', 'NoSuchTwo'] });
+    });
+
+    it('get_entities_by_type errors on an unknown type', async () => {
+      const raw = await callToolRaw(client, 'get_entities_by_type', { entityType: 'NoSuchType' });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('TYPE_NOT_FOUND');
+    });
+
+    it('get_neighbors errors on an unknown start entity', async () => {
+      const raw = await callToolRaw(client, 'get_neighbors', { entityName: 'NoSuchEntity' });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('ENTITY_NOT_FOUND');
+    });
+
+    it('error envelopes carry the tool name and a message naming the offender', async () => {
+      const raw = await callToolRaw(client, 'get_neighbors', { entityName: 'NoSuchEntity' });
+      const err = parseToolError(raw);
+      expect(err.tool).toBe('get_neighbors');
+      expect(err.message).toContain('NoSuchEntity');
+    });
+  });
+
+  describe('API ledgers (R3)', () => {
+    it('create_entities reports exact duplicates in existing', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerA', entityType: 'LedgerTag', observations: ['one'] }],
+      });
+
+      const result = await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'LedgerA', entityType: 'LedgerTag', observations: ['one'] }, // exact dupe
+          { name: 'LedgerB', entityType: 'LedgerTag', observations: ['two'] },
+        ],
+      }) as { created: Entity[]; existing: string[] };
+
+      expect(result.created.map(e => e.name)).toEqual(['LedgerB']);
+      expect(result.existing).toEqual(['LedgerA']);
+    });
+
+    it('create_relations reports duplicates in skippedDuplicates', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'LedgerC', entityType: 'LedgerTag', observations: [] },
+          { name: 'LedgerD', entityType: 'LedgerTag', observations: [] },
+        ],
+      });
+      await callTool(client, 'create_relations', {
+        relations: [{ from: 'LedgerC', to: 'LedgerD', relationType: 'LEDGES' }],
+      });
+
+      const result = await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'LedgerC', to: 'LedgerD', relationType: 'LEDGES' }, // dupe
+          { from: 'LedgerD', to: 'LedgerC', relationType: 'LEDGES' }, // new (reverse direction)
+        ],
+      }) as { created: Array<{ from: string; to: string }>; skippedDuplicates: Array<{ from: string; to: string }> };
+
+      expect(result.created).toHaveLength(1);
+      expect(result.created[0]).toMatchObject({ from: 'LedgerD', to: 'LedgerC' });
+      expect(result.skippedDuplicates).toHaveLength(1);
+      expect(result.skippedDuplicates[0]).toMatchObject({ from: 'LedgerC', to: 'LedgerD' });
+    });
+
+    it('add_observations reports alreadyPresent', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerE', entityType: 'LedgerTag', observations: ['seed'] }],
+      });
+
+      const result = await callTool(client, 'add_observations', {
+        observations: [{ entityName: 'LedgerE', contents: ['seed', 'fresh'] }],
+      }) as Array<{ entityName: string; addedObservations: string[]; alreadyPresent: string[] }>;
+
+      expect(result[0].addedObservations).toEqual(['fresh']);
+      expect(result[0].alreadyPresent).toEqual(['seed']);
+    });
+
+    it('delete_entities reports deleted + notFound', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerF', entityType: 'LedgerTag', observations: [] }],
+      });
+
+      const result = await callTool(client, 'delete_entities', {
+        entityNames: ['LedgerF', 'LedgerGhost'],
+      }) as { deleted: string[]; notFound: string[] };
+
+      expect(result.deleted).toEqual(['LedgerF']);
+      expect(result.notFound).toEqual(['LedgerGhost']);
+    });
+
+    it('delete_relations distinguishes missing entity vs missing relation', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'LedgerG', entityType: 'LedgerTag', observations: [] },
+          { name: 'LedgerH', entityType: 'LedgerTag', observations: [] },
+        ],
+      });
+
+      const result = await callTool(client, 'delete_relations', {
+        relations: [
+          { from: 'LedgerG', to: 'LedgerH', relationType: 'LEDGES' },     // entity exists, relation never created
+          { from: 'LedgerG', to: 'LedgerGhost', relationType: 'LEDGES' }, // entity missing
+        ],
+      }) as { deleted: unknown[]; notFound: Array<{ reason: string }> };
+
+      expect(result.deleted).toEqual([]);
+      expect(result.notFound.map(n => n.reason).sort()).toEqual(['entity', 'relation']);
+    });
+
+    it('delete_observations distinguishes entity vs observation', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerI', entityType: 'LedgerTag', observations: ['keep'] }],
+      });
+
+      const result = await callTool(client, 'delete_observations', {
+        deletions: [
+          { entityName: 'LedgerI', observations: ['keep', 'never-added'] },
+          { entityName: 'LedgerGhost', observations: ['x'] },
+        ],
+      }) as { deleted: Array<{ entityName: string; observations: string[] }>; notFound: Array<{ reason: string }> };
+
+      expect(result.deleted).toEqual([{ entityName: 'LedgerI', observations: ['keep'] }]);
+      expect(result.notFound.map(n => n.reason).sort()).toEqual(['entity', 'observation']);
+    });
+
+    it('open_nodes reports partial misses in missing[]', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerJ', entityType: 'LedgerTag', observations: [] }],
+      });
+
+      const result = await callTool(client, 'open_nodes', { names: ['LedgerJ', 'LedgerGhost'] }) as PaginatedGraph;
+
+      expect(result.entities.items.map(e => e.name)).toEqual(['LedgerJ']);
+      expect(result.missing).toEqual(['LedgerGhost']);
+    });
+
+    it('random_walk reports modeUsed and fallbackSteps', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'LedgerK', entityType: 'LedgerTag', observations: [] },
+          { name: 'LedgerL', entityType: 'LedgerTag', observations: [] },
+        ],
+      });
+      await callTool(client, 'create_relations', {
+        relations: [{ from: 'LedgerK', to: 'LedgerL', relationType: 'LEDGES' }],
+      });
+
+      const merw = await callTool(client, 'random_walk', { start: 'LedgerK', depth: 1 }) as { modeUsed: string; fallbackSteps: number };
+      expect(['merw', 'merw+fallback']).toContain(merw.modeUsed);
+      expect(merw.modeUsed === 'merw').toBe(merw.fallbackSteps === 0);
+
+      const uni = await callTool(client, 'random_walk', { start: 'LedgerK', depth: 1, mode: 'uniform' }) as { modeUsed: string; fallbackSteps: number };
+      expect(uni.modeUsed).toBe('uniform');
+      expect(uni.fallbackSteps).toBe(0);
+    });
+
+    it('sequentialthinking returns linkedTo', async () => {
+      const first = await callTool(client, 'sequentialthinking', { observations: ['ledger thought 1'] }) as { ctxId: string; linkedTo: string | null };
+      expect(first.linkedTo).toBeNull();
+
+      const second = await callTool(client, 'sequentialthinking', { observations: ['ledger thought 2'], previousCtxId: first.ctxId }) as { ctxId: string; linkedTo: string | null };
+      expect(second.linkedTo).toBe(first.ctxId);
+    });
+  });
+
+  describe('API cursor integrity (R5)', () => {
+    async function seedCursorTag(count: number) {
+      const entities = Array.from({ length: count }, (_, i) => ({
+        name: `CursorTag${String(i).padStart(2, '0')}`,
+        entityType: 'CursorTag',
+        observations: ['x'.repeat(100)],
+      }));
+      await callTool(client, 'create_entities', { entities });
+    }
+
+    it('a stale cursor errors instead of serving a shifted page', async () => {
+      await seedCursorTag(30);
+
+      const page1 = await callTool(client, 'get_entities_by_type', {
+        entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc',
+      }) as PaginatedResult<Entity>;
+      expect(page1.nextCursor).not.toBeNull();
+      expect(typeof page1.nextCursor).toBe('string');
+
+      // Mutate the result set between pages.
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'CursorTagNew', entityType: 'CursorTag', observations: ['y'.repeat(100)] }],
+      });
+
+      const raw = await callToolRaw(client, 'get_entities_by_type', {
+        entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc', cursor: page1.nextCursor,
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('CURSOR_STALE');
+    });
+
+    it('an unchanged set drains cleanly via string cursors (no dupes, no gaps)', async () => {
+      await seedCursorTag(30);
+
+      const seen: string[] = [];
+      let cursor: string | number | null = 0;
+      let guard = 0;
+      while (cursor !== null && guard++ < 20) {
+        const page = await callTool(client, 'get_entities_by_type', {
+          entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc', cursor,
+        }) as PaginatedResult<Entity>;
+        seen.push(...page.items.map(e => e.name));
+        cursor = page.nextCursor;
+      }
+      expect(seen).toHaveLength(30);
+      expect(new Set(seen).size).toBe(30);
+    });
+
+    it('malformed cursors are rejected with CURSOR_STALE', async () => {
+      await seedCursorTag(1);
+      const raw = await callToolRaw(client, 'get_entities_by_type', {
+        entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc', cursor: 'garbage',
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('CURSOR_STALE');
+    });
+
+    it('legacy bare-number cursors still work (no staleness check)', async () => {
+      await seedCursorTag(30);
+      const page = await callTool(client, 'get_entities_by_type', {
+        entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc', cursor: 1,
+      }) as PaginatedResult<Entity>;
+      expect(page.items.length).toBeGreaterThan(0);
+      // Starts at index 1 (the second item in name order), not at the head.
+      expect(page.items[0].name).toBe('CursorTag01');
     });
   });
 });

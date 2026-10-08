@@ -1,7 +1,7 @@
 /*
  * regex.c — parser + NFA compiler + Thompson/Pike simulation.
  *
- * Pipeline:  pattern --re_parse--> AST --re_compile_ast--> Inst[] --re_search--> bool
+ * Pipeline:  pattern --re_parse--> AST --re_compile_ast--> Inst[] --re_nfa_search--> bool
  *
  * The matcher is a Pike VM run for a BOOLEAN verdict (does the pattern match
  * anywhere?). Because we never need submatch offsets, there is no thread
@@ -446,7 +446,13 @@ static void addthread(TList *l, int *seen, int gen, const Regex *re, int pc,
     }
 }
 
-int re_search(const Regex *re, const char *text, size_t len) {
+/* NOTE(link hygiene): this entry is re_nfa_search, NOT re_search — glibc
+ * exports a (weak) re_search (GNU regex), and a dlopen'd addon that referenced
+ * "re_search" bound to LIBC's instead of ours (ELF symbol interposition),
+ * silently making every linear search "match everything". Keep engine symbols
+ * collision-free; binding.gyp compiles the addon with -fvisibility=hidden so
+ * engine symbols cannot interpose at dlopen. */
+int re_nfa_search(const Regex *re, const char *text, size_t len) {
     const unsigned char *s = (const unsigned char *)text;
     int m = re->ninst;
     int *seen = malloc((size_t)m * sizeof(int));

@@ -181,6 +181,24 @@ int main(void) {
         int model = 0; for (int i = 0; i < NENT; i++) if (ents[i].alive && (i % 16) == 3) model++;
         u32 s2 = graph_search(gr, "type-3", sb, NENT);
         CHECK((int)s2 == model, "search type-3 (type field) == model");
+
+        /* Live trigram index is single-writer-gated and OFF by default; when
+         * enabled (single process), search RESULTS must be identical (set-wise)
+         * to the linear engine scan. */
+        u64 *sb2 = malloc((size_t)NENT * sizeof(u64));
+        u32 base1 = graph_search(gr, "^ent-7$", sb, NENT);
+        graph_set_live_index(gr, 1);
+        u32 with = graph_search(gr, "^ent-7$", sb2, NENT);
+        CHECK(with == base1, "live index: same match count as linear scan");
+        u32 same = 1;
+        for (u32 a = 0; a < with && same; a++) {
+            u32 hit = 0;
+            for (u32 b2 = 0; b2 < base1; b2++) if (sb2[a] == sb[b2]) { hit = 1; break; }
+            same &= hit;
+        }
+        CHECK(same, "live index: identical match set as linear scan");
+        graph_set_live_index(gr, 0);
+        free(sb2);
         free(sb);
     }
 
@@ -206,7 +224,7 @@ int main(void) {
 
         if (nrel > 0) {
             u64 path[16];
-            u32 pl = graph_random_walk(gr, ents[rels[0].from].off, 5, DIR_FORWARD, 1, 999, path, 16);
+            u32 pl = graph_random_walk(gr, ents[rels[0].from].off, 5, DIR_FORWARD, 1, 999, 0, path, 16, NULL);
             CHECK(pl >= 1 && pl <= 6 && path[0] == ents[rels[0].from].off, "random_walk: valid path (start + <=depth steps)");
         }
     }

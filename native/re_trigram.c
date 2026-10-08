@@ -757,7 +757,7 @@ uint32_t re_trigram_search(const Regex *re, const ReNode *ast,
         candidates = ndocs; filtered = 0;
         for (uint32_t d = 0; d < ndocs; d++) {
             verified++;
-            if (re_search(re, docs[d].ptr, docs[d].len)) {
+            if (re_nfa_search(re, docs[d].ptr, docs[d].len)) {
                 if (matched < out_cap) out_ids[matched] = d;
                 matched++;
             }
@@ -768,7 +768,7 @@ uint32_t re_trigram_search(const Regex *re, const ReNode *ast,
             uint32_t d = c.ids[i];
             if (d >= ndocs) continue;
             verified++;
-            if (re_search(re, docs[d].ptr, docs[d].len)) {
+            if (re_nfa_search(re, docs[d].ptr, docs[d].len)) {
                 if (matched < out_cap) out_ids[matched] = d;
                 matched++;
             }

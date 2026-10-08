@@ -67,6 +67,6 @@ void   re_free(Regex *re);
 /* 1 if the pattern matches ANYWHERE in text[0..len) (unanchored, like
  * re.search); 0 otherwise. Linear time, no allocation beyond two O(m) thread
  * lists. Safe on arbitrary bytes including embedded NULs. */
-int    re_search(const Regex *re, const char *text, size_t len);
+int    re_nfa_search(const Regex *re, const char *text, size_t len);
 
 #endif /* REGEX_H */

@@ -43,7 +43,7 @@ test_memfile: test_memfile.c memoryfile.c
 test_stringtable: test_stringtable.c stringtable.c memoryfile.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_st && $(OUT)_st
 
-test_graph: test_graph.c graph.c stringtable.c memoryfile.c
+test_graph: test_graph.c graph.c stringtable.c memoryfile.c regex.c re_dfa.c re_trigram.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_graph && $(OUT)_graph
 
 test_entity: test_entity.c
@@ -52,7 +52,7 @@ test_entity: test_entity.c
 # Per-op graph benchmark: optimized build (NO ASan / NO double-free-check — those
 # skew timing). Emits per-op rdtsc cycle stats as JSON; CI compares base vs head.
 BENCH_CFLAGS = -std=c11 -O2 -march=native -Wall -D_GNU_SOURCE -I.
-bench: op_bench.c graph.c stringtable.c memoryfile.c
+bench: op_bench.c graph.c stringtable.c memoryfile.c regex.c re_dfa.c re_trigram.c
 	$(CC) $(BENCH_CFLAGS) $^ -lm -o $(OUT)_bench && $(OUT)_bench
 
 # ---- Frama-C/WP + EVA proofs ----------------------------------------------

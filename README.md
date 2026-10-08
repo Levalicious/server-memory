@@ -241,6 +241,7 @@ The eigenvector is computed via sparse power iteration with teleportation dampin
     - `depth` (number, default: 3): Number of hops to take
     - `seed` (string, optional): Seed for reproducible walks
     - `direction` (string, optional): Edge direction filter (`forward`, `backward`, `any`). Default: `forward`
+    - `avoidCycles` (boolean, optional): Self-avoiding walk — never revisits a node; stops early when every neighbor is already on the path. Default: `false`
   - Neighbors are selected proportional to their MERW eigenvector component ψ
   - Falls back to uniform sampling if ψ has not been computed
   - Returns the terminal entity name and the path taken

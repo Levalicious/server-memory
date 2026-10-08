@@ -682,10 +682,10 @@ int main(void) {
                 assert(g4_read_entity(g, ids[i], &e));
                 u16 len; const u8 *bb;
                 int hit = 0;
-                if ((bb = g4_str(g, e.name_sid, &len)) && re_search(re, (const char *)bb, len)) hit = 1;
-                if (!hit && (bb = g4_str(g, e.type_sid, &len)) && re_search(re, (const char *)bb, len)) hit = 1;
-                if (!hit && e.obs_count >= 1 && (bb = g4_str(g, e.obs0_sid, &len)) && re_search(re, (const char *)bb, len)) hit = 1;
-                if (!hit && e.obs_count >= 2 && (bb = g4_str(g, e.obs1_sid, &len)) && re_search(re, (const char *)bb, len)) hit = 1;
+                if ((bb = g4_str(g, e.name_sid, &len)) && re_nfa_search(re, (const char *)bb, len)) hit = 1;
+                if (!hit && (bb = g4_str(g, e.type_sid, &len)) && re_nfa_search(re, (const char *)bb, len)) hit = 1;
+                if (!hit && e.obs_count >= 1 && (bb = g4_str(g, e.obs0_sid, &len)) && re_nfa_search(re, (const char *)bb, len)) hit = 1;
+                if (!hit && e.obs_count >= 2 && (bb = g4_str(g, e.obs1_sid, &len)) && re_nfa_search(re, (const char *)bb, len)) hit = 1;
                 if (hit) want++;
             }
             re_free(re);

@@ -7,7 +7,7 @@
  * explicit transition table, then matches with one table lookup per byte and
  * no per-call NFA work.
  *
- * Semantics are identical to re_search (boolean, unanchored, byte-level,
+ * Semantics are identical to re_nfa_search (boolean, unanchored, byte-level,
  * case-sensitive, with Python-default `$` incl. the single-trailing-newline
  * rule) — enforced by differential-testing every DFA verdict against the NFA.
  *
@@ -29,7 +29,7 @@ ReDfa *re_dfa_build(const Regex *re);
 void   re_dfa_free(ReDfa *d);
 
 /* 1 if the pattern matches anywhere in text[0..len), else 0. Identical verdict
- * to re_search by construction; O(len) with a single table step per byte. */
+ * to re_nfa_search by construction; O(len) with a single table step per byte. */
 int    re_dfa_search(const ReDfa *d, const char *text, size_t len);
 
 /* Number of DFA states — for the Sheng tiering decision (<=16 => Sheng-able)
@@ -46,7 +46,7 @@ int    re_dfa_accept_eol(const ReDfa *d, int state);    /* match only at $ posit
 /* ---- Lazy (on-demand, cached) DFA -----------------------------------------
  * The graceful large-state scalar tier: builds states/transitions only as the
  * input visits them, and a bounded cache flushes+rebuilds instead of failing.
- * No eager blowup, no hard state cliff. Identical verdict to re_search (reuses
+ * No eager blowup, no hard state cliff. Identical verdict to re_nfa_search (reuses
  * the same closure). A search MUTATES the cache — not thread-safe. */
 typedef struct ReLdfa ReLdfa;
 

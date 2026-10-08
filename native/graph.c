@@ -714,7 +714,7 @@ u32 graph_relation_types(graph_t *g, u32 *out, u32 max) {
 static int match_id(graph_t *g, const Regex *re, u32 id) {
     if (!id) return 0;
     u16 len; const u8 *s = st_get(g->st, id, &len);
-    return re_search(re, (const char *)s, len);
+    return re_nfa_search(re, (const char *)s, len);
 }
 static int match_id_dfa(graph_t *g, const ReDfa *d, u32 id) {
     if (!id) return 0;
@@ -734,11 +734,23 @@ static int entity_matches(graph_t *g, const ReDfa *d, const Regex *re, u64 off) 
  * this many verified docs; below it the build-free NFA is cheaper. */
 #define GRAPH_DFA_MIN_VERIFY 128u
 
+/* Single-writer gate for the live trigram prefilter (KB: trigram accel is
+ * gated on single-writer until the owner daemon). The per-process index tracks
+ * only THIS process's writes; under multi-writer stdio use another process's
+ * deletes/recycles make it stale — stale candidates point at freed records and
+ * the ensuing string reads crash. Default OFF; enable only in a single-writer
+ * context (the kbd4 owner daemon, or a single-process test). */
+void graph_set_live_index(graph_t *g, int on) {
+    if (!on && g->tri) dirty_drop_index(g);   /* free index + dirty set */
+    g->live_index_enabled = on ? 1 : 0;
+}
+
 /* Bring the trigram prefilter current with the store. Writes only flag the index
  * stale (O(1) — keeps write TPS at store speed); the catch-up (here, a full
  * rebuild over the live name index) is deferred off the write path. Incremental
  * / cheaper maintenance is a separate, independently benchmarked optimization. */
 void graph_index_sync(graph_t *g) {
+    if (!g->live_index_enabled) return;
     if (!g->tri) {                                 /* not built yet — full build */
         g->tri = re_trigram_live_new();
         if (g->tri) {
@@ -765,11 +777,16 @@ u32 graph_search(graph_t *g, const char *pattern, u64 *out, u32 max) {
     Regex *re = re_compile_ast(ast);
     if (!re) { re_ast_free(ast); return 0; }
 
-    graph_index_sync(g);   /* catch the prefilter up (deferred from writes) */
-
-    /* Prefilter first so we know how many docs we'll actually verify. */
-    ReTrigramQuery *q = re_trigram_build(ast);
-    ReCandidates64 cand = re_trigram_live_eval(q, g->tri);
+    /* Live-index prefilter only in single-writer mode (graph_set_live_index):
+     * a multi-writer process would otherwise evaluate stale candidates whose
+     * offsets can point at freed/recycled records. */
+    ReTrigramQuery *q = NULL;
+    ReCandidates64 cand = { NULL, 0, 1 };   /* all==1: no constraint -> full scan */
+    if (g->live_index_enabled) {
+        graph_index_sync(g);   /* catch the prefilter up (deferred from writes) */
+        q = re_trigram_build(ast);
+        cand = re_trigram_live_eval(q, g->tri);
+    }
 
     u32 nverify = cand.all ? ni_entity_count(g) : cand.n;
     ReDfa *d = (nverify >= GRAPH_DFA_MIN_VERIFY) ? re_dfa_build(re) : NULL;
@@ -1211,9 +1228,11 @@ u32 graph_compute_merw_psi(graph_t *g, double alpha, u32 max_iter, double tol) {
 }
 
 u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_mode,
-                      u64 seed, u64 *out_path, u32 max_path) {
+                      u64 seed, int avoid_cycles, u64 *out_path, u32 max_path,
+                      u32 *out_uniform_steps) {
     u64 st = seed ? seed : g_rng;
     u32 plen = 0;
+    u32 uniform_steps = 0;
     if (max_path >= 1) out_path[plen] = start;
     plen = 1;
     u64 cur = start;
@@ -1226,6 +1245,17 @@ u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_
         for (u32 k = 0; k < ec; k++) {
             if (!dir_match(direction, es[k].direction)) continue;
             u64 t = es[k].target_offset; if (t == cur) continue;
+            if (avoid_cycles) {
+                /* Self-avoiding walk: skip any node already on the path. The
+                 * path prefix doubles as the visited set (callers pass
+                 * max_path >= depth+1, so plen never exceeds max_path and the
+                 * prefix in out_path is complete). All neighbors visited ->
+                 * nc == 0 below -> stops early. */
+                u32 vmax = plen < max_path ? plen : max_path;
+                int seen = 0;
+                for (u32 j = 0; j < vmax; j++) if (out_path[j] == t) { seen = 1; break; }
+                if (seen) continue;
+            }
             double p = rdf64(g->mf, t + E_PSI);
             int found = 0;
             for (u32 j = 0; j < nc; j++) if (cand[j] == t) { if (p > cpsi[j]) cpsi[j] = p; found = 1; break; }
@@ -1239,6 +1269,7 @@ u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_
             double r = rng_d(&st) * total_psi, cum = 0; chosen = cand[nc - 1];
             for (u32 j = 0; j < nc; j++) { cum += cpsi[j]; if (r <= cum) { chosen = cand[j]; break; } }
         } else {
+            if (merw_mode) uniform_steps++;   /* psi unavailable at this step: fallback */
             u32 ix = (u32)(rng_d(&st) * nc); if (ix >= nc) ix = nc - 1; chosen = cand[ix];
         }
         free(cand); free(cpsi);
@@ -1247,6 +1278,7 @@ u32 graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_
         plen++;
     }
     if (!seed) g_rng = st;
+    if (out_uniform_steps) *out_uniform_steps = uniform_steps;
     return plen;
 }
 

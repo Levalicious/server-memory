@@ -1186,7 +1186,7 @@ static int g4_match_sid(graph4_t *g, const ReDfa *d, const Regex *re, u32 sid) {
     const u8 *b = st4_get(g->st, sid, &len);
     if (!b) return 0;
     return d ? re_dfa_search(d, (const char *)b, len)
-             : re_search(re, (const char *)b, len);
+             : re_nfa_search(re, (const char *)b, len);
 }
 
 static int g4_entity_matches(graph4_t *g, const ReDfa *d, const Regex *re, u32 eid) {
