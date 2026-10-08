@@ -1122,6 +1122,7 @@ export class KnowledgeGraphManager {
     seed?: string,
     direction: 'forward' | 'backward' | 'any' = 'forward',
     mode: RandomWalkMode = 'merw',
+    avoidCycles: boolean = false,
   ): Promise<{ entity: string; path: string[] }> {
     return traced(
       'kb.random_walk',
@@ -1130,6 +1131,7 @@ export class KnowledgeGraphManager {
         'kb.traversal.direction': direction,
         'kb.walker.mode': mode,
         'kb.walker.seeded': seed !== undefined,
+        'kb.walker.avoid_cycles': avoidCycles,
       },
       (span) => this.withReadLock(() => {
         const startOffset = this.db.lookup(start);
@@ -1141,7 +1143,7 @@ export class KnowledgeGraphManager {
         // seed of 0 means "use the global RNG" (unseeded), so hashSeed (never
         // 0) keeps seeded walks reproducible.
         const seedU64 = seed !== undefined ? BigInt(this.hashSeed(seed) >>> 0) : 0n;
-        const pathOffsets = this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64);
+        const pathOffsets = this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64, avoidCycles);
         const pathNames = pathOffsets.map(o => this.db.entityName(o));
 
         span.setAttribute('kb.walker.steps_taken', pathNames.length - 1);
@@ -1565,6 +1567,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Transition policy. 'merw' (default) weights each step by ψ (the cached Maximum-Entropy Random Walk eigenvector), biasing the walk toward structurally important nodes; falls back to uniform if ψ is not yet computed. 'uniform' samples each eligible neighbor with equal probability — useful for unbiased exploration or as a baseline for comparison.",
             },
+            avoidCycles: {
+              type: "boolean",
+              description:
+                "If true, the walk never revisits a node (self-avoiding — the path contains no cycles) and stops early when every neighbor is already on the path. Default: false",
+            },
           },
           required: ["start"],
         },
@@ -1765,6 +1772,7 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
           args.seed as string | undefined,
           (args.direction as 'forward' | 'backward' | 'any') ?? 'forward',
           (args.mode as RandomWalkMode) ?? 'merw',
+          (args.avoidCycles as boolean) ?? false,
         );
         return { content: [{ type: "text", text: JSON.stringify(result) }] };
       }

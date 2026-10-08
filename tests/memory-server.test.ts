@@ -1277,6 +1277,12 @@ describe('MCP Memory Server E2E Tests', () => {
           { name: 'South', entityType: 'Node', observations: ['South node'] },
           { name: 'East', entityType: 'Node', observations: ['East node'] },
           { name: 'Isolated', entityType: 'Node', observations: ['No connections'] },
+          { name: 'Ping', entityType: 'Node', observations: ['2-cycle pair'] },
+          { name: 'Pong', entityType: 'Node', observations: ['2-cycle pair'] },
+          { name: 'LoopA', entityType: 'Node', observations: ['Chain head'] },
+          { name: 'LoopB', entityType: 'Node', observations: ['Chain cycle'] },
+          { name: 'LoopC', entityType: 'Node', observations: ['Chain cycle'] },
+          { name: 'LoopD', entityType: 'Node', observations: ['Chain tail'] },
         ]
       });
       await callTool(client, 'create_relations', {
@@ -1285,6 +1291,17 @@ describe('MCP Memory Server E2E Tests', () => {
           { from: 'Center', to: 'South', relationType: 'connects' },
           { from: 'Center', to: 'East', relationType: 'connects' },
           { from: 'North', to: 'South', relationType: 'connects' },
+          // Cycle fixtures for the avoidCycles tests: Ping<->Pong is a 2-cycle;
+          // LoopA->LoopB->LoopC->LoopD with back-edges B->A and C->B, so an
+          // unguarded walk can cycle but a self-avoiding one is forced along
+          // the chain.
+          { from: 'Ping', to: 'Pong', relationType: 'connects' },
+          { from: 'Pong', to: 'Ping', relationType: 'connects' },
+          { from: 'LoopA', to: 'LoopB', relationType: 'connects' },
+          { from: 'LoopB', to: 'LoopA', relationType: 'connects' },
+          { from: 'LoopB', to: 'LoopC', relationType: 'connects' },
+          { from: 'LoopC', to: 'LoopB', relationType: 'connects' },
+          { from: 'LoopC', to: 'LoopD', relationType: 'connects' },
         ]
       });
     });
@@ -1384,6 +1401,60 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(visited.has('North')).toBe(true);
       expect(visited.has('South')).toBe(true);
       expect(visited.has('East')).toBe(true);
+    });
+
+    it('avoidCycles=true produces a simple, cycle-free path', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'LoopA',
+        depth: 6,
+        avoidCycles: true,
+      }) as { entity: string; path: string[] };
+
+      // LoopA -> LoopB -> LoopC -> LoopD: back-edges are blocked by the visited
+      // set, so the walk is forced along the chain and then stops at the tail.
+      expect(result.path).toEqual(['LoopA', 'LoopB', 'LoopC', 'LoopD']);
+      expect(new Set(result.path).size).toBe(result.path.length);
+    });
+
+    it('avoidCycles=true stops when every neighbor is already on the path', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'Ping',
+        depth: 5,
+        avoidCycles: true,
+      }) as { entity: string; path: string[] };
+
+      // Ping <-> Pong is a 2-cycle; the self-avoiding walk takes one step and
+      // stops rather than bouncing.
+      expect(result.path).toEqual(['Ping', 'Pong']);
+      expect(result.entity).toBe('Pong');
+    });
+
+    it('without avoidCycles the walk may still revisit nodes (default unchanged)', async () => {
+      const result = await callTool(client, 'random_walk', {
+        start: 'Ping',
+        depth: 5,
+      }) as { entity: string; path: string[] };
+
+      // Single candidate at every step, so the default walk alternates
+      // deterministically — proof that revisits are still permitted.
+      expect(result.path).toEqual(['Ping', 'Pong', 'Ping', 'Pong', 'Ping', 'Pong']);
+    });
+
+    it('avoidCycles=true walks stay reproducible under a seed', async () => {
+      const r1 = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 3,
+        seed: 'cycle-seed',
+        avoidCycles: true,
+      }) as { entity: string; path: string[] };
+      const r2 = await callTool(client, 'random_walk', {
+        start: 'Center',
+        depth: 3,
+        seed: 'cycle-seed',
+        avoidCycles: true,
+      }) as { entity: string; path: string[] };
+
+      expect(r1.path).toEqual(r2.path);
     });
   });
 
