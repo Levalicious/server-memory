@@ -19,13 +19,47 @@ import { toolDurationHistogram, traced, tracer } from './src/tracing.js';
 /**
  * Result envelope for a single tool dispatch. Mirrors the MCP CallToolResult
  * shape we return from every case; `isError: true` signals a tool-level error
- * that the LLM should see (vs. a thrown error which becomes a hidden JSON-RPC
- * protocol error).
+ * that the LLM should see. Caller-actionable failures are thrown as
+ * {@link ToolError} and converted into that visible shape by the request
+ * handler; any other exception propagates as a protocol error and is reserved
+ * for genuine server faults.
  */
 type ToolDispatchResult = {
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
 };
+
+/**
+ * Stable, machine-readable error codes carried in the tool-error envelope.
+ * This list is part of the public contract (docs/api-error-policy.md).
+ */
+export type ToolErrorCode =
+  | 'ENTITY_NOT_FOUND'
+  | 'TYPE_NOT_FOUND'
+  | 'ENDPOINT_MISSING'
+  | 'COLLISION'
+  | 'LIMIT_EXCEEDED'
+  | 'INVALID_REGEX'
+  | 'INVALID_FILE'
+  | 'NO_MATCHES'
+  | 'VALIDATION_FAILED';
+
+/**
+ * A failure the CALLER can act on. The request handler converts these into a
+ * VISIBLE, structured tool error (`isError: true` with a JSON envelope) —
+ * never a protocol error. Protocol errors stay reserved for genuine server
+ * faults. See docs/api-error-policy.md (R1).
+ */
+export class ToolError extends Error {
+  constructor(
+    public code: ToolErrorCode,
+    message: string,
+    public details?: unknown,
+  ) {
+    super(message);
+    this.name = 'ToolError';
+  }
+}
 
 /**
  * True if the query contains any regex metacharacter. Used to gate the
@@ -581,22 +615,43 @@ export class KnowledgeGraphManager {
   }
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
-    // Validate observation limits (can do outside lock)
+    // Validate observation limits across the WHOLE batch first, collecting
+    // every violation rather than stopping at the first (R2: validate-first;
+    // the caller gets all offenders in one round-trip).
+    const limitViolations: { entity: string; code: ToolErrorCode; message: string }[] = [];
     for (const entity of entities) {
       if (entity.observations.length > 2) {
-        throw new Error(`Entity "${entity.name}" has ${entity.observations.length} observations. Maximum allowed is 2.`);
+        limitViolations.push({
+          entity: entity.name,
+          code: 'LIMIT_EXCEEDED',
+          message: `has ${entity.observations.length} observations; maximum allowed is 2`,
+        });
       }
-      for (const obs of entity.observations) {
+      entity.observations.forEach((obs, index) => {
         if (obs.length > 140) {
-          throw new Error(`Observation in entity "${entity.name}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+          limitViolations.push({
+            entity: entity.name,
+            code: 'LIMIT_EXCEEDED',
+            message: `observation #${index + 1} is ${obs.length} chars (140 max, ${obs.length - 140} over)`,
+          });
         }
-      }
+      });
+    }
+    if (limitViolations.length > 0) {
+      throw new ToolError(
+        'LIMIT_EXCEEDED',
+        `${limitViolations.length} limit violation(s) in the batch; nothing was created (details below).`,
+        limitViolations,
+      );
     }
 
     return this.withWriteLock(() => {
       const now = BigInt(Date.now());
-      const newEntities: Entity[] = [];
 
+      // Pass 1 — classify every entity before writing anything. A collision
+      // fails the whole batch (R2: atomic) and lists every offender.
+      const toCreate: Entity[] = [];
+      const collisions: { entity: string; code: ToolErrorCode; message: string }[] = [];
       for (const e of entities) {
         const existingOffset = this.db.lookup(e.name);
         if (existingOffset !== 0n) {
@@ -604,10 +659,27 @@ export class KnowledgeGraphManager {
           const sameType = existing.entityType === e.entityType;
           const sameObs = existing.observations.length === e.observations.length &&
             existing.observations.every((o, i) => o === e.observations[i]);
-          if (sameType && sameObs) continue;
-          throw new Error(`Entity "${e.name}" already exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`);
+          if (sameType && sameObs) continue; // exact duplicate: intent satisfied
+          collisions.push({
+            entity: e.name,
+            code: 'COLLISION',
+            message: `exists with different data (type: "${existing.entityType}" vs "${e.entityType}", observations: ${existing.observations.length} vs ${e.observations.length})`,
+          });
+        } else {
+          toCreate.push(e);
         }
+      }
+      if (collisions.length > 0) {
+        throw new ToolError(
+          'COLLISION',
+          `${collisions.length} entity name collision(s); nothing was created (details below).`,
+          collisions,
+        );
+      }
 
+      // Pass 2 — create.
+      const newEntities: Entity[] = [];
+      for (const e of toCreate) {
         const offset = this.db.createEntity(e.name, e.entityType, now);
         for (const obs of e.observations) {
           this.db.addObservation(offset, obs, now);
@@ -628,12 +700,40 @@ export class KnowledgeGraphManager {
   async createRelations(relations: Relation[]): Promise<Relation[]> {
     return this.withWriteLock(() => {
       const now = BigInt(Date.now());
-      const newRelations: Relation[] = [];
 
+      // Pass 1 — every endpoint must exist; missing endpoints fail the whole
+      // batch (R2/R4: a relation to a nonexistent entity is a state desync,
+      // never a silent drop).
+      const missing: { from: string; to: string; relationType: string; code: ToolErrorCode; missing: string[]; message: string }[] = [];
+      for (const r of relations) {
+        const missingEnds: string[] = [];
+        if (this.db.lookup(r.from) === 0n) missingEnds.push('from');
+        if (this.db.lookup(r.to) === 0n) missingEnds.push('to');
+        if (missingEnds.length > 0) {
+          missing.push({
+            from: r.from,
+            to: r.to,
+            relationType: r.relationType,
+            code: 'ENDPOINT_MISSING',
+            missing: missingEnds,
+            message: `endpoint(s) not found: ${missingEnds.join(', ')}`,
+          });
+        }
+      }
+      if (missing.length > 0) {
+        throw new ToolError(
+          'ENDPOINT_MISSING',
+          `${missing.length} relation(s) reference nonexistent entities; nothing was created (details below).`,
+          missing,
+        );
+      }
+
+      // Pass 2 — create. Duplicates are already-satisfied intent and are
+      // skipped (they become part of the result ledger under policy R3).
+      const newRelations: Relation[] = [];
       for (const r of relations) {
         const fromOffset = this.db.lookup(r.from);
         const toOffset = this.db.lookup(r.to);
-        if (fromOffset === 0n || toOffset === 0n) continue;
 
         const isDuplicate = this.db.edges(fromOffset).some(e =>
           e.direction === DIR_FORWARD && e.target === toOffset && e.relType === r.relationType
@@ -651,33 +751,58 @@ export class KnowledgeGraphManager {
 
   async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
     return this.withWriteLock(() => {
-      const results: { entityName: string; addedObservations: string[] }[] = [];
+      // Pass 1 — validate the WHOLE batch before touching state (R2: atomic;
+      // the old code validated inside the write loop, so a late failure left
+      // earlier items applied). Collect every violation for one round-trip.
+      const pending: { entityName: string; offset: bigint; newObservations: string[] }[] = [];
+      const violations: { entityName: string; code: ToolErrorCode; message: string }[] = [];
 
       for (const o of observations) {
         const offset = this.db.lookup(o.entityName);
         if (offset === 0n) {
-          throw new Error(`Entity with name ${o.entityName} not found`);
+          violations.push({ entityName: o.entityName, code: 'ENTITY_NOT_FOUND', message: 'entity does not exist' });
+          continue;
         }
 
-        for (const obs of o.contents) {
+        o.contents.forEach((obs, index) => {
           if (obs.length > 140) {
-            throw new Error(`Observation for "${o.entityName}" exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+            violations.push({
+              entityName: o.entityName,
+              code: 'LIMIT_EXCEEDED',
+              message: `observation #${index + 1} is ${obs.length} chars (140 max, ${obs.length - 140} over)`,
+            });
           }
-        }
+        });
 
         const existingObs = this.db.readEntity(offset).observations;
         const newObservations = o.contents.filter(content => !existingObs.includes(content));
-
         if (existingObs.length + newObservations.length > 2) {
-          throw new Error(`Adding ${newObservations.length} observations to "${o.entityName}" would exceed limit of 2 (currently has ${existingObs.length}).`);
+          violations.push({
+            entityName: o.entityName,
+            code: 'LIMIT_EXCEEDED',
+            message: `adding ${newObservations.length} observation(s) would give ${existingObs.length + newObservations.length} total; maximum is 2`,
+          });
         }
+        pending.push({ entityName: o.entityName, offset, newObservations });
+      }
 
-        const now = BigInt(Date.now());
-        for (const obs of newObservations) {
-          this.db.addObservation(offset, obs, now);
+      if (violations.length > 0) {
+        const codes = new Set(violations.map(v => v.code));
+        throw new ToolError(
+          codes.size === 1 ? violations[0].code : 'VALIDATION_FAILED',
+          `${violations.length} observation(s) failed validation; nothing was written (details below).`,
+          violations,
+        );
+      }
+
+      // Pass 2 — apply.
+      const now = BigInt(Date.now());
+      const results: { entityName: string; addedObservations: string[] }[] = [];
+      for (const p of pending) {
+        for (const obs of p.newObservations) {
+          this.db.addObservation(p.offset, obs, now);
         }
-
-        results.push({ entityName: o.entityName, addedObservations: newObservations });
+        results.push({ entityName: p.entityName, addedObservations: p.newObservations });
       }
 
       return results;
@@ -742,7 +867,7 @@ export class KnowledgeGraphManager {
     // query is never rejected by a divergent JS RegExp dialect, and an invalid one
     // is rejected consistently. Preserves the "Invalid regex pattern" contract.
     if (!this.db.regexValid(query)) {
-      throw new Error(`Invalid regex pattern: ${query}`);
+      throw new ToolError('INVALID_REGEX', `Invalid regex pattern: ${query}`);
     }
 
     return traced(
@@ -787,6 +912,17 @@ export class KnowledgeGraphManager {
         if (offset === 0n) continue;
         filteredEntities.push(this.recordToEntity(this.db.readEntity(offset)));
         offsetByName.set(name, offset);
+      }
+
+      // Q2 (docs/api-error-policy.md): when NONE of the requested names exist,
+      // the request is a typo/desync — error instead of returning an empty
+      // graph (a partial miss is reported via the R3 ledger).
+      if (names.length > 0 && filteredEntities.length === 0) {
+        throw new ToolError(
+          'ENTITY_NOT_FOUND',
+          `None of the ${names.length} requested entities exist.`,
+          { missing: names },
+        );
       }
 
       const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
@@ -838,7 +974,7 @@ export class KnowledgeGraphManager {
         const startOffset = this.db.lookup(entityName);
         if (startOffset === 0n) {
           span.setAttribute('kb.traversal.start_found', false);
-          return [];
+          throw new ToolError('ENTITY_NOT_FOUND', `Start entity not found: ${entityName}`);
         }
         span.setAttribute('kb.traversal.start_found', true);
 
@@ -989,7 +1125,17 @@ export class KnowledgeGraphManager {
 
   async getEntitiesByType(entityType: string, sortBy?: EntitySortField, sortDir?: SortDirection): Promise<Entity[]> {
     return this.withReadLock(() => {
-      const filtered = this.getAllEntities().filter(e => e.entityType === entityType);
+      const all = this.getAllEntities();
+      // Q3 (docs/api-error-policy.md): the type set is data-derived, so an
+      // absent type can never have entities — a miss is a typo/desync, not an
+      // empty result.
+      if (!all.some(e => e.entityType === entityType)) {
+        throw new ToolError(
+          'TYPE_NOT_FOUND',
+          `Entity type "${entityType}" is not present in the graph. See get_entity_types for the full list.`,
+        );
+      }
+      const filtered = all.filter(e => e.entityType === entityType);
       const rankMaps = this.getRankMapsUnlocked();
       return sortEntities(filtered, sortBy, sortDir, rankMaps);
     });
@@ -1136,7 +1282,7 @@ export class KnowledgeGraphManager {
       (span) => this.withReadLock(() => {
         const startOffset = this.db.lookup(start);
         if (startOffset === 0n) {
-          throw new Error(`Start entity not found: ${start}`);
+          throw new ToolError('ENTITY_NOT_FOUND', `Start entity not found: ${start}`);
         }
 
         // Seeded walk: hash the string seed to a u64 the C RNG can use. A
@@ -1203,33 +1349,45 @@ export class KnowledgeGraphManager {
   }
 
   async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string }> {
-    // Validate observations (can do outside lock)
+    // Validate observation limits across the whole request first.
+    const violations: { code: ToolErrorCode; message: string }[] = [];
     if (observations.length > 2) {
-      throw new Error(`Thought has ${observations.length} observations. Maximum allowed is 2.`);
+      violations.push({ code: 'LIMIT_EXCEEDED', message: `Thought has ${observations.length} observations; maximum allowed is 2` });
     }
-    for (const obs of observations) {
+    observations.forEach((obs, index) => {
       if (obs.length > 140) {
-        throw new Error(`Observation exceeds 140 characters (${obs.length} chars): "${obs.substring(0, 50)}..."`);
+        violations.push({ code: 'LIMIT_EXCEEDED', message: `observation #${index + 1} is ${obs.length} chars (140 max, ${obs.length - 140} over)` });
       }
+    });
+    if (violations.length > 0) {
+      throw new ToolError('LIMIT_EXCEEDED', `${violations.length} limit violation(s); nothing was created (details below).`, violations);
     }
 
     return this.withWriteLock(() => {
       const now = BigInt(Date.now());
-      const ctxId = randomBytes(12).toString('hex');
 
+      // Validate the chain link BEFORE creating the thought (R2: atomic; a
+      // silently-unlinked thought is exactly the FORGOT_EVIDENCE failure the
+      // chain exists to prevent).
+      let prevOffset = 0n;
+      if (previousCtxId) {
+        prevOffset = this.db.lookup(previousCtxId);
+        if (prevOffset === 0n) {
+          throw new ToolError('ENTITY_NOT_FOUND', `previousCtxId "${previousCtxId}" does not exist; refusing to create an unlinked thought.`);
+        }
+      }
+
+      const ctxId = randomBytes(12).toString('hex');
       const offset = this.db.createEntity(ctxId, 'Thought', now);
       for (const obs of observations) {
         this.db.addObservation(offset, obs, now);
       }
 
       if (previousCtxId) {
-        const prevOffset = this.db.lookup(previousCtxId);
-        if (prevOffset !== 0n) {
-          // prev --follows--> new, and new --preceded_by--> prev. C creates
-          // both directed edges per relation and owns the refcounts.
-          this.db.createRelation(prevOffset, offset, 'follows', now);
-          this.db.createRelation(offset, prevOffset, 'preceded_by', now);
-        }
+        // prev --follows--> new, and new --preceded_by--> prev. C creates
+        // both directed edges per relation and owns the refcounts.
+        this.db.createRelation(prevOffset, offset, 'follows', now);
+        this.db.createRelation(offset, prevOffset, 'preceded_by', now);
       }
 
       return { ctxId };
@@ -1629,9 +1787,12 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
   /**
    * Dispatch a single tool call. Extracted from the request handler so the
    * handler can wrap it with span/metric instrumentation without duplicating
-   * the per-tool logic. Returns the MCP `CallToolResult` shape; thrown errors
-   * become JSON-RPC protocol errors (hidden from the model), while
-   * `{ isError: true }` returns are visible tool-level errors.
+   * the per-tool logic. Returns the MCP `CallToolResult` shape.
+   *
+   * Error policy (docs/api-error-policy.md): caller-actionable failures are
+   * thrown as `ToolError`s — the request handler converts them into VISIBLE
+   * structured tool errors (`isError: true` + JSON envelope). Any other throw
+   * remains a JSON-RPC protocol error and is reserved for server faults.
    */
   async function dispatch(name: string, args: Record<string, unknown>): Promise<ToolDispatchResult> {
     switch (name) {
@@ -1677,11 +1838,16 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
           const suggestion = suggested && suggested !== query
             ? ` For multiple terms try ${JSON.stringify(suggested)}.`
             : '';
+          const envelope = {
+            error: {
+              tool: 'search_nodes',
+              code: 'NO_MATCHES',
+              message: `No matches for ${JSON.stringify(query)}. search_nodes uses POSIX Extended Regular Expressions (ERE), case-sensitive — not natural language, and not JS/PCRE regex (use [0-9] not \\d, [[:alpha:]] not \\w; no lookahead or backreferences).${suggestion} You can also browse with get_entities_by_type, get_neighbors, or random_walk.`,
+              ...(suggestion && { details: { suggestedRegex: suggested } }),
+            },
+          };
           return {
-            content: [{
-              type: "text",
-              text: `No matches for ${JSON.stringify(query)}. search_nodes uses POSIX Extended Regular Expressions (ERE), case-sensitive — not natural language, and not JS/PCRE regex (use [0-9] not \\d, [[:alpha:]] not \\w; no lookahead or backreferences).${suggestion} You can also browse with get_entities_by_type, get_neighbors, or random_walk.`,
-            }],
+            content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }],
             isError: true,
           };
         }
@@ -1787,14 +1953,18 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         const filePath = args.filePath as string;
 
         // Validate extension
-        validateExtension(filePath);
+        try {
+          validateExtension(filePath);
+        } catch (err: unknown) {
+          throw new ToolError('INVALID_FILE', err instanceof Error ? err.message : String(err));
+        }
 
         // Read file
         let text: string;
         try {
           text = fs.readFileSync(filePath, 'utf-8');
         } catch (err: unknown) {
-          throw new Error(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
+          throw new ToolError('INVALID_FILE', `Failed to read file: ${err instanceof Error ? err.message : String(err)}`);
         }
 
         // Derive title
@@ -1887,6 +2057,26 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
           }
           return result;
         } catch (err) {
+          if (err instanceof ToolError) {
+            // Policy R1 (docs/api-error-policy.md): caller-actionable failures
+            // surface as VISIBLE tool errors with a structured envelope —
+            // never as protocol errors.
+            errorType = `tool_error:${err.code}`;
+            span.setAttribute('error.type', errorType);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+            const envelope = {
+              error: {
+                tool: name,
+                code: err.code,
+                message: err.message,
+                ...(err.details !== undefined && { details: err.details }),
+              },
+            };
+            return {
+              content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }],
+              isError: true,
+            };
+          }
           errorType = (err as Error)?.constructor?.name ?? 'Error';
           span.setAttribute('error.type', errorType);
           span.recordException(err as Error);

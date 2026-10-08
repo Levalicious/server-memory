@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
 import { createServer, type Entity, type Relation, type Neighbor } from '../server.js';
-import { createTestClient, callTool, callToolRaw, type PaginatedGraph, type PaginatedResult, type FindPathResult } from './test-utils.js';
+import { createTestClient, callTool, callToolRaw, parseToolError, type PaginatedGraph, type PaginatedResult, type FindPathResult } from './test-utils.js';
 
 describe('MCP Memory Server E2E Tests', () => {
   let testDir: string;
@@ -64,49 +64,49 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(result[0].name).toBe('Bob');
     });
 
-    it('should error on duplicate name with different data', async () => {
+    it('should error on duplicate name with different data (COLLISION, visible)', async () => {
       await callTool(client, 'create_entities', {
         entities: [{ name: 'Alice', entityType: 'Person', observations: ['First'] }]
       });
 
-      // Same name, different type — should error
-      await expect(
-        callTool(client, 'create_entities', {
-          entities: [{ name: 'Alice', entityType: 'Organization', observations: ['First'] }]
-        })
-      ).rejects.toThrow(/already exists/);
+      // Same name, different type — visible tool error (policy R1)
+      const rawType = await callToolRaw(client, 'create_entities', {
+        entities: [{ name: 'Alice', entityType: 'Organization', observations: ['First'] }]
+      });
+      expect(rawType.isError).toBe(true);
+      expect(parseToolError(rawType).code).toBe('COLLISION');
 
-      // Same name, different observations — should error
-      await expect(
-        callTool(client, 'create_entities', {
-          entities: [{ name: 'Alice', entityType: 'Person', observations: ['Different'] }]
-        })
-      ).rejects.toThrow(/already exists/);
+      // Same name, different observations — also visible
+      const rawObs = await callToolRaw(client, 'create_entities', {
+        entities: [{ name: 'Alice', entityType: 'Person', observations: ['Different'] }]
+      });
+      expect(rawObs.isError).toBe(true);
+      expect(parseToolError(rawObs).code).toBe('COLLISION');
     });
 
-    it('should reject entities with more than 2 observations', async () => {
-      await expect(
-        callTool(client, 'create_entities', {
-          entities: [{
-            name: 'TooMany',
-            entityType: 'Test',
-            observations: ['One', 'Two', 'Three']
-          }]
-        })
-      ).rejects.toThrow(/Maximum allowed is 2/);
+    it('should reject entities with more than 2 observations (LIMIT_EXCEEDED, visible)', async () => {
+      const raw = await callToolRaw(client, 'create_entities', {
+        entities: [{
+          name: 'TooMany',
+          entityType: 'Test',
+          observations: ['One', 'Two', 'Three']
+        }]
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('LIMIT_EXCEEDED');
     });
 
-    it('should reject observations longer than 140 characters', async () => {
+    it('should reject observations longer than 140 characters (LIMIT_EXCEEDED, visible)', async () => {
       const longObservation = 'x'.repeat(141);
-      await expect(
-        callTool(client, 'create_entities', {
-          entities: [{
-            name: 'LongObs',
-            entityType: 'Test',
-            observations: [longObservation]
-          }]
-        })
-      ).rejects.toThrow(/exceeds 140 characters/);
+      const raw = await callToolRaw(client, 'create_entities', {
+        entities: [{
+          name: 'LongObs',
+          entityType: 'Test',
+          observations: [longObservation]
+        }]
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('LIMIT_EXCEEDED');
     });
 
     it('should delete entities and their relations', async () => {
@@ -158,16 +158,16 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(result[0].addedObservations).toEqual(['New']);
     });
 
-    it('should reject adding observations that would exceed limit', async () => {
+    it('should reject adding observations that would exceed limit (LIMIT_EXCEEDED, visible)', async () => {
       await callTool(client, 'add_observations', {
         observations: [{ entityName: 'TestEntity', contents: ['One', 'Two'] }]
       });
 
-      await expect(
-        callTool(client, 'add_observations', {
-          observations: [{ entityName: 'TestEntity', contents: ['Three'] }]
-        })
-      ).rejects.toThrow(/would exceed limit of 2/);
+      const raw = await callToolRaw(client, 'add_observations', {
+        observations: [{ entityName: 'TestEntity', contents: ['Three'] }]
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('LIMIT_EXCEEDED');
     });
 
     it('should delete specific observations', async () => {
@@ -300,10 +300,10 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(result.entities.items[0].name).toBe('TypeScript');
     });
 
-    it('should reject invalid regex', async () => {
-      await expect(
-        callTool(client, 'search_nodes', { query: '[invalid' })
-      ).rejects.toThrow(/Invalid regex pattern/);
+    it('should reject invalid regex (INVALID_REGEX, visible)', async () => {
+      const raw = await callToolRaw(client, 'search_nodes', { query: '[invalid' });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('INVALID_REGEX');
     });
 
     it('accepts ERE-valid patterns that JS RegExp rejects (validator uses the C ERE engine)', async () => {
@@ -315,11 +315,11 @@ describe('MCP Memory Server E2E Tests', () => {
     });
 
     it('rejects ERE-invalid patterns even when JS RegExp accepts them', async () => {
-      // '(?:x)' is a valid JS non-capturing group but invalid POSIX ERE — must throw,
-      // not silently return zero matches.
-      await expect(
-        callTool(client, 'search_nodes', { query: '(?:x)' })
-      ).rejects.toThrow(/Invalid regex pattern/);
+      // '(?:x)' is a valid JS non-capturing group but invalid POSIX ERE — must
+      // be a visible error, not silently zero matches.
+      const raw = await callToolRaw(client, 'search_nodes', { query: '(?:x)' });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('INVALID_REGEX');
     });
 
     it('trigram path: regex-extractable queries return the same results as before', async () => {
@@ -495,11 +495,12 @@ describe('MCP Memory Server E2E Tests', () => {
       });
 
       expect(raw.isError).toBe(true);
-      const text = raw.content[0]?.text ?? '';
-      expect(text).toContain('knowledge graph features');
-      expect(text).toContain('regex');
+      const err = parseToolError(raw);
+      expect(err.code).toBe('NO_MATCHES');
+      expect(err.message).toContain('knowledge graph features');
+      expect(err.message).toContain('regex');
       // Auto-suggested |-joined regex should appear.
-      expect(text).toContain('knowledge|graph|features');
+      expect(err.message).toContain('knowledge|graph|features');
     });
 
     it('does NOT flag a regex query with anchors that simply misses', async () => {
@@ -539,11 +540,12 @@ describe('MCP Memory Server E2E Tests', () => {
       });
 
       expect(raw.isError).toBe(true);
-      const text = raw.content[0]?.text ?? '';
-      expect(text).toContain('Slef');
-      expect(text).toContain('regex');
+      const err = parseToolError(raw);
+      expect(err.code).toBe('NO_MATCHES');
+      expect(err.message).toContain('Slef');
+      expect(err.message).toContain('regex');
       // No multi-term suggestion because there's only one term.
-      expect(text).not.toContain('"Slef|');
+      expect(err.message).not.toContain('"Slef|');
     });
 
     // Note: a "walker bias" test is intentionally omitted because the guard
@@ -1201,29 +1203,25 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(neighbors.items.some(n => n.name === second.ctxId)).toBe(true);
     });
 
-    it('should ignore invalid previousCtxId gracefully', async () => {
-      const result = await callTool(client, 'sequentialthinking', {
+    it('should refuse an invalid previousCtxId (visible ENTITY_NOT_FOUND)', async () => {
+      // Policy R4: a silently-unlinked thought is exactly the evidence-loss
+      // failure the chain exists to prevent — an unknown link is an error.
+      const raw = await callToolRaw(client, 'sequentialthinking', {
         previousCtxId: 'nonexistent_thought',
         observations: ['Orphaned thought']
-      }) as { ctxId: string };
-
-      expect(result.ctxId).toMatch(/^[0-9a-f]{24}$/);
-
-      // Verify no neighbors (no valid relations were created)
-      const neighbors = await callTool(client, 'get_neighbors', {
-        entityName: result.ctxId,
-        depth: 1
-      }) as PaginatedResult<Neighbor>;
-
-      expect(neighbors.items).toHaveLength(0);
+      });
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('ENTITY_NOT_FOUND');
+      expect(err.message).toContain('nonexistent_thought');
     });
 
-    it('should enforce observation limits on thoughts', async () => {
-      await expect(
-        callTool(client, 'sequentialthinking', {
-          observations: ['One', 'Two', 'Three']
-        })
-      ).rejects.toThrow(/Maximum allowed is 2/);
+    it('should enforce observation limits on thoughts (LIMIT_EXCEEDED, visible)', async () => {
+      const raw = await callToolRaw(client, 'sequentialthinking', {
+        observations: ['One', 'Two', 'Three']
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('LIMIT_EXCEEDED');
     });
 
     it('should set mtime and obsMtime on thought entities', async () => {
@@ -1360,10 +1358,10 @@ describe('MCP Memory Server E2E Tests', () => {
       expect(result1.path).toEqual(result2.path);
     });
 
-    it('should throw on non-existent start entity', async () => {
-      await expect(
-        callTool(client, 'random_walk', { start: 'NonExistent', depth: 2 })
-      ).rejects.toThrow(/not found/);
+    it('should return a visible ENTITY_NOT_FOUND for a non-existent start entity', async () => {
+      const raw = await callToolRaw(client, 'random_walk', { start: 'NonExistent', depth: 2 });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('ENTITY_NOT_FOUND');
     });
 
     it('should accept mode=uniform and produce a valid walk', async () => {
@@ -1965,28 +1963,30 @@ describe('MCP Memory Server E2E Tests', () => {
       docFile = path.join(testDir, 'test-doc.txt');
     });
 
-    it('should reject non-plaintext extensions', async () => {
+    it('should reject non-plaintext extensions (INVALID_FILE, visible)', async () => {
       const pdfPath = path.join(testDir, 'test.pdf');
       await fs.writeFile(pdfPath, 'fake pdf content');
 
-      await expect(
-        callTool(client, 'kb_load', { filePath: pdfPath })
-      ).rejects.toThrow(/Unsupported file extension/);
+      const raw = await callToolRaw(client, 'kb_load', { filePath: pdfPath });
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('INVALID_FILE');
+      expect(err.message).toContain('Unsupported file extension');
     });
 
-    it('should reject files with no extension', async () => {
+    it('should reject files with no extension (INVALID_FILE, visible)', async () => {
       const noExtPath = path.join(testDir, 'noext');
       await fs.writeFile(noExtPath, 'some content');
 
-      await expect(
-        callTool(client, 'kb_load', { filePath: noExtPath })
-      ).rejects.toThrow(/no extension/);
+      const raw = await callToolRaw(client, 'kb_load', { filePath: noExtPath });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('INVALID_FILE');
     });
 
-    it('should reject missing files', async () => {
-      await expect(
-        callTool(client, 'kb_load', { filePath: path.join(testDir, 'nonexistent.txt') })
-      ).rejects.toThrow(/Failed to read file/);
+    it('should reject missing files (INVALID_FILE, visible)', async () => {
+      const raw = await callToolRaw(client, 'kb_load', { filePath: path.join(testDir, 'nonexistent.txt') });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('INVALID_FILE');
     });
 
     it('should load a small document and create entities + relations', async () => {
@@ -2095,14 +2095,14 @@ describe('MCP Memory Server E2E Tests', () => {
       await fs.writeFile(docFile, 'Short doc for dedup testing purposes here.');
       await callTool(client, 'kb_load', { filePath: docFile });
 
-      // Second load with different content but same title — Document entity
-      // already exists with entityType 'Document' and no observations,
-      // so it gets silently skipped. But the index entities already exist
-      // with different observations, so it should error.
+      // Second load with different content but same title: the Document entity
+      // is an exact duplicate (intent satisfied), but the index entities collide
+      // with different observations → visible COLLISION (policy R1), and the
+      // failed load is atomic per op.
       await fs.writeFile(docFile, 'Completely different content for dedup testing now.');
-      await expect(
-        callTool(client, 'kb_load', { filePath: docFile })
-      ).rejects.toThrow(/already exists/);
+      const raw = await callToolRaw(client, 'kb_load', { filePath: docFile });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('COLLISION');
     });
 
     it('should enforce observation length limits', async () => {
@@ -2135,6 +2135,117 @@ describe('MCP Memory Server E2E Tests', () => {
         }) as any;
         expect(result.entitiesCreated).toBeGreaterThan(0);
       }
+    });
+  });
+
+  describe('API error policy (R1/R2/R4)', () => {
+    it('create_entities collision is atomic: nothing in the batch is created', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'PolicyDup', entityType: 'PolicyTag', observations: ['base'] }],
+      });
+
+      const raw = await callToolRaw(client, 'create_entities', {
+        entities: [
+          { name: 'PolicyFresh', entityType: 'PolicyTag', observations: ['new'] },
+          { name: 'PolicyDup', entityType: 'PolicyTag', observations: ['changed'] },
+        ],
+      });
+
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('COLLISION');
+      expect(Array.isArray(err.details)).toBe(true);
+
+      // Atomicity: PolicyFresh must NOT exist. Anchored regex → plain empty
+      // result (a literal query would route through the NL guard instead).
+      const fresh = await callTool(client, 'search_nodes', { query: '^PolicyFresh$' }) as PaginatedGraph;
+      expect(fresh.entities.items).toEqual([]);
+    });
+
+    it('create_relations with a missing endpoint errors and writes nothing', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'PolicyX', entityType: 'PolicyTag', observations: [] },
+          { name: 'PolicyY', entityType: 'PolicyTag', observations: [] },
+        ],
+      });
+
+      const raw = await callToolRaw(client, 'create_relations', {
+        relations: [
+          { from: 'PolicyX', to: 'PolicyY', relationType: 'LINKS' },
+          { from: 'PolicyX', to: 'PolicyGhost', relationType: 'LINKS' },
+        ],
+      });
+
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('ENDPOINT_MISSING');
+
+      // Atomicity: the valid relation in the same batch was not created.
+      const after = await callTool(client, 'open_nodes', { names: ['PolicyX'] }) as PaginatedGraph;
+      expect(after.relations.items).toEqual([]);
+    });
+
+    it('add_observations validates the whole batch first (atomic)', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'PolicyObs', entityType: 'PolicyTag', observations: [] }],
+      });
+
+      const raw = await callToolRaw(client, 'add_observations', {
+        observations: [
+          { entityName: 'PolicyObs', contents: ['would-have-been-added'] },
+          { entityName: 'PolicyGhost', contents: ['x'] },
+        ],
+      });
+
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('ENTITY_NOT_FOUND');
+
+      // Atomicity: the first item must not have been applied.
+      const after = await callTool(client, 'open_nodes', { names: ['PolicyObs'] }) as PaginatedGraph;
+      expect(after.entities.items[0]?.observations).toEqual([]);
+    });
+
+    it('add_observations limit errors carry exact char counts', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'PolicyObs2', entityType: 'PolicyTag', observations: [] }],
+      });
+
+      const raw = await callToolRaw(client, 'add_observations', {
+        observations: [{ entityName: 'PolicyObs2', contents: ['y'.repeat(151)] }],
+      });
+
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('LIMIT_EXCEEDED');
+      // Precise counts live in the per-item details: "151 chars (…11 over)".
+      expect(JSON.stringify(err.details)).toContain('151');
+    });
+
+    it('open_nodes errors when ALL requested names are missing', async () => {
+      const raw = await callToolRaw(client, 'open_nodes', { names: ['NoSuchOne', 'NoSuchTwo'] });
+      expect(raw.isError).toBe(true);
+      const err = parseToolError(raw);
+      expect(err.code).toBe('ENTITY_NOT_FOUND');
+      expect(err.details).toEqual({ missing: ['NoSuchOne', 'NoSuchTwo'] });
+    });
+
+    it('get_entities_by_type errors on an unknown type', async () => {
+      const raw = await callToolRaw(client, 'get_entities_by_type', { entityType: 'NoSuchType' });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('TYPE_NOT_FOUND');
+    });
+
+    it('get_neighbors errors on an unknown start entity', async () => {
+      const raw = await callToolRaw(client, 'get_neighbors', { entityName: 'NoSuchEntity' });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('ENTITY_NOT_FOUND');
+    });
+
+    it('error envelopes carry the tool name and a message naming the offender', async () => {
+      const raw = await callToolRaw(client, 'get_neighbors', { entityName: 'NoSuchEntity' });
+      const err = parseToolError(raw);
+      expect(err.tool).toBe('get_neighbors');
+      expect(err.message).toContain('NoSuchEntity');
     });
   });
 });
