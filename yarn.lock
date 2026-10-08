@@ -843,7 +843,7 @@
     "@opentelemetry/otlp-transformer" "0.220.0"
     "@opentelemetry/sdk-logs" "0.220.0"
 
-"@opentelemetry/exporter-metrics-otlp-grpc@0.220.0":
+"@opentelemetry/exporter-metrics-otlp-grpc@0.220.0", "@opentelemetry/exporter-metrics-otlp-grpc@^0.220.0":
   version "0.220.0"
   resolved "https://registry.yarnpkg.com/@opentelemetry/exporter-metrics-otlp-grpc/-/exporter-metrics-otlp-grpc-0.220.0.tgz#edc452e205864794d0f5031edd46b36587761907"
   integrity sha512-U128izvJfX/dW9jRGP0gIfadR1Hg7ft3UEGIeRxLFK70m2BWw6AtNCOnsUygpw2zCgR/ygdWbGpcL6TmhW0ZGw==
@@ -856,31 +856,6 @@
     "@opentelemetry/otlp-transformer" "0.220.0"
     "@opentelemetry/resources" "2.9.0"
     "@opentelemetry/sdk-metrics" "2.9.0"
-
-"@opentelemetry/exporter-metrics-otlp-grpc@^0.219.0":
-  version "0.219.0"
-  resolved "https://registry.yarnpkg.com/@opentelemetry/exporter-metrics-otlp-grpc/-/exporter-metrics-otlp-grpc-0.219.0.tgz#b9d1ede26f45adfbcbf087dd7d4065dfc1268121"
-  integrity sha512-6LaaSrPxK5L55bXevWajvOMxGOpNm0n12tG53TeZaUeNzXwLPg6d2KCC1zAlGsojan+xRG71mA4Qqs9K2VVrKQ==
-  dependencies:
-    "@grpc/grpc-js" "^1.14.3"
-    "@opentelemetry/core" "2.8.0"
-    "@opentelemetry/exporter-metrics-otlp-http" "0.219.0"
-    "@opentelemetry/otlp-exporter-base" "0.219.0"
-    "@opentelemetry/otlp-grpc-exporter-base" "0.219.0"
-    "@opentelemetry/otlp-transformer" "0.219.0"
-    "@opentelemetry/resources" "2.8.0"
-    "@opentelemetry/sdk-metrics" "2.8.0"
-
-"@opentelemetry/exporter-metrics-otlp-http@0.219.0":
-  version "0.219.0"
-  resolved "https://registry.yarnpkg.com/@opentelemetry/exporter-metrics-otlp-http/-/exporter-metrics-otlp-http-0.219.0.tgz#aed2238678486434cff020cbdfef07b24f1370b6"
-  integrity sha512-6CaDRbMVHZSDWzNXwrR8y/H4B/Z1eMNnkHiPQlTx3Ojz2OHY4X/aff/UC4P/3pHUQSuTfi3oh2UsPPZppw+Vrg==
-  dependencies:
-    "@opentelemetry/core" "2.8.0"
-    "@opentelemetry/otlp-exporter-base" "0.219.0"
-    "@opentelemetry/otlp-transformer" "0.219.0"
-    "@opentelemetry/resources" "2.8.0"
-    "@opentelemetry/sdk-metrics" "2.8.0"
 
 "@opentelemetry/exporter-metrics-otlp-http@0.220.0":
   version "0.220.0"
