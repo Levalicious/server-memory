@@ -67,6 +67,11 @@ static void wstr(wr_t *w, const u8 *s, u16 l) {
         memcpy(w->buf + w->len, s, l); w->len += l;
     }
 }
+static u64 f64bits(double d) { u64 u; memcpy(&u, &d, 8); return u; }
+static int cmp_u32asc(const void *a, const void *b) {
+    u32 x = *(const u32 *)a, y = *(const u32 *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
 
 /* ---------- daemon state ---------- */
 
@@ -332,16 +337,112 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
     case OP_RANDOM_WALK: {
         u16 nl; const u8 *nm = rstr(r, &nl);
         u32 depth = r32(r); u8 dir = r8(r); u8 merw = r8(r); u64 seed = r64(r);
+        u8 avoid = (r->p < r->end) ? r8(r) : 0;   /* v1.1 optional trailing field */
         if (r->err || depth > 256) { err_reply(w, "bad req"); return ST_ERR; }
         u32 eid = lookup_or0(k, nm, nl);
         if (!eid) { err_reply(w, "no such entity"); return ST_ERR; }
         u32 *path = (u32 *)malloc((size_t)(depth + 1) * 4);
         if (!path) { err_reply(w, "oom"); return ST_ERR; }
-        u32 n = g4_random_walk(k->g, eid, depth, wire_dir(dir), merw, seed,
-                               path, depth + 1);
+        u32 uniform_steps = 0;
+        u32 n = g4_random_walk(k->g, eid, depth, wire_dir(dir), merw, seed, avoid,
+                               path, depth + 1, &uniform_steps);
         w32(w, n);
         for (u32 i = 0; i < n && i <= depth; i++) { put_name(k, w, path[i]); pw_add(k, path[i]); }
+        w32(w, uniform_steps);                    /* v1.1 trailer */
         free(path);
+        return ST_OK;
+    }
+    case OP_RANKS: {
+        u32 n = r32(r);
+        if (r->err || n > 100000) { err_reply(w, "bad batch"); return ST_ERR; }
+        w64(w, g4_walker_total(k->g));
+        w64(w, g4_structural_total(k->g));
+        for (u32 i = 0; i < n; i++) {
+            u16 nl; const u8 *nm = rstr(r, &nl);
+            if (r->err) { err_reply(w, "trunc"); return ST_ERR; }
+            u32 eid = lookup_or0(k, nm, nl);
+            w64(w, f64bits(eid ? g4_walker_rank(k->g, eid) : 0.0));
+            w64(w, f64bits(eid ? g4_structural_rank(k->g, eid) : 0.0));
+            w64(w, f64bits(eid ? g4_get_psi(k->g, eid) : 0.0));
+        }
+        return ST_OK;
+    }
+    case OP_RESAMPLE: {
+        /* One-shot rank refresh: structural sample + MERW psi in one txn
+         * (the shim's resample() after mutations). */
+        if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
+        if (k->dirty_counters) pw_flush_in_txn(k);
+        g4_structural_sample(k->g, 1, 0.85);
+        g4_compute_merw_psi(k->g, 0.85, 200, 1e-8);
+        if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
+        return ST_OK;
+    }
+    case OP_VALIDATE: {
+        u32 total = g4_entity_count(k->g);
+        u32 *ids = (u32 *)malloc((size_t)(total ? total : 1) * 4);
+        if (!ids) { err_reply(w, "oom"); return ST_ERR; }
+        u32 n = g4_list_entities(k->g, ids, total);
+        u32 nviol = 0;
+        for (u32 i = 0; i < n; i++) {               /* pass 1: count */
+            g4_entity_t e;
+            if (!g4_read_entity(k->g, ids[i], &e)) continue;
+            u8 over = 0; u16 l;
+            if (e.obs_count >= 1 && g4_str(k->g, e.obs0_sid, &l) && l > 140) over |= 1;
+            if (e.obs_count >= 2 && g4_str(k->g, e.obs1_sid, &l) && l > 140) over |= 2;
+            if (e.obs_count > 2 || over) nviol++;
+        }
+        w32(w, 0);              /* missingEntities: structurally impossible in v4 */
+        w32(w, nviol);
+        for (u32 i = 0; i < n; i++) {               /* pass 2: emit */
+            g4_entity_t e;
+            if (!g4_read_entity(k->g, ids[i], &e)) continue;
+            u8 over = 0; u16 l;
+            if (e.obs_count >= 1 && g4_str(k->g, e.obs0_sid, &l) && l > 140) over |= 1;
+            if (e.obs_count >= 2 && g4_str(k->g, e.obs1_sid, &l) && l > 140) over |= 2;
+            if (e.obs_count > 2 || over) {
+                put_name(k, w, ids[i]);
+                w8(w, e.obs_count);
+                w8(w, over);
+            }
+        }
+        free(ids);
+        return ST_OK;
+    }
+    case OP_SCAN: {
+        u32 after = r32(r), max = r32(r);
+        if (r->err || max > 4096) { err_reply(w, "bad req"); return ST_ERR; }
+        u32 total = g4_entity_count(k->g);
+        u32 *ids = (u32 *)malloc((size_t)(total ? total : 1) * 4);
+        if (!ids) { err_reply(w, "oom"); return ST_ERR; }
+        u32 n = g4_list_entities(k->g, ids, total);
+        qsort(ids, n, sizeof *ids, cmp_u32asc);
+        u32 sel0 = 0, sel_n = 0;
+        for (u32 i = 0; i < n; i++) {
+            if (ids[i] <= after) continue;
+            if (sel_n == 0) sel0 = i;
+            sel_n++;
+            if (sel_n >= max) break;
+        }
+        u32 next_eid = 0;
+        if (sel_n) {
+            u32 last = ids[sel0 + sel_n - 1];
+            next_eid = (sel0 + sel_n < n) ? last : 0;   /* 0 = drained */
+        }
+        w32(w, next_eid);
+        w32(w, sel_n);
+        for (u32 i = 0; i < sel_n; i++) {
+            u32 eid = ids[sel0 + i];
+            g4_entity_t e;
+            w32(w, eid);
+            if (!g4_read_entity(k->g, eid, &e)) { wstr(w, (const u8 *)"", 0); wstr(w, (const u8 *)"", 0); w8(w, 0); continue; }
+            u16 l = 0; const u8 *b;
+            b = g4_str(k->g, e.name_sid, &l); wstr(w, b, l);
+            b = g4_str(k->g, e.type_sid, &l); wstr(w, b, l);
+            w8(w, e.obs_count);
+            if (e.obs_count >= 1) { b = g4_str(k->g, e.obs0_sid, &l); wstr(w, b, l); }
+            if (e.obs_count >= 2) { b = g4_str(k->g, e.obs1_sid, &l); wstr(w, b, l); }
+        }
+        free(ids);
         return ST_OK;
     }
     default:

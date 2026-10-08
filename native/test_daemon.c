@@ -377,6 +377,113 @@ int main(void) {
     }
     PASS();
 
+    TEST(ranks_resample_validate_scan);
+    {
+        /* RESAMPLE: structural sample + MERW psi in one txn */
+        pl_reset(&pl);
+        assert(cl_call(fd, 50, OP_RESAMPLE, &pl, &body) == ST_OK);
+        assert(body.n == 0);
+        free(body.b);
+
+        /* RANKS: totals + per-name values; unknown name -> zeros */
+        pl_reset(&pl);
+        w32(&pl, 2); pl_str(&pl, "Self"); pl_str(&pl, "NoSuchName");
+        assert(cl_call(fd, 51, OP_RANKS, &pl, &body) == ST_OK);
+        rd_t r = body_rd(&body);
+        u64 wtot = r64(&r), stot = r64(&r);
+        assert(stot > 0);                                  /* resample populated it */
+        double self_srank;
+        { u64 b2 = r64(&r); (void)b2; }                    /* walker rank */
+        { u64 b2 = r64(&r); memcpy(&self_srank, &b2, 8); } /* structural rank */
+        { u64 b2 = r64(&r); (void)b2; }                    /* psi */
+        assert(self_srank >= 0.0);
+        double missing_wr;
+        { u64 b2 = r64(&r); memcpy(&missing_wr, &b2, 8); } /* NoSuchName walker rank */
+        r64(&r); r64(&r);
+        assert(missing_wr == 0.0);
+        (void)wtot;
+        free(body.b);
+
+        /* VALIDATE: flag exactly one oversized observation */
+        pl_reset(&pl);
+        w32(&pl, 1); pl_str(&pl, "BadObs"); pl_str(&pl, "t"); w64(&pl, 300);
+        assert(cl_call(fd, 52, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        char longobs[160];
+        memset(longobs, 'x', 155); longobs[155] = 0;
+        w32(&pl, 1); pl_str(&pl, "BadObs"); pl_str(&pl, longobs); w64(&pl, 301);
+        assert(cl_call(fd, 53, OP_ADD_OBS, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        assert(cl_call(fd, 54, OP_VALIDATE, &pl, &body) == ST_OK);
+        r = body_rd(&body);
+        assert(r32(&r) == 0);                              /* no missing entities */
+        assert(r32(&r) == 1);                              /* one violation */
+        expect_name(&r, "BadObs");
+        assert(r8(&r) == 1 && r8(&r) == 1);                /* count 1, over_mask bit 0 */
+        free(body.b);
+
+        /* SCAN: drain the KB in chunks of 2; every entity exactly once */
+        u32 seen = 0, cur = 0, guard = 0;
+        do {
+            pl_reset(&pl);
+            w32(&pl, cur); w32(&pl, 2);
+            assert(cl_call(fd, 60 + guard, OP_SCAN, &pl, &body) == ST_OK);
+            r = body_rd(&body);
+            cur = r32(&r);
+            u32 cnt = r32(&r);
+            for (u32 i = 0; i < cnt; i++) {
+                r32(&r);                                   /* eid */
+                u16 l; rstr(&r, &l);                       /* name */
+                rstr(&r, &l);                              /* type */
+                u8 oc = r8(&r);
+                for (u8 o = 0; o < oc; o++) rstr(&r, &l);
+                seen++;
+            }
+            free(body.b);
+        } while (cur != 0 && ++guard < 200);
+        assert(guard < 200);
+        pl_reset(&pl);
+        assert(cl_call(fd, 80, OP_STATS, &pl, &body) == ST_OK);
+        r = body_rd(&body);
+        u32 ents = r32(&r);
+        free(body.b);
+        assert(seen == ents);
+    }
+    PASS();
+
+    TEST(random_walk_avoid_cycles);
+    {
+        pl_reset(&pl);
+        w32(&pl, 2);
+        pl_str(&pl, "LoopL"); pl_str(&pl, "t"); w64(&pl, 400);
+        pl_str(&pl, "LoopR"); pl_str(&pl, "t"); w64(&pl, 401);
+        assert(cl_call(fd, 90, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 2);
+        pl_str(&pl, "LoopL"); pl_str(&pl, "LoopR"); pl_str(&pl, "loops"); w64(&pl, 402);
+        pl_str(&pl, "LoopR"); pl_str(&pl, "LoopL"); pl_str(&pl, "loops"); w64(&pl, 402);
+        assert(cl_call(fd, 91, OP_CREATE_RELATIONS, &pl, &body) == ST_OK);
+        free(body.b);
+        for (int mode = 0; mode < 2; mode++) {
+            pl_reset(&pl);
+            pl_str(&pl, "LoopL"); w32(&pl, 5); w8(&pl, 0); w8(&pl, 1); w64(&pl, 7);
+            w8(&pl, (u8)mode);                             /* avoid_cycles */
+            assert(cl_call(fd, 92 + (u32)mode, OP_RANDOM_WALK, &pl, &body) == ST_OK);
+            rd_t r = body_rd(&body);
+            u32 n = r32(&r);
+            for (u32 i = 0; i < n; i++) { u16 l; rstr(&r, &l); }
+            u32 us = r32(&r);                              /* v1.1 trailer present */
+            free(body.b);
+            assert(us >= 1);                               /* psi 0 on fresh nodes -> fallback counted */
+            if (mode == 0) assert(n == 6);                 /* cycles freely: L,R,L,R,L,R */
+            else           assert(n == 2);                 /* self-avoiding: L,R then stop */
+        }
+    }
+    PASS();
+
     close(fd);
     stop_daemon(pid);
     free(pl.buf);

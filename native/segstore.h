@@ -561,9 +561,14 @@ u32    g4_relation_count(graph4_t *g);                      /* O(E) fwd sweep */
 u32    g4_structural_sample(graph4_t *g, u32 iterations, double damping);
 /* MERW psi power iteration (warm-started from stored psi); returns iters */
 u32    g4_compute_merw_psi(graph4_t *g, double alpha, u32 max_iter, double tol);
-/* random walk; merw_mode weights by target psi; seed 0 = global rng */
+/* random walk; merw_mode weights by target psi; seed 0 = global rng.
+ * avoid_cycles: 1 = self-avoiding (never revisits a node; stops early when
+ * every neighbor is already on the path).
+ * out_uniform_steps (optional): merw-requested steps that fell back to
+ * uniform sampling because psi weighting was unavailable at that step. */
 u32    g4_random_walk(graph4_t *g, u32 start, u32 depth, u32 direction,
-                      int merw_mode, u64 seed, u32 *out_path, u32 max_path);
+                      int merw_mode, u64 seed, int avoid_cycles, u32 *out_path, u32 max_path,
+                      u32 *out_uniform_steps);
 /* migration support: restore preserved fields on an existing entity */
 int    g4_set_entity_fields(graph4_t *g, u32 eid, u64 mtime, u64 obs_mtime,
                             u64 svis, u64 wvis, double psi);

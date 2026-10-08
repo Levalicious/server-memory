@@ -738,8 +738,8 @@ int main(void) {
 
         /* random walk: valid, seeded-deterministic */
         u32 p1[16], p2[16];
-        u32 n1 = g4_random_walk(g, a, 8, G4_DIR_FORWARD, 0, 777, p1, 16);
-        u32 n2 = g4_random_walk(g, a, 8, G4_DIR_FORWARD, 0, 777, p2, 16);
+        u32 n1 = g4_random_walk(g, a, 8, G4_DIR_FORWARD, 0, 777, 0, p1, 16, NULL);
+        u32 n2 = g4_random_walk(g, a, 8, G4_DIR_FORWARD, 0, 777, 0, p2, 16, NULL);
         assert(n1 == n2 && n1 >= 2);
         for (u32 i = 0; i < n1; i++) assert(p1[i] == p2[i]);
         assert(p1[0] == a);
@@ -752,7 +752,7 @@ int main(void) {
             assert(found);
         }
         /* merw mode also valid */
-        u32 n3 = g4_random_walk(g, a, 8, G4_DIR_ANY, 1, 123, p1, 16);
+        u32 n3 = g4_random_walk(g, a, 8, G4_DIR_ANY, 1, 123, 0, p1, 16, NULL);
         assert(n3 >= 1 && p1[0] == a);
 
         /* totals survive reopen via record scan: commit + check set_fields */

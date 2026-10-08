@@ -1351,11 +1351,13 @@ u32 g4_structural_sample(graph4_t *g, u32 iterations, double damping) {
 }
 
 u32 g4_random_walk(graph4_t *g, u32 start, u32 depth, u32 direction,
-                   int merw_mode, u64 seed, u32 *out_path, u32 max_path) {
+                   int merw_mode, u64 seed, int avoid_cycles, u32 *out_path, u32 max_path,
+                   u32 *out_uniform_steps) {
     g4_entity_t e0;
     if (!g4_read_entity(g, start, &e0)) return 0;
     u64 st = seed ? seed : g4_rng_state;
     u32 plen = 0;
+    u32 uniform_steps = 0;
     if (max_path >= 1) out_path[plen] = start;
     plen = 1;
     u32 cur = start;
@@ -1372,6 +1374,16 @@ u32 g4_random_walk(graph4_t *g, u32 start, u32 depth, u32 direction,
         for (u32 k = 0; k < ec; k++) {
             if (!g4_dir_match(direction, es[k].direction)) continue;
             u32 t = es[k].target_eid; if (t == cur) continue;
+            if (avoid_cycles) {
+                /* Self-avoiding walk: skip any node already on the path (the
+                 * path prefix doubles as the visited set; max_path >= depth+1
+                 * from callers, so the prefix is complete). All visited ->
+                 * nc == 0 below -> stops early. */
+                u32 vmax = plen < max_path ? plen : max_path;
+                int seen = 0;
+                for (u32 j = 0; j < vmax; j++) if (out_path[j] == t) { seen = 1; break; }
+                if (seen) continue;
+            }
             double p = g4_get_psi(g, t);
             int found = 0;
             for (u32 j = 0; j < nc; j++) if (cand[j] == t) { if (p > cpsi[j]) cpsi[j] = p; found = 1; break; }
@@ -1385,6 +1397,7 @@ u32 g4_random_walk(graph4_t *g, u32 start, u32 depth, u32 direction,
             double r = g4_rng_d(&st) * total_psi, cum = 0; chosen = cand[nc - 1];
             for (u32 j = 0; j < nc; j++) { cum += cpsi[j]; if (r <= cum) { chosen = cand[j]; break; } }
         } else {
+            if (merw_mode) uniform_steps++;   /* psi unavailable at this step: fallback */
             u32 ix = (u32)(g4_rng_d(&st) * nc); if (ix >= nc) ix = nc - 1; chosen = cand[ix];
         }
         free(cand); free(cpsi);
@@ -1393,6 +1406,7 @@ u32 g4_random_walk(graph4_t *g, u32 start, u32 depth, u32 direction,
         plen++;
     }
     if (!seed) g4_rng_state = st;
+    if (out_uniform_steps) *out_uniform_steps = uniform_steps;
     return plen;
 }
 
