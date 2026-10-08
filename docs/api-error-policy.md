@@ -31,8 +31,9 @@ Every failure the caller can act on is returned as a tool-level error:
 
 Stable codes: `ENTITY_NOT_FOUND`, `TYPE_NOT_FOUND`, `ENDPOINT_MISSING`,
 `COLLISION`, `LIMIT_EXCEEDED`, `INVALID_REGEX`, `INVALID_FILE`,
-`NO_MATCHES`, `VALIDATION_FAILED`. JSON-RPC protocol errors are reserved for
-genuine server faults and are never used for caller-actionable failures.
+`NO_MATCHES`, `CURSOR_STALE`, `VALIDATION_FAILED`. JSON-RPC protocol errors
+are reserved for genuine server faults and are never used for
+caller-actionable failures.
 
 **R2 — Validate-first, atomic.**
 A mutation validates the entire request under the write lock before touching
@@ -84,10 +85,14 @@ faults; Q1 = atomic-fail on missing endpoints; Q2/Q3 = error.
   (drops→errors: `ENDPOINT_MISSING`, all-missing `open_nodes`,
   `TYPE_NOT_FOUND`, unknown starts), `INVALID_FILE`, `INVALID_REGEX`,
   `NO_MATCHES` envelope.
-- **Ledger PR:** R3 result ledgers + report fields
+- **Ledger PR (#248, merged):** R3 result ledgers + report fields
   (`created`/`existing`/`skippedDuplicates`/`notFound`/`alreadyPresent`,
   `open_nodes.missing[]`, `random_walk.modeUsed`/`fallbackSteps`,
   `sequentialthinking.linkedTo`).
-- **Next:** R5 cursor fingerprinting (`CURSOR_STALE`).
+- **Cursor PR (this change):** R5 — cursors are `<index>:<fnv32(result set)>`;
+  any change to the set between pages → visible `CURSOR_STALE`; malformed
+  cursors rejected; bare-number cursors accepted as legacy (unchecked).
+  Prerequisite shipped in the same change: all sort tie-breaks are
+  deterministic (name), so result sets have a stable total order.
 - **v4 line (`feat/libsegstore`):** inherits this policy at reconciliation;
   kbd4's batch=txn=commit model is the natural home for R2 atomicity.
