@@ -42,6 +42,7 @@ export type ToolErrorCode =
   | 'INVALID_REGEX'
   | 'INVALID_FILE'
   | 'NO_MATCHES'
+  | 'CURSOR_STALE'
   | 'VALIDATION_FAILED';
 
 /**
@@ -157,7 +158,8 @@ export interface KnowledgeGraph {
 
 export interface PaginatedResult<T> {
   items: T[];
-  nextCursor: number | null;
+  /** Opaque "<index>:<fingerprint>" token, or null when the drain is complete. */
+  nextCursor: string | null;
   totalCount: number;
 }
 
@@ -212,7 +214,7 @@ function sortEntities(
       const bRank = rankMaps?.structural.get(b.name) ?? 0;
       const diff = aRank - bRank;
       if (diff !== 0) return mult * diff;
-      return Math.random() - 0.5; // random tiebreak
+      return a.name.localeCompare(b.name); // deterministic tiebreak (R5: total order keeps pagination stable)
     }
     if (sortBy === "llmrank") {
       // Primary: walker rank
@@ -225,8 +227,8 @@ function sortEntities(
       const bStruct = rankMaps?.structural.get(b.name) ?? 0;
       const structDiff = aStruct - bStruct;
       if (structDiff !== 0) return mult * structDiff;
-      // Final: random tiebreak
-      return Math.random() - 0.5;
+      // Final: deterministic tiebreak — a total order keeps pagination stable (R5)
+      return a.name.localeCompare(b.name);
     }
     // For timestamps, treat undefined as 0 (oldest)
     const aVal = a[sortBy] ?? 0;
@@ -257,7 +259,7 @@ function sortNeighbors(
       const bRank = rankMaps?.structural.get(b.name) ?? 0;
       const diff = aRank - bRank;
       if (diff !== 0) return mult * diff;
-      return Math.random() - 0.5;
+      return a.name.localeCompare(b.name);
     }
     if (sortBy === "llmrank") {
       const aWalker = rankMaps?.walker.get(a.name) ?? 0;
@@ -268,7 +270,7 @@ function sortNeighbors(
       const bStruct = rankMaps?.structural.get(b.name) ?? 0;
       const structDiff = aStruct - bStruct;
       if (structDiff !== 0) return mult * structDiff;
-      return Math.random() - 0.5;
+      return a.name.localeCompare(b.name);
     }
     const aVal = a[sortBy] ?? 0;
     const bVal = b[sortBy] ?? 0;
@@ -279,8 +281,41 @@ function sortNeighbors(
 export const MAX_CHARS = 4096;
 
 /**
+ * FNV-1a (32-bit) over a string; `seed` lets callers stream multiple strings
+ * into one hash. Used for result-set fingerprints.
+ */
+function fnv1a32(s: string, seed = 0x811c9dc5): number {
+  let h = seed;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Fingerprint of a result set: FNV-1a over every item's serialized form — the
+ * exact bytes pagination boundaries are computed over — so any change to the
+ * set's content or order changes the fingerprint.
+ */
+function resultSetFingerprint<T>(items: T[]): string {
+  let h = 0x811c9dc5;
+  for (const item of items) {
+    h = fnv1a32(JSON.stringify(item), h);
+    h = fnv1a32('\u001f', h);
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+/**
  * Paginate `items` starting at `cursor`, producing a page no larger than
  * `maxChars` (best-effort).
+ *
+ * Policy R5 (docs/api-error-policy.md): a cursor is `"<index>:<fingerprint>"`
+ * for the result set it came from. If the set has changed since the cursor was
+ * issued (content or order), the page boundaries have silently shifted, so the
+ * call errors with CURSOR_STALE rather than serving a wrong page. Bare numbers
+ * are accepted as legacy cursors and are NOT staleness-checked.
  *
  * Forward-progress invariant: every call advances the cursor by at least one
  * item, even when that item's JSON exceeds `maxChars`. Without this guarantee,
@@ -293,12 +328,37 @@ export const MAX_CHARS = 4096;
  * alternative (skipping the item, or returning an error) hides data from the
  * caller and makes downstream pagination inconsistent.
  */
-function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
+function paginateItems<T>(items: T[], cursor: number | string = 0, maxChars: number = MAX_CHARS): PaginatedResult<T> {
+  // Parse the cursor first; a malformed one is a stale/invalid cursor.
+  let i = 0;
+  let expected: string | null = null;
+  if (typeof cursor === 'string') {
+    const sep = cursor.indexOf(':');
+    const idx = sep >= 0 ? Number(cursor.slice(0, sep)) : NaN;
+    if (!Number.isInteger(idx) || idx < 0) {
+      throw new ToolError('CURSOR_STALE', `Malformed cursor ${JSON.stringify(cursor)}; re-run the query and page from the start.`);
+    }
+    i = idx;
+    expected = cursor.slice(sep + 1);
+  } else if (typeof cursor === 'number' && Number.isFinite(cursor) && cursor >= 0) {
+    i = Math.floor(cursor);
+  } else {
+    throw new ToolError('CURSOR_STALE', 'Invalid cursor value; re-run the query and page from the start.');
+  }
+
+  const fingerprint = resultSetFingerprint(items);
+  if (expected !== null && expected !== fingerprint) {
+    throw new ToolError(
+      'CURSOR_STALE',
+      `Result set changed since this cursor was issued (fingerprint ${expected} -> ${fingerprint}); re-run the query and page from the start.`,
+      { cursorIndex: i, totalCount: items.length },
+    );
+  }
+
   const result: T[] = [];
-  let i = cursor;
 
   // Calculate overhead for wrapper: {"items":[],"nextCursor":null,"totalCount":123}
-  const wrapperTemplate = { items: [] as T[], nextCursor: null as number | null, totalCount: items.length };
+  const wrapperTemplate = { items: [] as T[], nextCursor: null as string | null, totalCount: items.length };
   const overhead = JSON.stringify(wrapperTemplate).length;
   let charCount = overhead;
 
@@ -323,8 +383,7 @@ function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX
     i++;
   }
 
-  // Update nextCursor - recalculate if we stopped early (cursor digits may differ from null)
-  const nextCursor = i < items.length ? i : null;
+  const nextCursor = i < items.length ? `${i}:${fingerprint}` : null;
 
   return {
     items: result,
@@ -333,7 +392,7 @@ function paginateItems<T>(items: T[], cursor: number = 0, maxChars: number = MAX
   };
 }
 
-function paginateGraph(graph: KnowledgeGraph, entityCursor: number = 0, relationCursor: number = 0): { entities: PaginatedResult<Entity>; relations: PaginatedResult<Relation> } {
+function paginateGraph(graph: KnowledgeGraph, entityCursor: number | string = 0, relationCursor: number | string = 0): { entities: PaginatedResult<Entity>; relations: PaginatedResult<Relation> } {
   // Entities and relations have independent cursors, so paginate them
   // independently — each gets the full budget.  The caller already has
   // previously-returned pages and only needs the next page of whichever
@@ -1612,8 +1671,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction filter for returned relations. Default: forward" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
-            entityCursor: { type: "number", description: "Cursor for entity pagination (from previous response's nextCursor)" },
-            relationCursor: { type: "number", description: "Cursor for relation pagination" },
+            entityCursor: { type: ["number", "string"], description: "Opaque entity page cursor; pass back exactly what nextCursor returned" },
+            relationCursor: { type: ["number", "string"], description: "Opaque relation page cursor; pass back exactly what nextCursor returned" },
           },
           required: ["query"],
         },
@@ -1630,8 +1689,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "An array of entity names to retrieve",
             },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction filter for returned relations. Default: forward" },
-            entityCursor: { type: "number", description: "Cursor for entity pagination" },
-            relationCursor: { type: "number", description: "Cursor for relation pagination" },
+            entityCursor: { type: ["number", "string"], description: "Opaque entity page cursor; pass back exactly what nextCursor returned" },
+            relationCursor: { type: ["number", "string"], description: "Opaque relation page cursor; pass back exactly what nextCursor returned" },
           },
           required: ["names"],
         },
@@ -1647,7 +1706,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for neighbors. Omit for arbitrary order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
           required: ["entityName"],
         },
@@ -1662,7 +1721,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             toEntity: { type: "string", description: "The name of the target entity" },
             maxDepth: { type: "number", description: "Maximum depth to search (default: 5)", default: 5 },
             direction: { type: "string", enum: ["forward", "backward", "any"], description: "Edge direction to follow. Default: forward" },
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
           required: ["fromEntity", "toEntity"],
         },
@@ -1676,7 +1735,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             entityType: { type: "string", description: "The type of entities to retrieve" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
           required: ["entityType"],
         },
@@ -1687,7 +1746,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
         },
       },
@@ -1697,7 +1756,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
         },
       },
@@ -1718,7 +1777,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             strict: { type: "boolean", description: "If true, returns entities not connected to 'Self' (directly or indirectly). Default: false" },
             sortBy: { type: "string", enum: ["mtime", "obsMtime", "name", "pagerank", "llmrank"], description: "Sort field for entities. Omit for insertion order." },
             sortDir: { type: "string", enum: ["asc", "desc"], description: "Sort direction. Default: desc for timestamps, asc for name." },
-            cursor: { type: "number", description: "Cursor for pagination" },
+            cursor: { type: ["number", "string"], description: "Opaque page cursor; pass back exactly what nextCursor returned. Bare numbers are accepted for legacy callers (no staleness check)." },
           },
         },
       },
@@ -1728,8 +1787,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            entitiesCursor: { type: "number", description: "Cursor for the missingEntities list" },
-            violationsCursor: { type: "number", description: "Cursor for the observationViolations list" },
+            entitiesCursor: { type: ["number", "string"], description: "Opaque cursor for the missingEntities list; pass back exactly what nextCursor returned" },
+            violationsCursor: { type: ["number", "string"], description: "Opaque cursor for the observationViolations list; pass back exactly what nextCursor returned" },
           },
         },
       },
@@ -1892,26 +1951,26 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
 
         // Record walker visits for entities that will be returned to the LLM
         knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
-        return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, (args.entityCursor as number | string | undefined) ?? 0, (args.relationCursor as number | string | undefined) ?? 0)) }] };
       }
       case "open_nodes": {
         const graph = await knowledgeGraphManager.openNodes(args.names as string[], (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
         // Record walker visits for opened nodes
         knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
         // R3: report partial misses alongside the (paginated) graph.
-        const paginated = paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0);
+        const paginated = paginateGraph(graph, (args.entityCursor as number | string | undefined) ?? 0, (args.relationCursor as number | string | undefined) ?? 0);
         return { content: [{ type: "text", text: JSON.stringify({ ...paginated, missing: graph.missing }) }] };
       }
       case "get_neighbors": {
         const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 0, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
         // Record walker visits for returned neighbors
         knowledgeGraphManager.recordWalkerVisits(neighbors.map(n => n.name));
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(neighbors, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "find_path": {
         const toEntityName = args.toEntity as string;
         const result = await knowledgeGraphManager.findPath(args.fromEntity as string, toEntityName, args.maxDepth as number, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
-        const paginated = paginateItems(result.path, args.cursor as number ?? 0);
+        const paginated = paginateItems(result.path, (args.cursor as number | string | undefined) ?? 0);
         // β-contract response. Pagination of `path` is unchanged; the
         // result wrapper additionally carries `targetReached` (did we
         // actually reach `toEntity`?), `budgetExhausted` (did we stop
@@ -1946,27 +2005,27 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
       }
       case "get_entities_by_type": {
         const entities = await knowledgeGraphManager.getEntitiesByType(args.entityType as string, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "get_entity_types": {
         const types = await knowledgeGraphManager.getEntityTypes();
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "get_relation_types": {
         const types = await knowledgeGraphManager.getRelationTypes();
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(types, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "get_stats":
         return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.getStats(), null, 2) }] };
       case "get_orphaned_entities": {
         const entities = await knowledgeGraphManager.getOrphanedEntities(args.strict as boolean ?? false, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined);
-        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, args.cursor as number ?? 0)) }] };
+        return { content: [{ type: "text", text: JSON.stringify(paginateItems(entities, (args.cursor as number | string | undefined) ?? 0)) }] };
       }
       case "validate_graph": {
         const report = await knowledgeGraphManager.validateGraph();
         return { content: [{ type: "text", text: JSON.stringify({
-          missingEntities: paginateItems(report.missingEntities, args.entitiesCursor as number ?? 0),
-          observationViolations: paginateItems(report.observationViolations, args.violationsCursor as number ?? 0),
+          missingEntities: paginateItems(report.missingEntities, (args.entitiesCursor as number | string | undefined) ?? 0),
+          observationViolations: paginateItems(report.observationViolations, (args.violationsCursor as number | string | undefined) ?? 0),
         }) }] };
       }
       case "decode_timestamp":

@@ -7,7 +7,7 @@ export { MAX_CHARS };
 
 export interface PaginatedResult<T> {
   items: T[];
-  nextCursor: number | null;
+  nextCursor: string | null;
   totalCount: number;
 }
 

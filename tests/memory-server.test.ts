@@ -259,7 +259,7 @@ describe('MCP Memory Server E2E Tests', () => {
     it('should search by regex pattern', async () => {
       // Accumulate all entities across pagination
       const allEntities: Entity[] = [];
-      let entityCursor: number | null = 0;
+      let entityCursor: string | number | null = 0;
 
       while (entityCursor !== null) {
         const result = await callTool(client, 'search_nodes', {
@@ -279,7 +279,7 @@ describe('MCP Memory Server E2E Tests', () => {
     it('should search with alternation', async () => {
       // Accumulate all entities across pagination
       const allEntities: Entity[] = [];
-      let entityCursor: number | null = 0;
+      let entityCursor: string | number | null = 0;
 
       while (entityCursor !== null) {
         const result = await callTool(client, 'search_nodes', {
@@ -345,7 +345,7 @@ describe('MCP Memory Server E2E Tests', () => {
       // result sets, not nondeterministic top-llmrank pages.
       async function drainAll(query: string): Promise<Set<string>> {
         const out = new Set<string>();
-        let cursor: number | null = 0;
+        let cursor: string | number | null = 0;
         while (cursor !== null) {
           const r = await callTool(client, 'search_nodes', {
             query, sortBy: 'name', sortDir: 'asc', entityCursor: cursor,
@@ -452,7 +452,7 @@ describe('MCP Memory Server E2E Tests', () => {
       });
 
       const allEntities: Entity[] = [];
-      let entityCursor: number | null = 0;
+      let entityCursor: string | number | null = 0;
       let iterations = 0;
       const ITERATION_CAP = 50;  // any healthy graph fits in << 50 pages here
 
@@ -1840,7 +1840,7 @@ describe('MCP Memory Server E2E Tests', () => {
 
         // Fetch all pages sorted by name descending
         const allEntities: Entity[] = [];
-        let entityCursor: number | null = 0;
+        let entityCursor: string | number | null = 0;
 
         while (entityCursor !== null) {
           const result = await callTool(client, 'search_nodes', {
@@ -2391,6 +2391,74 @@ describe('MCP Memory Server E2E Tests', () => {
 
       const second = await callTool(client, 'sequentialthinking', { observations: ['ledger thought 2'], previousCtxId: first.ctxId }) as { ctxId: string; linkedTo: string | null };
       expect(second.linkedTo).toBe(first.ctxId);
+    });
+  });
+
+  describe('API cursor integrity (R5)', () => {
+    async function seedCursorTag(count: number) {
+      const entities = Array.from({ length: count }, (_, i) => ({
+        name: `CursorTag${String(i).padStart(2, '0')}`,
+        entityType: 'CursorTag',
+        observations: ['x'.repeat(100)],
+      }));
+      await callTool(client, 'create_entities', { entities });
+    }
+
+    it('a stale cursor errors instead of serving a shifted page', async () => {
+      await seedCursorTag(30);
+
+      const page1 = await callTool(client, 'get_entities_by_type', {
+        entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc',
+      }) as PaginatedResult<Entity>;
+      expect(page1.nextCursor).not.toBeNull();
+      expect(typeof page1.nextCursor).toBe('string');
+
+      // Mutate the result set between pages.
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'CursorTagNew', entityType: 'CursorTag', observations: ['y'.repeat(100)] }],
+      });
+
+      const raw = await callToolRaw(client, 'get_entities_by_type', {
+        entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc', cursor: page1.nextCursor,
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('CURSOR_STALE');
+    });
+
+    it('an unchanged set drains cleanly via string cursors (no dupes, no gaps)', async () => {
+      await seedCursorTag(30);
+
+      const seen: string[] = [];
+      let cursor: string | number | null = 0;
+      let guard = 0;
+      while (cursor !== null && guard++ < 20) {
+        const page = await callTool(client, 'get_entities_by_type', {
+          entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc', cursor,
+        }) as PaginatedResult<Entity>;
+        seen.push(...page.items.map(e => e.name));
+        cursor = page.nextCursor;
+      }
+      expect(seen).toHaveLength(30);
+      expect(new Set(seen).size).toBe(30);
+    });
+
+    it('malformed cursors are rejected with CURSOR_STALE', async () => {
+      await seedCursorTag(1);
+      const raw = await callToolRaw(client, 'get_entities_by_type', {
+        entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc', cursor: 'garbage',
+      });
+      expect(raw.isError).toBe(true);
+      expect(parseToolError(raw).code).toBe('CURSOR_STALE');
+    });
+
+    it('legacy bare-number cursors still work (no staleness check)', async () => {
+      await seedCursorTag(30);
+      const page = await callTool(client, 'get_entities_by_type', {
+        entityType: 'CursorTag', sortBy: 'name', sortDir: 'asc', cursor: 1,
+      }) as PaginatedResult<Entity>;
+      expect(page.items.length).toBeGreaterThan(0);
+      // Starts at index 1 (the second item in name order), not at the head.
+      expect(page.items[0].name).toBe('CursorTag01');
     });
   });
 });
