@@ -134,8 +134,11 @@ u32    graph_structural_sample(graph_t *g, u32 iterations, double damping);  /* 
 u32    graph_compute_merw_psi(graph_t *g, double alpha, u32 max_iter, double tol);  /* iters run */
 /* random walk; mode: 1=merw (weighted by psi), 0=uniform; seed 0 = use global rng.
  * avoid_cycles: 1 = self-avoiding (never revisits a node; stops early when every
- * neighbor is already on the path). Returns path node count. */
+ * neighbor is already on the path). Returns path node count.
+ * out_uniform_steps (optional): number of merw-requested steps that fell back to
+ * uniform sampling because psi weighting was unavailable at that step. */
 u32    graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_mode,
-                         u64 seed, int avoid_cycles, u64 *out_path, u32 max_path);
+                         u64 seed, int avoid_cycles, u64 *out_path, u32 max_path,
+                         u32 *out_uniform_steps);
 
 #endif /* GRAPH_H */

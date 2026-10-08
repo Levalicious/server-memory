@@ -614,7 +614,7 @@ export class KnowledgeGraphManager {
     };
   }
 
-  async createEntities(entities: Entity[]): Promise<Entity[]> {
+  async createEntities(entities: Entity[]): Promise<{ created: Entity[]; existing: string[] }> {
     // Validate observation limits across the WHOLE batch first, collecting
     // every violation rather than stopping at the first (R2: validate-first;
     // the caller gets all offenders in one round-trip).
@@ -651,6 +651,7 @@ export class KnowledgeGraphManager {
       // Pass 1 — classify every entity before writing anything. A collision
       // fails the whole batch (R2: atomic) and lists every offender.
       const toCreate: Entity[] = [];
+      const existingNames: string[] = [];
       const collisions: { entity: string; code: ToolErrorCode; message: string }[] = [];
       for (const e of entities) {
         const existingOffset = this.db.lookup(e.name);
@@ -659,7 +660,7 @@ export class KnowledgeGraphManager {
           const sameType = existing.entityType === e.entityType;
           const sameObs = existing.observations.length === e.observations.length &&
             existing.observations.every((o, i) => o === e.observations[i]);
-          if (sameType && sameObs) continue; // exact duplicate: intent satisfied
+          if (sameType && sameObs) { existingNames.push(e.name); continue; } // exact duplicate: intent satisfied (R3 ledger)
           collisions.push({
             entity: e.name,
             code: 'COLLISION',
@@ -693,11 +694,11 @@ export class KnowledgeGraphManager {
         newEntities.push(newEntity);
       }
 
-      return newEntities;
+      return { created: newEntities, existing: existingNames };
     });
   }
 
-  async createRelations(relations: Relation[]): Promise<Relation[]> {
+  async createRelations(relations: Relation[]): Promise<{ created: Relation[]; skippedDuplicates: Relation[] }> {
     return this.withWriteLock(() => {
       const now = BigInt(Date.now());
 
@@ -731,6 +732,7 @@ export class KnowledgeGraphManager {
       // Pass 2 — create. Duplicates are already-satisfied intent and are
       // skipped (they become part of the result ledger under policy R3).
       const newRelations: Relation[] = [];
+      const skippedDuplicates: Relation[] = [];
       for (const r of relations) {
         const fromOffset = this.db.lookup(r.from);
         const toOffset = this.db.lookup(r.to);
@@ -738,23 +740,23 @@ export class KnowledgeGraphManager {
         const isDuplicate = this.db.edges(fromOffset).some(e =>
           e.direction === DIR_FORWARD && e.target === toOffset && e.relType === r.relationType
         );
-        if (isDuplicate) continue;
+        if (isDuplicate) { skippedDuplicates.push(r); continue; }
 
         // C owns the bidirectional edges + relType interning/refcounts.
         this.db.createRelation(fromOffset, toOffset, r.relationType, now);
         newRelations.push({ ...r, mtime: Number(now) });
       }
 
-      return newRelations;
+      return { created: newRelations, skippedDuplicates };
     });
   }
 
-  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
+  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[]; alreadyPresent: string[] }[]> {
     return this.withWriteLock(() => {
       // Pass 1 — validate the WHOLE batch before touching state (R2: atomic;
       // the old code validated inside the write loop, so a late failure left
       // earlier items applied). Collect every violation for one round-trip.
-      const pending: { entityName: string; offset: bigint; newObservations: string[] }[] = [];
+      const pending: { entityName: string; offset: bigint; newObservations: string[]; alreadyPresent: string[] }[] = [];
       const violations: { entityName: string; code: ToolErrorCode; message: string }[] = [];
 
       for (const o of observations) {
@@ -776,6 +778,7 @@ export class KnowledgeGraphManager {
 
         const existingObs = this.db.readEntity(offset).observations;
         const newObservations = o.contents.filter(content => !existingObs.includes(content));
+        const alreadyPresent = o.contents.filter(content => existingObs.includes(content));
         if (existingObs.length + newObservations.length > 2) {
           violations.push({
             entityName: o.entityName,
@@ -783,7 +786,7 @@ export class KnowledgeGraphManager {
             message: `adding ${newObservations.length} observation(s) would give ${existingObs.length + newObservations.length} total; maximum is 2`,
           });
         }
-        pending.push({ entityName: o.entityName, offset, newObservations });
+        pending.push({ entityName: o.entityName, offset, newObservations, alreadyPresent });
       }
 
       if (violations.length > 0) {
@@ -797,53 +800,78 @@ export class KnowledgeGraphManager {
 
       // Pass 2 — apply.
       const now = BigInt(Date.now());
-      const results: { entityName: string; addedObservations: string[] }[] = [];
+      const results: { entityName: string; addedObservations: string[]; alreadyPresent: string[] }[] = [];
       for (const p of pending) {
         for (const obs of p.newObservations) {
           this.db.addObservation(p.offset, obs, now);
         }
-        results.push({ entityName: p.entityName, addedObservations: p.newObservations });
+        results.push({ entityName: p.entityName, addedObservations: p.newObservations, alreadyPresent: p.alreadyPresent });
       }
 
       return results;
     });
   }
 
-  async deleteEntities(entityNames: string[]): Promise<void> {
-    this.withWriteLock(() => {
+  async deleteEntities(entityNames: string[]): Promise<{ deleted: string[]; notFound: string[] }> {
+    return this.withWriteLock(() => {
+      const deleted: string[] = [];
+      const notFound: string[] = [];
       for (const name of entityNames) {
         const offset = this.db.lookup(name);
-        if (offset === 0n) continue;
+        if (offset === 0n) { notFound.push(name); continue; }
         // C deletes the record + adjacency, drops mirror edges, and releases
         // every string ref (name/type/obs + relType per edge + mirror).
         this.db.deleteEntity(offset);
+        deleted.push(name);
       }
+      return { deleted, notFound };
     });
   }
 
-  async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
-    this.withWriteLock(() => {
+  async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<{
+    deleted: { entityName: string; observations: string[] }[];
+    notFound: { entityName: string; observation?: string; reason: 'entity' | 'observation' }[];
+  }> {
+    return this.withWriteLock(() => {
       const now = BigInt(Date.now());
+      const deleted: { entityName: string; observations: string[] }[] = [];
+      const notFound: { entityName: string; observation?: string; reason: 'entity' | 'observation' }[] = [];
       for (const d of deletions) {
         const offset = this.db.lookup(d.entityName);
-        if (offset === 0n) continue;
-
+        if (offset === 0n) { notFound.push({ entityName: d.entityName, reason: 'entity' }); continue; }
+        const existing = this.db.readEntity(offset).observations;
+        const removed: string[] = [];
         for (const obs of d.observations) {
+          if (!existing.includes(obs)) { notFound.push({ entityName: d.entityName, observation: obs, reason: 'observation' }); continue; }
           this.db.removeObservation(offset, obs, now);
+          removed.push(obs);
         }
+        if (removed.length > 0) deleted.push({ entityName: d.entityName, observations: removed });
       }
+      return { deleted, notFound };
     });
   }
 
-  async deleteRelations(relations: Relation[]): Promise<void> {
-    this.withWriteLock(() => {
+  async deleteRelations(relations: Relation[]): Promise<{ deleted: Relation[]; notFound: { from: string; to: string; relationType: string; reason: 'entity' | 'relation' }[] }> {
+    return this.withWriteLock(() => {
+      const deleted: Relation[] = [];
+      const notFound: { from: string; to: string; relationType: string; reason: 'entity' | 'relation' }[] = [];
       for (const r of relations) {
         const fromOffset = this.db.lookup(r.from);
         const toOffset = this.db.lookup(r.to);
-        if (fromOffset === 0n || toOffset === 0n) continue;
+        if (fromOffset === 0n || toOffset === 0n) {
+          notFound.push({ from: r.from, to: r.to, relationType: r.relationType, reason: 'entity' });
+          continue;
+        }
+        const exists = this.db.edges(fromOffset).some(e =>
+          e.direction === DIR_FORWARD && e.target === toOffset && e.relType === r.relationType
+        );
+        if (!exists) { notFound.push({ from: r.from, to: r.to, relationType: r.relationType, reason: 'relation' }); continue; }
         // C removes both directed edges and releases the two relType refs.
         this.db.deleteRelation(fromOffset, toOffset, r.relationType);
+        deleted.push(r);
       }
+      return { deleted, notFound };
     });
   }
 
@@ -903,13 +931,14 @@ export class KnowledgeGraphManager {
     );
   }
 
-  async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph> {
+  async openNodes(names: string[], direction: 'forward' | 'backward' | 'any' = 'forward'): Promise<KnowledgeGraph & { missing: string[] }> {
     return this.withReadLock(() => {
       const filteredEntities: Entity[] = [];
+      const missing: string[] = [];
       const offsetByName = new Map<string, bigint>();
       for (const name of names) {
         const offset = this.db.lookup(name);
-        if (offset === 0n) continue;
+        if (offset === 0n) { missing.push(name); continue; }
         filteredEntities.push(this.recordToEntity(this.db.readEntity(offset)));
         offsetByName.set(name, offset);
       }
@@ -952,7 +981,7 @@ export class KnowledgeGraphManager {
         }
       }
 
-      return { entities: filteredEntities, relations: filteredRelations };
+      return { entities: filteredEntities, relations: filteredRelations, missing };
     });
   }
 
@@ -1269,7 +1298,7 @@ export class KnowledgeGraphManager {
     direction: 'forward' | 'backward' | 'any' = 'forward',
     mode: RandomWalkMode = 'merw',
     avoidCycles: boolean = false,
-  ): Promise<{ entity: string; path: string[] }> {
+  ): Promise<{ entity: string; path: string[]; modeUsed: 'merw' | 'uniform' | 'merw+fallback'; fallbackSteps: number }> {
     return traced(
       'kb.random_walk',
       {
@@ -1289,12 +1318,18 @@ export class KnowledgeGraphManager {
         // seed of 0 means "use the global RNG" (unseeded), so hashSeed (never
         // 0) keeps seeded walks reproducible.
         const seedU64 = seed !== undefined ? BigInt(this.hashSeed(seed) >>> 0) : 0n;
-        const pathOffsets = this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64, avoidCycles);
-        const pathNames = pathOffsets.map(o => this.db.entityName(o));
+        const walk = this.db.randomWalk(startOffset, depth, direction, mode === 'merw', seedU64, avoidCycles);
+        const pathNames = walk.path.map(o => this.db.entityName(o));
 
         span.setAttribute('kb.walker.steps_taken', pathNames.length - 1);
         span.setAttribute('kb.walker.truncated', pathNames.length - 1 < depth);
-        return { entity: pathNames[pathNames.length - 1], path: pathNames };
+        span.setAttribute('kb.walker.fallback_steps', walk.uniformSteps);
+        // R3 report (docs/api-error-policy.md): which policy actually ran.
+        // 'merw+fallback' = psi weighting was unavailable at some steps, so
+        // those steps sampled uniformly instead.
+        const modeUsed: 'merw' | 'uniform' | 'merw+fallback' =
+          mode === 'uniform' ? 'uniform' : (walk.uniformSteps === 0 ? 'merw' : 'merw+fallback');
+        return { entity: pathNames[pathNames.length - 1], path: pathNames, modeUsed, fallbackSteps: walk.uniformSteps };
       }),
     );
   }
@@ -1348,7 +1383,7 @@ export class KnowledgeGraphManager {
     return result;
   }
 
-  async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string }> {
+  async addThought(observations: string[], previousCtxId?: string): Promise<{ ctxId: string; linkedTo: string | null }> {
     // Validate observation limits across the whole request first.
     const violations: { code: ToolErrorCode; message: string }[] = [];
     if (observations.length > 2) {
@@ -1390,7 +1425,7 @@ export class KnowledgeGraphManager {
         this.db.createRelation(offset, prevOffset, 'preceded_by', now);
       }
 
-      return { ctxId };
+      return { ctxId, linkedTo: previousCtxId ?? null };
     });
   }
 
@@ -1808,17 +1843,20 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
       }
       case "add_observations":
         return { content: [{ type: "text", text: JSON.stringify(await knowledgeGraphManager.addObservations(args.observations as { entityName: string; contents: string[] }[]), null, 2) }] };
-      case "delete_entities":
-        await knowledgeGraphManager.deleteEntities(args.entityNames as string[]);
+      case "delete_entities": {
+        const result = await knowledgeGraphManager.deleteEntities(args.entityNames as string[]);
         knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
-        return { content: [{ type: "text", text: "Entities deleted successfully" }] };
-      case "delete_observations":
-        await knowledgeGraphManager.deleteObservations(args.deletions as { entityName: string; observations: string[] }[]);
-        return { content: [{ type: "text", text: "Observations deleted successfully" }] };
-      case "delete_relations":
-        await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+      case "delete_observations": {
+        const result = await knowledgeGraphManager.deleteObservations(args.deletions as { entityName: string; observations: string[] }[]);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+      case "delete_relations": {
+        const result = await knowledgeGraphManager.deleteRelations(args.relations as Relation[]);
         knowledgeGraphManager.resample(); // Re-run structural sampling after graph mutation
-        return { content: [{ type: "text", text: "Relations deleted successfully" }] };
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
       case "search_nodes": {
         const query = args.query as string;
         const graph = await knowledgeGraphManager.searchNodes(
@@ -1860,7 +1898,9 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
         const graph = await knowledgeGraphManager.openNodes(args.names as string[], (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
         // Record walker visits for opened nodes
         knowledgeGraphManager.recordWalkerVisits(graph.entities.map(e => e.name));
-        return { content: [{ type: "text", text: JSON.stringify(paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0)) }] };
+        // R3: report partial misses alongside the (paginated) graph.
+        const paginated = paginateGraph(graph, args.entityCursor as number ?? 0, args.relationCursor as number ?? 0);
+        return { content: [{ type: "text", text: JSON.stringify({ ...paginated, missing: graph.missing }) }] };
       }
       case "get_neighbors": {
         const neighbors = await knowledgeGraphManager.getNeighbors(args.entityName as string, args.depth as number ?? 0, args.sortBy as EntitySortField | undefined, args.sortDir as SortDirection | undefined, (args.direction as 'forward' | 'backward' | 'any') ?? 'forward');
@@ -1997,8 +2037,8 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
             text: JSON.stringify({
               document: title,
               stats: loadResult.stats,
-              entitiesCreated: entities.length,
-              relationsCreated: relations.length,
+              entities: { created: entities.created.length, existing: entities.existing.length },
+              relations: { created: relations.created.length, skippedDuplicates: relations.skippedDuplicates.length },
             }, null, 2),
           }],
         };

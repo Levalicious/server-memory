@@ -14,6 +14,8 @@ export interface PaginatedResult<T> {
 export interface PaginatedGraph {
   entities: PaginatedResult<Entity>;
   relations: PaginatedResult<Relation>;
+  /** open_nodes only: requested names that do not exist (partial misses). */
+  missing?: string[];
 }
 
 /**

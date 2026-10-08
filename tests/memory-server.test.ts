@@ -39,11 +39,12 @@ describe('MCP Memory Server E2E Tests', () => {
           { name: 'Alice', entityType: 'Person', observations: ['Likes coding'] },
           { name: 'Bob', entityType: 'Person', observations: ['Likes music'] }
         ]
-      }) as Entity[];
+      }) as { created: Entity[]; existing: string[] };
 
-      expect(result).toHaveLength(2);
-      expect(result[0].name).toBe('Alice');
-      expect(result[1].name).toBe('Bob');
+      expect(result.created).toHaveLength(2);
+      expect(result.created[0].name).toBe('Alice');
+      expect(result.created[1].name).toBe('Bob');
+      expect(result.existing).toEqual([]);
     });
 
     it('should not duplicate existing entities', async () => {
@@ -51,17 +52,16 @@ describe('MCP Memory Server E2E Tests', () => {
         entities: [{ name: 'Alice', entityType: 'Person', observations: ['First'] }]
       });
 
-      // Exact same entity should be silently skipped
+      // Exact same entity is reported in `existing`, not created again (R3).
       const result = await callTool(client, 'create_entities', {
         entities: [
           { name: 'Alice', entityType: 'Person', observations: ['First'] },
           { name: 'Bob', entityType: 'Person', observations: ['New'] }
         ]
-      }) as Entity[];
+      }) as { created: Entity[]; existing: string[] };
 
-      // Only Bob should be returned as new
-      expect(result).toHaveLength(1);
-      expect(result[0].name).toBe('Bob');
+      expect(result.created.map(e => e.name)).toEqual(['Bob']);
+      expect(result.existing).toEqual(['Alice']);
     });
 
     it('should error on duplicate name with different data (COLLISION, visible)', async () => {
@@ -201,9 +201,10 @@ describe('MCP Memory Server E2E Tests', () => {
           { from: 'A', to: 'B', relationType: 'connects' },
           { from: 'B', to: 'C', relationType: 'connects' }
         ]
-      }) as Relation[];
+      }) as { created: Relation[]; skippedDuplicates: Relation[] };
 
-      expect(result).toHaveLength(2);
+      expect(result.created).toHaveLength(2);
+      expect(result.skippedDuplicates).toEqual([]);
     });
 
     it('should not duplicate relations', async () => {
@@ -216,10 +217,12 @@ describe('MCP Memory Server E2E Tests', () => {
           { from: 'A', to: 'B', relationType: 'connects' },
           { from: 'A', to: 'C', relationType: 'connects' }
         ]
-      }) as Relation[];
+      }) as { created: Relation[]; skippedDuplicates: Relation[] };
 
-      expect(result).toHaveLength(1);
-      expect(result[0].to).toBe('C');
+      expect(result.created).toHaveLength(1);
+      expect(result.created[0].to).toBe('C');
+      expect(result.skippedDuplicates).toHaveLength(1);
+      expect(result.skippedDuplicates[0].to).toBe('B');
     });
 
     it('should delete relations', async () => {
@@ -2002,8 +2005,8 @@ describe('MCP Memory Server E2E Tests', () => {
       const result = await callTool(client, 'kb_load', { filePath: docFile }) as any;
 
       expect(result.document).toBe('test-doc');
-      expect(result.entitiesCreated).toBeGreaterThan(0);
-      expect(result.relationsCreated).toBeGreaterThan(0);
+      expect(result.entities.created).toBeGreaterThan(0);
+      expect(result.relations.created).toBeGreaterThan(0);
       expect(result.stats.chunks).toBeGreaterThan(0);
       expect(result.stats.sentences).toBeGreaterThan(0);
     });
@@ -2111,7 +2114,7 @@ describe('MCP Memory Server E2E Tests', () => {
       await fs.writeFile(docFile, `${longWord} is a very long word that tests our splitting logic handles edge cases.`);
 
       const result = await callTool(client, 'kb_load', { filePath: docFile }) as any;
-      expect(result.entitiesCreated).toBeGreaterThan(0);
+      expect(result.entities.created).toBeGreaterThan(0);
 
       // All observations should be within limits
       const chunks = await callTool(client, 'get_entities_by_type', { entityType: 'TextChunk' }) as PaginatedResult<Entity>;
@@ -2133,7 +2136,7 @@ describe('MCP Memory Server E2E Tests', () => {
           filePath,
           title: `ext-test-${ext.slice(1)}`,
         }) as any;
-        expect(result.entitiesCreated).toBeGreaterThan(0);
+        expect(result.entities.created).toBeGreaterThan(0);
       }
     });
   });
@@ -2246,6 +2249,148 @@ describe('MCP Memory Server E2E Tests', () => {
       const err = parseToolError(raw);
       expect(err.tool).toBe('get_neighbors');
       expect(err.message).toContain('NoSuchEntity');
+    });
+  });
+
+  describe('API ledgers (R3)', () => {
+    it('create_entities reports exact duplicates in existing', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerA', entityType: 'LedgerTag', observations: ['one'] }],
+      });
+
+      const result = await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'LedgerA', entityType: 'LedgerTag', observations: ['one'] }, // exact dupe
+          { name: 'LedgerB', entityType: 'LedgerTag', observations: ['two'] },
+        ],
+      }) as { created: Entity[]; existing: string[] };
+
+      expect(result.created.map(e => e.name)).toEqual(['LedgerB']);
+      expect(result.existing).toEqual(['LedgerA']);
+    });
+
+    it('create_relations reports duplicates in skippedDuplicates', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'LedgerC', entityType: 'LedgerTag', observations: [] },
+          { name: 'LedgerD', entityType: 'LedgerTag', observations: [] },
+        ],
+      });
+      await callTool(client, 'create_relations', {
+        relations: [{ from: 'LedgerC', to: 'LedgerD', relationType: 'LEDGES' }],
+      });
+
+      const result = await callTool(client, 'create_relations', {
+        relations: [
+          { from: 'LedgerC', to: 'LedgerD', relationType: 'LEDGES' }, // dupe
+          { from: 'LedgerD', to: 'LedgerC', relationType: 'LEDGES' }, // new (reverse direction)
+        ],
+      }) as { created: Array<{ from: string; to: string }>; skippedDuplicates: Array<{ from: string; to: string }> };
+
+      expect(result.created).toHaveLength(1);
+      expect(result.created[0]).toMatchObject({ from: 'LedgerD', to: 'LedgerC' });
+      expect(result.skippedDuplicates).toHaveLength(1);
+      expect(result.skippedDuplicates[0]).toMatchObject({ from: 'LedgerC', to: 'LedgerD' });
+    });
+
+    it('add_observations reports alreadyPresent', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerE', entityType: 'LedgerTag', observations: ['seed'] }],
+      });
+
+      const result = await callTool(client, 'add_observations', {
+        observations: [{ entityName: 'LedgerE', contents: ['seed', 'fresh'] }],
+      }) as Array<{ entityName: string; addedObservations: string[]; alreadyPresent: string[] }>;
+
+      expect(result[0].addedObservations).toEqual(['fresh']);
+      expect(result[0].alreadyPresent).toEqual(['seed']);
+    });
+
+    it('delete_entities reports deleted + notFound', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerF', entityType: 'LedgerTag', observations: [] }],
+      });
+
+      const result = await callTool(client, 'delete_entities', {
+        entityNames: ['LedgerF', 'LedgerGhost'],
+      }) as { deleted: string[]; notFound: string[] };
+
+      expect(result.deleted).toEqual(['LedgerF']);
+      expect(result.notFound).toEqual(['LedgerGhost']);
+    });
+
+    it('delete_relations distinguishes missing entity vs missing relation', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'LedgerG', entityType: 'LedgerTag', observations: [] },
+          { name: 'LedgerH', entityType: 'LedgerTag', observations: [] },
+        ],
+      });
+
+      const result = await callTool(client, 'delete_relations', {
+        relations: [
+          { from: 'LedgerG', to: 'LedgerH', relationType: 'LEDGES' },     // entity exists, relation never created
+          { from: 'LedgerG', to: 'LedgerGhost', relationType: 'LEDGES' }, // entity missing
+        ],
+      }) as { deleted: unknown[]; notFound: Array<{ reason: string }> };
+
+      expect(result.deleted).toEqual([]);
+      expect(result.notFound.map(n => n.reason).sort()).toEqual(['entity', 'relation']);
+    });
+
+    it('delete_observations distinguishes entity vs observation', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerI', entityType: 'LedgerTag', observations: ['keep'] }],
+      });
+
+      const result = await callTool(client, 'delete_observations', {
+        deletions: [
+          { entityName: 'LedgerI', observations: ['keep', 'never-added'] },
+          { entityName: 'LedgerGhost', observations: ['x'] },
+        ],
+      }) as { deleted: Array<{ entityName: string; observations: string[] }>; notFound: Array<{ reason: string }> };
+
+      expect(result.deleted).toEqual([{ entityName: 'LedgerI', observations: ['keep'] }]);
+      expect(result.notFound.map(n => n.reason).sort()).toEqual(['entity', 'observation']);
+    });
+
+    it('open_nodes reports partial misses in missing[]', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [{ name: 'LedgerJ', entityType: 'LedgerTag', observations: [] }],
+      });
+
+      const result = await callTool(client, 'open_nodes', { names: ['LedgerJ', 'LedgerGhost'] }) as PaginatedGraph;
+
+      expect(result.entities.items.map(e => e.name)).toEqual(['LedgerJ']);
+      expect(result.missing).toEqual(['LedgerGhost']);
+    });
+
+    it('random_walk reports modeUsed and fallbackSteps', async () => {
+      await callTool(client, 'create_entities', {
+        entities: [
+          { name: 'LedgerK', entityType: 'LedgerTag', observations: [] },
+          { name: 'LedgerL', entityType: 'LedgerTag', observations: [] },
+        ],
+      });
+      await callTool(client, 'create_relations', {
+        relations: [{ from: 'LedgerK', to: 'LedgerL', relationType: 'LEDGES' }],
+      });
+
+      const merw = await callTool(client, 'random_walk', { start: 'LedgerK', depth: 1 }) as { modeUsed: string; fallbackSteps: number };
+      expect(['merw', 'merw+fallback']).toContain(merw.modeUsed);
+      expect(merw.modeUsed === 'merw').toBe(merw.fallbackSteps === 0);
+
+      const uni = await callTool(client, 'random_walk', { start: 'LedgerK', depth: 1, mode: 'uniform' }) as { modeUsed: string; fallbackSteps: number };
+      expect(uni.modeUsed).toBe('uniform');
+      expect(uni.fallbackSteps).toBe(0);
+    });
+
+    it('sequentialthinking returns linkedTo', async () => {
+      const first = await callTool(client, 'sequentialthinking', { observations: ['ledger thought 1'] }) as { ctxId: string; linkedTo: string | null };
+      expect(first.linkedTo).toBeNull();
+
+      const second = await callTool(client, 'sequentialthinking', { observations: ['ledger thought 2'], previousCtxId: first.ctxId }) as { ctxId: string; linkedTo: string | null };
+      expect(second.linkedTo).toBe(first.ctxId);
     });
   });
 });
