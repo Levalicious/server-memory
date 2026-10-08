@@ -243,8 +243,8 @@ static napi_value n_structural_sample(napi_env env, napi_callback_info info){ AR
 static napi_value n_merw(napi_env env, napi_callback_info info)            { ARGS(4); STORE; return mkU32(env, graph_compute_merw_psi(s->g, getF64(env, argv[1]), getU32(env, argv[2]), getF64(env, argv[3]))); }
 static napi_value n_seed(napi_env env, napi_callback_info info)            { ARGS(2); (void)unwrap(env, argv[0]); graph_seed_rng(getU64(env, argv[1])); return NULL; }
 static napi_value n_random_walk(napi_env env, napi_callback_info info) {
-    ARGS(6); STORE; u32 depth = getU32(env, argv[2]); u32 cap = depth + 1; u64 *out = malloc((size_t)cap * 8);
-    u32 n = graph_random_walk(s->g, getU64(env, argv[1]), depth, getU32(env, argv[3]), getU32(env, argv[4]), getU64(env, argv[5]), out, cap);
+    ARGS(7); STORE; u32 depth = getU32(env, argv[2]); u32 cap = depth + 1; u64 *out = malloc((size_t)cap * 8);
+    u32 n = graph_random_walk(s->g, getU64(env, argv[1]), depth, getU32(env, argv[3]), getU32(env, argv[4]), getU64(env, argv[5]), getU32(env, argv[6]), out, cap);
     napi_value r = u64arr(env, out, n < cap ? n : cap); free(out); return r;
 }
 

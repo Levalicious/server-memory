@@ -132,8 +132,10 @@ void graph_set_entity_fields(graph_t *g, u64 off, u64 mtime, u64 obs_mtime,
 void graph_set_totals(graph_t *g, u64 structural_total, u64 walker_total);
 u32    graph_structural_sample(graph_t *g, u32 iterations, double damping);  /* MC pagerank; total visits */
 u32    graph_compute_merw_psi(graph_t *g, double alpha, u32 max_iter, double tol);  /* iters run */
-/* random walk; mode: 1=merw (weighted by psi), 0=uniform; seed 0 = use global rng. Returns path node count. */
+/* random walk; mode: 1=merw (weighted by psi), 0=uniform; seed 0 = use global rng.
+ * avoid_cycles: 1 = self-avoiding (never revisits a node; stops early when every
+ * neighbor is already on the path). Returns path node count. */
 u32    graph_random_walk(graph_t *g, u64 start, u32 depth, u32 direction, int merw_mode,
-                         u64 seed, u64 *out_path, u32 max_path);
+                         u64 seed, int avoid_cycles, u64 *out_path, u32 max_path);
 
 #endif /* GRAPH_H */
