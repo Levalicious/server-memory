@@ -465,12 +465,6 @@ static void tyx_drop(graph_t *g) { tyx_free(g->type_idx); g->type_idx = NULL; }
 static inline u64 graph_write_gen(graph_t *g) {
     return rdu64(g->mf, g->header_offset + GH_WRITE_GEN);
 }
-static void tyx_gate(graph_t *g) {
-    u64 gen = graph_write_gen(g);
-    if (g->idx_gen == gen) return;
-    tyx_drop(g);
-    g->idx_gen = gen;
-}
 /* O(1) maintenance hooks; on OOM drop the index so the next query rebuilds. */
 static void tyx_on_create(graph_t *g, u32 tid, u64 off) {
     if (!g->type_idx) return;
@@ -627,10 +621,30 @@ u32 graph_entities_by_type(graph_t *g, const u8 *type, u16 len, u64 *out, u32 ma
     memfile_t *mf = g->mf;
     u64 tid = st_find(g->st, type, len);
     if (!tid) return 0;
-    tyx_gate(g);                                    /* cross-process writes invalidate */
-    if (!g->type_idx) {                             /* lazy build: one O(N) pass */
-        g->type_idx = tyx_build(g);
-        if (g->type_idx) g->idx_gen = graph_write_gen(g);
+    u64 gen = graph_write_gen(g);
+    /* Density signal: how many by_type queries has this process been getting
+     * per write generation? Two or more means reads outpace generation moves,
+     * so a rebuild amortizes; a single query per generation (a sparse
+     * observer next to an active writer) must never pay the O(N) rebuild. */
+    if (gen != g->last_query_gen) {
+        g->prev_gen_count = g->gen_count;
+        g->gen_count = 0;
+        g->last_query_gen = gen;
+    }
+    g->gen_count++;
+    if (!g->type_idx || g->idx_gen != gen) {
+        /* The generation moved (some process wrote) or there is no cache yet.
+         * A stale cache can hold offsets of blocks freed+reused by another
+         * process, so it is dropped, never trusted. Rebuild only when dense
+         * evidence exists (previous or current generation served >= 2
+         * queries); otherwise serve this query by the sound O(N) scan. */
+        if (g->prev_gen_count >= 2 || g->gen_count >= 2) {
+            if (g->type_idx) tyx_drop(g);
+            g->type_idx = tyx_build(g);
+            if (g->type_idx) g->idx_gen = gen;
+        } else if (g->type_idx) {
+            tyx_drop(g);
+        }
     }
     if (g->type_idx) {                              /* O(result): iterate the posting */
         TypePost *p = tyx_slot(g->type_idx, (u32)tid, 0);

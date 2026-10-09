@@ -58,7 +58,9 @@ typedef struct {
     u32            tri_dirty_cap, tri_dirty_cnt;
     int            live_index_enabled; /* single-writer gate for the live trigram index; OFF by default */
     TypeIndex     *type_idx;      /* type_id -> offset postings (lazy; O(1) maintained) */
-    u64            idx_gen;       /* graph write-generation the in-memory indexes were built from */
+    u64            idx_gen;       /* graph write-generation the type index was built from */
+    u64            last_query_gen; /* write-gen observed by the previous by_type query */
+    u32            gen_count, prev_gen_count; /* by_type queries in the current / previous generation */
 } graph_t;
 
 typedef struct {
