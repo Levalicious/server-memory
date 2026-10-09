@@ -7,12 +7,12 @@
 #include "re_trigram.h" /* trigram prefilter (candidate narrowing) */
 #include "entity.h"   /* versioned record schema (single source of truth) */
 
-#define GRAPH_HEADER_SIZE 40u   /* reserved0, structural_total, walker_total, name_index_off, schema_ver, pad */
+#define GRAPH_HEADER_SIZE 40u   /* write_gen, structural_total, walker_total, name_index_off, schema_ver, pad */
 
 /* graph header field offsets. GH_RESERVED_0 was the node-log offset; the node
  * log was eliminated 2026-07-13 (the name index is the sole entity registry).
  * The slot is left dead rather than renumbered so existing stores still map. */
-#define GH_RESERVED_0       0
+#define GH_WRITE_GEN        0   /* bumped by graph_sync under the writer's lock */
 #define GH_STRUCTURAL_TOTAL 8
 #define GH_WALKER_TOTAL     16
 #define GH_NAME_INDEX_OFF   24
@@ -456,6 +456,21 @@ static TypeIndex *tyx_build(graph_t *g) {
     return t;
 }
 static void tyx_drop(graph_t *g) { tyx_free(g->type_idx); g->type_idx = NULL; }
+/* Graph write generation (header slot 0), bumped by graph_sync at the end of
+ * every write op under the caller's exclusive lock. In-memory derived indexes
+ * are only valid for the generation they were built from; a mismatch drops
+ * them so the next query rebuilds from the current file. Without this,
+ * another process's delete + block reuse leaks stale offsets into results
+ * (observed as garbage records / SIGSEGV in the 30-agent concurrency fuzz). */
+static inline u64 graph_write_gen(graph_t *g) {
+    return rdu64(g->mf, g->header_offset + GH_WRITE_GEN);
+}
+static void tyx_gate(graph_t *g) {
+    u64 gen = graph_write_gen(g);
+    if (g->idx_gen == gen) return;
+    tyx_drop(g);
+    g->idx_gen = gen;
+}
 /* O(1) maintenance hooks; on OOM drop the index so the next query rebuilds. */
 static void tyx_on_create(graph_t *g, u32 tid, u64 off) {
     if (!g->type_idx) return;
@@ -612,7 +627,11 @@ u32 graph_entities_by_type(graph_t *g, const u8 *type, u16 len, u64 *out, u32 ma
     memfile_t *mf = g->mf;
     u64 tid = st_find(g->st, type, len);
     if (!tid) return 0;
-    if (!g->type_idx) g->type_idx = tyx_build(g);   /* lazy build: one O(N) pass */
+    tyx_gate(g);                                    /* cross-process writes invalidate */
+    if (!g->type_idx) {                             /* lazy build: one O(N) pass */
+        g->type_idx = tyx_build(g);
+        if (g->type_idx) g->idx_gen = graph_write_gen(g);
+    }
     if (g->type_idx) {                              /* O(result): iterate the posting */
         TypePost *p = tyx_slot(g->type_idx, (u32)tid, 0);
         u32 found = 0;
@@ -1380,7 +1399,12 @@ graph_t *graph_open(const char *graph_path, stringtable_t *st, size_t initial_si
     return g;
 }
 
-void graph_sync(graph_t *g) { memfile_sync(g->mf); }
+void graph_sync(graph_t *g) {
+    /* End-of-write-op fence: bump the generation FIRST (MAP_SHARED writes are
+     * visible to peers immediately) so their in-memory indexes invalidate. */
+    wru64(g->mf, g->header_offset + GH_WRITE_GEN, graph_write_gen(g) + 1);
+    memfile_sync(g->mf);
+}
 
 void graph_close(graph_t *g) {
     if (!g) return;

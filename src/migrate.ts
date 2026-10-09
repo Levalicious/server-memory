@@ -282,6 +282,33 @@ function migrateInPlace(graphPath: string, strPath: string): MigrateReport {
 }
 
 /**
+ * Serialize concurrent startups on the migration lock: run `fn` with an
+ * exclusive flock held on `<graphPath>.migrate.lock`.
+ */
+export function withMigrationLock<T>(graphPath: string, fn: () => T): T {
+  const lockFd = migrationLock(`${graphPath}.migrate.lock`);
+  try {
+    return fn();
+  } finally {
+    migrationUnlock(lockFd);
+  }
+}
+
+/**
+ * Ensure the KB is v3. The caller MUST already hold the migration lock
+ * (via {@link withMigrationLock}) across BOTH this call and the subsequent
+ * store open: the native create path initializes a fresh store in place
+ * (file header + allocator cursor), so two processes opening a fresh KB
+ * concurrently would interleave those init writes and corrupt records.
+ * Returns the migration report if a migration ran, else null (already v3,
+ * or a fresh/empty KB).
+ */
+export function ensureV3Locked(graphPath: string, strPath: string): MigrateReport | null {
+  if (detectGraphFormat(graphPath) !== 'old') return null;  // fresh or already v3
+  return migrateInPlace(graphPath, strPath);
+}
+
+/**
  * Ensure the KB is v3, migrating from v1/v2 in place if needed. Holds an
  * exclusive migration flock across BOTH detection and migration, so concurrent
  * server startups serialize: the first migrates, the rest wait then observe v3.
@@ -290,11 +317,5 @@ function migrateInPlace(graphPath: string, strPath: string): MigrateReport {
  * report if a migration ran, else null (already v3, or a fresh/empty KB).
  */
 export function ensureV3(graphPath: string, strPath: string): MigrateReport | null {
-  const lockFd = migrationLock(`${graphPath}.migrate.lock`);
-  try {
-    if (detectGraphFormat(graphPath) !== 'old') return null;  // fresh or already v3
-    return migrateInPlace(graphPath, strPath);
-  } finally {
-    migrationUnlock(lockFd);
-  }
+  return withMigrationLock(graphPath, () => ensureV3Locked(graphPath, strPath));
 }

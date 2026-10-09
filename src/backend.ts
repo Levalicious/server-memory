@@ -11,7 +11,7 @@
 import path from 'path';
 import fs from 'fs';
 import { Store, type Direction } from './store.js';
-import { ensureV3 } from './migrate.js';
+import { ensureV3Locked, withMigrationLock } from './migrate.js';
 import { DaemonClient } from './daemon_client.js';
 import { DaemonStore } from './daemon_store.js';
 
@@ -203,6 +203,15 @@ export function createBackend(memoryFilePath: string): GraphBackend {
     return new DaemonStore(DaemonClient.connect(host, port, token));
   }
 
-  ensureV3(graphPath, strPath);
-  return new EmbeddedBackend(new Store(graphPath, strPath));
+  // Hold the migration lock across BOTH the ensure and the store open: the
+  // native create path initializes a fresh store in place (file header +
+  // allocator cursor), so two processes opening a not-yet-created KB
+  // concurrently would interleave those init writes and corrupt entity
+  // records (observed as SIGSEGV crashes in the 30-agent concurrency fuzz).
+  // The first process creates; the rest wait, then open the finished store.
+  const store = withMigrationLock(graphPath, () => {
+    ensureV3Locked(graphPath, strPath);
+    return new Store(graphPath, strPath);
+  });
+  return new EmbeddedBackend(store);
 }

@@ -42,8 +42,10 @@
  * at graph_open, maintained on writes — NOT persisted. */
 typedef struct ReTrigramLive ReTrigramLive;
 /* In-memory type index (type_id -> set of entity offsets); opaque here. Lazily
- * built on first entities_by_type, maintained O(1) on create/delete — NOT
- * persisted. Turns entities_by_type from an O(N) bucket scan into O(result). */
+ * built on first entities_by_type; O(1) maintained on THIS process's
+ * create/delete; invalidated whenever another process commits a write
+ * (graph write-generation moved), then rebuilt from the current file.
+ * Turns entities_by_type from an O(N) bucket scan into O(result). */
 typedef struct TypeIndex TypeIndex;
 
 typedef struct {
@@ -56,6 +58,7 @@ typedef struct {
     u32            tri_dirty_cap, tri_dirty_cnt;
     int            live_index_enabled; /* single-writer gate for the live trigram index; OFF by default */
     TypeIndex     *type_idx;      /* type_id -> offset postings (lazy; O(1) maintained) */
+    u64            idx_gen;       /* graph write-generation the in-memory indexes were built from */
 } graph_t;
 
 typedef struct {
