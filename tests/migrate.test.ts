@@ -55,7 +55,7 @@ describe('v3 migrator (v1/v2 -> v3 logical rebuild)', () => {
     expect(graph.entities[0]?.name).toBe('Alice');
     expect(graph.entities[0]?.observations).toEqual(['likes tea']);
     expect(graph.relations.some(r => r.from === 'Alice' && r.to === 'Bob' && r.relationType === 'KNOWS')).toBe(true);
-    mgr.close();
+    await mgr.close();
 
     expect(detectGraphFormat(join(dir, 'mem.graph'))).toBe('v3');      // converted in place
     expect(existsSync(join(dir, 'mem.graph.premigrate'))).toBe(true);  // backup retained

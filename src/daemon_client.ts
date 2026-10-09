@@ -214,7 +214,7 @@ export class DaemonClient {
   private openSocket(host: string, port: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const sock = net.createConnection({ host, port });
-      const onErr = (e: Error) => { sock.destroy(); reject(e); };
+      const onErr = (e: Error): void => { sock.destroy(); reject(e); };
       sock.once('error', onErr);
       sock.once('connect', () => {
         sock.off('error', onErr);

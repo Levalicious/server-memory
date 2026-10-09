@@ -14,7 +14,6 @@ import { fileURLToPath } from 'url';
 import { DIR_FORWARD, DIR_BACKWARD } from './src/store.js';
 import { createBackend, type GraphBackend, type BackendEntity } from './src/backend.js';
 import { StoreRecordError } from './src/errors.js';
-import { ensureV3 } from './src/migrate.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
 import { toolDurationHistogram, traced, tracer } from './src/tracing.js';
 

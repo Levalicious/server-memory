@@ -8,7 +8,7 @@ import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { jest } from '@jest/globals';
+import { afterAll, beforeAll, describe, expect, it, jest } from '@jest/globals';
 import { DaemonClient } from '../src/daemon_client.js';
 import { DaemonStore } from '../src/daemon_store.js';
 import { StoreRecordError } from '../src/errors.js';

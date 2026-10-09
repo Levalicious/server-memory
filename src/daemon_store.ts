@@ -11,7 +11,7 @@
  * operation via `ready`). Consistency is per-call (each daemon request is its
  * own transaction): reads are never cached.
  */
-import { DaemonClient, OP, R, ST_OK } from './daemon_client.js';
+import { type DaemonClient, OP, R, ST_OK } from './daemon_client.js';
 import { DIR_FORWARD, DIR_BACKWARD, type Direction } from './store.js';
 import { StoreRecordError } from './errors.js';
 import type { GraphBackend, BackendEntity, BackendEdge, BackendRanks, BackendValidation, ScanRow } from './backend.js';
