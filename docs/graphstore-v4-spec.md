@@ -254,6 +254,11 @@ never again meet an untested default).
 - Refs segment-qualified on the wire; node identity = logical node id via
   the per-segment indirection table (rebalance mechanism + stable external
   id + future cross-shard forwarding point, in one structure).
+- (r3.2, 2026-10-09: the logical node-id indirection table and the wire
+  shard-id space are **EXPLICITLY DEFERRED**
+  (Decision_Lev_ReconciliationRulings_2026_10_09). The retained seam arms:
+  segments as the transaction/placement domain, segment-qualified refs, and
+  the reserved SEG_KIND_INDIRECT page kind as the named future hook.)
 - Op classes under sharding: **split-and-route** (search, by-type, scans,
   point reads — per-shard indexes, scatter-gather, ≥linear) vs
   **sequentially-bound** (traversals — placement hostage; cross-host edge
