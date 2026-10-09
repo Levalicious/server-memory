@@ -160,7 +160,11 @@ All reads through the owner (remote machines make local-mmap clients moot).
 RO `MAP_SHARED` mapping + pwrite coherence via the page cache; the only
 durability barrier is fdatasync on the commit path, held under nothing.
 Leases (owner-internal, bounded) pin snapshots for cursors; expired cursors
-re-resolve and say so.
+re-resolve and say so. (r3.1, implemented: continuation leases — a bounded
+TTL/cap table of opaque tokens with O(1) replay-descriptor payloads; RESUME
+validates the store txid and reports TOKEN_STALE/TOKEN_EXPIRED explicitly,
+so the client re-anchors from the farthest it already holds. Snapshot pins
+(`seg_pin`) remain the phase-B step for daemon-side cursors.)
 
 Measured (rdtsc p50, ladder N=500K, 4K): read 88 cyc, pin_read 85,
 touch 4.4K (memcpy-bound), alloc 265, pin+unpin 3.7K (ptable memcpy →
@@ -232,6 +236,8 @@ Semantics classes (normative):
   {budget_exhausted, farthest} was this shape before it had a name.
 - v4.0 single-host: continuations surface only on budget exhaustion.
   Sharding changes *who resumes*, never what a continuation is.
+- (r3.1: implemented — OP_FIND_PATH returns a u64 continuation lease id
+  exactly on budget exhaustion; OP_RESUME (0x2e) continues it.)
 
 ### 6.3 Depth semantics — canonical
 

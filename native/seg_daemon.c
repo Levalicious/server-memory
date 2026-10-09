@@ -88,7 +88,24 @@ typedef struct {
     int64_t    rank_cadence_ms;       /* min gap between rank slices on busy ticks */
     u32        rank_slice_iters;      /* ψ iters per slice (scheduling chunk only) */
     int        psi_pending;           /* ψ hit the chunk bound, not yet |Δ|<ε */
+    /* v1.5 leases (continuations — spec §4 as r3.1, design note 2026-10-08).
+     * RAM-only, TTL+cap bounded, swept on the poll loop; at cap: evict expired
+     * else don't issue (token 0). Payload is O(1): a deterministic replay
+     * descriptor, never a serialized frontier. */
+    struct kbd_lease *leases;
+    u32        lease_cap;
+    u64        lease_next_id;
+    int64_t    lease_ttl_ms;
 } kbd_t;
+
+typedef struct kbd_lease {
+    u64 id;                 /* 0 = free slot */
+    u64 txid;               /* store txid at issue (Phase A validate-or-stale) */
+    int64_t last_use_ms;
+    u32 from, to, maxd;     /* eids + wire depth bound as requested */
+    u32 dir;                /* internal G4_DIR_* */
+    u64 replay_until;       /* cumulative bytes where the last run stopped */
+} kbd_lease_t;
 
 static void pw_add(kbd_t *k, u32 eid) {
     for (u32 i = 0; i < k->pw.n; i++)
@@ -156,10 +173,59 @@ static void maybe_rank_slice(kbd_t *k, int idle, int64_t *last_slice) {
     if (mstore_txn_commit(k->ms)) k->rank_mark = mstore_txid(k->ms);
 }
 
+/* ---------- v1.5 continuations (leases) ----------------------------------
+ * spec §4 as r3.1 + docs/leases-continuations-note.md (approved 2026-10-08):
+ * bounded continuation tokens. Phase A: RESUME validates the store txid
+ * (mismatch -> TOKEN_STALE; the client re-anchors from the farthest it
+ * already holds). At cap: evict expired first, then don't issue — leasing
+ * is an optimization and its absence never fails an operation. */
+
+static kbd_lease_t *lease_find(kbd_t *k, u64 id) {
+    if (!id) return NULL;
+    for (u32 i = 0; i < k->lease_cap; i++)
+        if (k->leases[i].id == id) return &k->leases[i];
+    return NULL;
+}
+
+static void lease_free(kbd_t *k, kbd_lease_t *L) { (void)k; L->id = 0; }
+
+static void lease_sweep(kbd_t *k) {
+    if (!k->lease_cap) return;
+    int64_t now = kbd_now_ms();
+    for (u32 i = 0; i < k->lease_cap; i++) {
+        kbd_lease_t *L = &k->leases[i];
+        if (L->id && now - L->last_use_ms > k->lease_ttl_ms) L->id = 0;
+    }
+}
+
+static u64 lease_new(kbd_t *k, u32 from, u32 to, u32 maxd, u32 dir, u64 replay_until) {
+    if (!k->lease_cap) return 0;
+    lease_sweep(k);
+    kbd_lease_t *slot = NULL;
+    for (u32 i = 0; i < k->lease_cap; i++)
+        if (!k->leases[i].id) { slot = &k->leases[i]; break; }
+    if (!slot) return 0;                             /* at cap: don't issue */
+    u64 id = ++k->lease_next_id;
+    if (!id) id = ++k->lease_next_id;                /* 0 is reserved */
+    slot->id = id;
+    slot->txid = mstore_txid(k->ms);
+    slot->last_use_ms = kbd_now_ms();
+    slot->from = from; slot->to = to; slot->maxd = maxd; slot->dir = dir;
+    slot->replay_until = replay_until;
+    return id;
+}
+
 /* ---------- op handlers ---------- */
 
 static void err_reply(wr_t *w, const char *msg) {
     w->len = 0;                        /* discard partial payload */
+    wstr(w, (const u8 *)msg, (u16)strlen(msg));
+}
+
+/* v1.5: coded error payload for OP_RESUME ([u8 code][str msg]). */
+static void err_reply_code(wr_t *w, u8 code, const char *msg) {
+    w->len = 0;
+    w8(w, code);
     wstr(w, (const u8 *)msg, (u16)strlen(msg));
 }
 
@@ -335,15 +401,56 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         u32 fe = lookup_or0(k, f, fl), te = lookup_or0(k, t, tl);
         if (!fe || !te) { err_reply(w, "no such entity"); return ST_ERR; }
         u32 path[128];
-        int reached = 0, exhausted = 0; u32 farthest = 0;
-        u32 n = g4_find_path_ex(k->g, fe, te, maxd, wire_dir(dir), budget,
-                                path, 128, &reached, &exhausted, &farthest);
+        int reached = 0, exhausted = 0; u32 farthest = 0; u64 cut = 0;
+        u32 n = g4_find_path_ex2(k->g, fe, te, maxd, wire_dir(dir), budget, 0,
+                                 path, 128, &reached, &exhausted, &farthest, &cut);
         (void)farthest;
+        /* v1.5: a continuation exists exactly when a budgeted run cut
+         * mid-search (§6.2 v4.0 rule). At lease cap it silently doesn't —
+         * the anchor below remains the re-resolve path. */
+        u64 token = exhausted ? lease_new(k, fe, te, maxd, wire_dir(dir), cut) : 0;
         u32 kept = n < 128 ? n : 128;
         w32(w, n);
         for (u32 i = 0; i < kept; i++) put_name(k, w, path[i]);
         w8(w, (u8)(reached ? 1 : 0));       /* v1.3 β-contract flags */
         w8(w, (u8)(exhausted ? 1 : 0));
+        w64(w, token);                      /* v1.5 continuation (0 = none) */
+        return ST_OK;
+    }
+    case OP_RESUME: {
+        /* v1.5: continue a budgeted find_path from its lease. Reply is
+         * find_path-shaped; errors carry [u8 code][str msg]. */
+        u64 token = r64(r), budget = r64(r);
+        if (r->err) { err_reply(w, "trunc"); return ST_ERR; }
+        kbd_lease_t *L = lease_find(k, token);
+        if (!L) { err_reply_code(w, 3, "unknown token"); return ST_ERR; }
+        int64_t now = kbd_now_ms();
+        if (now - L->last_use_ms > k->lease_ttl_ms) {
+            lease_free(k, L);
+            err_reply_code(w, 1, "token expired");
+            return ST_ERR;
+        }
+        if (L->txid != mstore_txid(k->ms)) {
+            lease_free(k, L);
+            err_reply_code(w, 2, "token stale (store advanced; re-anchor from farthest)");
+            return ST_ERR;
+        }
+        L->last_use_ms = now;
+        u32 path[128];
+        int reached = 0, exhausted = 0; u32 farthest = 0; u64 cut = 0;
+        u32 n = g4_find_path_ex2(k->g, L->from, L->to, L->maxd, L->dir,
+                                 budget, L->replay_until,
+                                 path, 128, &reached, &exhausted, &farthest, &cut);
+        (void)farthest;
+        u64 token_out = 0;
+        if (exhausted) { L->replay_until = cut; token_out = L->id; }
+        else lease_free(k, L);              /* finished (found or frontier dry) */
+        u32 kept = n < 128 ? n : 128;
+        w32(w, n);
+        for (u32 i = 0; i < kept; i++) put_name(k, w, path[i]);
+        w8(w, (u8)(reached ? 1 : 0));
+        w8(w, (u8)(exhausted ? 1 : 0));
+        w64(w, token_out);
         return ST_OK;
     }
     case OP_SEARCH: case OP_BY_TYPE: case OP_ORPHANED: {
@@ -633,6 +740,7 @@ int kbd_serve(kbd_t *k, int lfd, volatile sig_atomic_t *stop) {
         /* Amortized rank: slice on idle ticks (rc == 0), or at the cadence on
          * busy ticks. Never inside an op handler — the op path stays tax-free. */
         maybe_rank_slice(k, rc == 0, &last_slice);
+        if (rc == 0) lease_sweep(k);    /* v1.5: expiry on idle ticks */
         if (pfds[0].revents & POLLIN) {
             int fd = accept(lfd, NULL, NULL);
             if (fd >= 0) {
@@ -714,6 +822,15 @@ kbd_t *kbd_open(const char *dir) {
         const char *ri = getenv("KBD_RANK_SLICE_ITERS");
         k->rank_slice_iters = ri ? (u32)atol(ri) : KBD_RANK_SLICE_DEFAULT_ITERS;
         if (k->rank_slice_iters < 1) k->rank_slice_iters = KBD_RANK_SLICE_DEFAULT_ITERS;
+        const char *lt = getenv("KBD_LEASE_TTL_MS");
+        k->lease_ttl_ms = lt ? atol(lt) : 600000;
+        if (k->lease_ttl_ms < 1) k->lease_ttl_ms = 1;
+        const char *lm = getenv("KBD_LEASE_MAX");
+        u32 lmax = lm ? (u32)atol(lm) : 256;
+        if (lmax > 4096) lmax = 4096;                /* hard sanity bound */
+        k->lease_next_id = 0;
+        k->leases = (kbd_lease_t *)calloc(lmax ? lmax : 1, sizeof(kbd_lease_t));
+        k->lease_cap = k->leases ? lmax : 0;         /* degrade: no tokens */
     }
     return k;
 }
@@ -723,6 +840,7 @@ void kbd_close(kbd_t *k) {
     graph4_close(k->g);
     mstore_close(k->ms);
     free(k->pw.eids); free(k->pw.walks);
+    free(k->leases);
     free(k);
 }
 

@@ -132,4 +132,47 @@ describe('kbd4 daemon client', () => {
     );
     expect(results).toHaveLength(20);
   });
+
+  it('find_path continuation + resume (v1.5)', async () => {
+    // chain CW0..CW4: name 3B + relType 2B + 28 = 33B/discovery, root 31B
+    await client.callOk(OP.CREATE_ENTITIES, (w) => {
+      w.u32(5);
+      for (let i = 0; i < 5; i++) { w.str(`CW${i}`); w.str('cwT'); w.u64(BigInt(2000 + i)); }
+    });
+    await client.callOk(OP.CREATE_RELATIONS, (w) => {
+      w.u32(4);
+      for (let i = 0; i < 4; i++) { w.str(`CW${i}`); w.str(`CW${i + 1}`); w.str('NX'); w.u64(BigInt(2100 + i)); }
+    });
+
+    // budget 90: cum 31 → 64 (CW1) → 97 ≥ 90 → trip at CW2; token issued
+    const fp = await client.callOk(OP.FIND_PATH, (w) => {
+      w.str('CW0'); w.str('CW4'); w.u32(9); w.u8(0); w.u64(90n);
+    });
+    let r = new R(fp);
+    let n = r.u32();
+    const names1: string[] = [];
+    for (let i = 0; i < n; i++) names1.push(r.strText());
+    expect(names1[names1.length - 1]).toBe('CW2');
+    expect(r.u8()).toBe(0);                 // not reached
+    expect(r.u8()).toBe(1);                 // budget exhausted
+    const token = r.u64();
+    expect(token).not.toBe(0n);             // v1.5 continuation issued
+
+    // resume with a big segment budget: exact replay, then reach the target
+    const rp = await client.callOk(OP.RESUME, (w) => { w.u64(token); w.u64(100_000n); });
+    r = new R(rp);
+    n = r.u32();
+    const names2: string[] = [];
+    for (let i = 0; i < n; i++) names2.push(r.strText());
+    expect(r.u8()).toBe(1);                 // reached
+    expect(r.u8()).toBe(0);                 // not exhausted
+    expect(r.u64()).toBe(0n);               // finished: token retired
+    expect(names2[names2.length - 1]).toBe('CW4');
+    expect(names2.length).toBeGreaterThan(names1.length);
+
+    // unknown token -> coded error payload [u8 code][str msg]
+    const bad = await client.call(OP.RESUME, (w) => { w.u64(999999n); w.u64(1000n); });
+    expect(bad.status).not.toBe(ST_OK);
+    expect(new R(bad.body).u8()).toBe(3);
+  });
 });

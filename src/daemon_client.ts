@@ -47,6 +47,7 @@ export const OP = {
   VALIDATE: 0x2b,
   SCAN: 0x2c,
   REGEX_VALID: 0x2d,
+  RESUME: 0x2e,
 } as const;
 
 export const ST_OK = 0;

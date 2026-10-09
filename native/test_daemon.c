@@ -719,6 +719,201 @@ int main(void) {
     }
     PASS();
 
+    TEST(find_path_continuation);
+    {
+        /* v1.5 leases, Phase A (spec §4 as r3.1): a budgeted find_path that
+         * cuts mid-search issues a continuation token; RESUME continues via
+         * exact replay + a fresh segment budget; failures are coded
+         * (1=expired, 2=stale, 3=unknown); at cap (KBD_LEASE_MAX) no token is
+         * issued. Chain LQ0→…→LQ8; per-discovery cost = 3+2+28 = 33B, root 31B. */
+        setenv("KBD_LEASE_MAX", "2", 1);
+        setenv("KBD_LEASE_TTL_MS", "60000", 1);
+        char ldir[] = "/tmp/kbd4_test_XXXXXX";
+        assert(mkdtemp(ldir));
+        unsigned short lport = 0;
+        pid_t lpid = spawn_daemon(ldir, TOKEN, &lport);
+        unsetenv("KBD_LEASE_MAX");
+        unsetenv("KBD_LEASE_TTL_MS");
+        usleep(100000);
+        int lfd = cl_connect(lport);
+        assert(lfd >= 0);
+        pl_reset(&pl); pl_str(&pl, TOKEN);
+        assert(cl_call(lfd, 1, OP_AUTH, &pl, &body) == ST_OK);
+        free(body.b);
+
+        pl_reset(&pl);
+        w32(&pl, 9);
+        for (int i = 0; i < 9; i++) {
+            char nm[8]; snprintf(nm, sizeof nm, "LQ%d", i);
+            pl_str(&pl, nm); pl_str(&pl, "lbg"); w64(&pl, 1000 + (u64)i);
+        }
+        assert(cl_call(lfd, 2, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 8);
+        for (int i = 0; i < 8; i++) {
+            char a[8], c[8];
+            snprintf(a, sizeof a, "LQ%d", i); snprintf(c, sizeof c, "LQ%d", i + 1);
+            pl_str(&pl, a); pl_str(&pl, c); pl_str(&pl, "NX"); w64(&pl, 1100 + (u64)i);
+        }
+        assert(cl_call(lfd, 3, OP_CREATE_RELATIONS, &pl, &body) == ST_OK);
+        free(body.b);
+
+        /* fresh run, budget 90: cum 31 → 64 (LQ1) → 97 ≥ 90 → trip at LQ2 */
+        pl_reset(&pl);
+        pl_str(&pl, "LQ0"); pl_str(&pl, "LQ8"); w32(&pl, 9); w8(&pl, 0); w64(&pl, 90);
+        assert(cl_call(lfd, 4, OP_FIND_PATH, &pl, &body) == ST_OK);
+        u64 t1 = 0;
+        {
+            rd_t r = body_rd(&body);
+            u32 n = r32(&r);
+            char last[8] = {0};
+            for (u32 i = 0; i < n; i++) { u16 l; const u8 *s = rstr(&r, &l); if (l < 8) { memcpy(last, s, l); last[l] = 0; } }
+            assert(n == 3 && strcmp(last, "LQ2") == 0);
+            assert(r8(&r) == 0 && r8(&r) == 1);
+            t1 = r64(&r);
+            assert(t1 != 0);
+        }
+        free(body.b);
+
+        /* RESUME(t1, 70): stop_at = 97+70 = 167 → LQ3 (130) LQ4 (163) push,
+         * LQ5 (196) trips; path LQ0..LQ5; same lease id continues */
+        pl_reset(&pl);
+        w64(&pl, t1); w64(&pl, 70);
+        assert(cl_call(lfd, 5, OP_RESUME, &pl, &body) == ST_OK);
+        u64 t2 = 0;
+        {
+            rd_t r = body_rd(&body);
+            u32 n = r32(&r);
+            char last[8] = {0};
+            for (u32 i = 0; i < n; i++) { u16 l; const u8 *s = rstr(&r, &l); if (l < 8) { memcpy(last, s, l); last[l] = 0; } }
+            assert(n == 6 && strcmp(last, "LQ5") == 0);
+            assert(r8(&r) == 0 && r8(&r) == 1);
+            t2 = r64(&r);
+            assert(t2 == t1);
+        }
+        free(body.b);
+
+        /* RESUME(t2, big): replay to 196, then LQ6/LQ7 push; LQ8 discovery
+         * hits the target check FIRST → reached; token retired */
+        pl_reset(&pl);
+        w64(&pl, t2); w64(&pl, 100000);
+        assert(cl_call(lfd, 6, OP_RESUME, &pl, &body) == ST_OK);
+        {
+            rd_t r = body_rd(&body);
+            assert(r32(&r) == 9);
+            for (int i = 0; i < 9; i++) { char nm[8]; snprintf(nm, sizeof nm, "LQ%d", i); expect_name(&r, nm); }
+            assert(r8(&r) == 1 && r8(&r) == 0);
+            assert(r64(&r) == 0);
+        }
+        free(body.b);
+
+        /* retired token: unknown */
+        pl_reset(&pl);
+        w64(&pl, t2); w64(&pl, 1000);
+        assert(cl_call(lfd, 7, OP_RESUME, &pl, &body) == ST_ERR);
+        { rd_t r = body_rd(&body); assert(r8(&r) == 3); }
+        free(body.b);
+
+        /* cap: two live tokens fill KBD_LEASE_MAX=2 → the third is refused (0) */
+        u64 toks[3] = {0, 0, 0};
+        for (int c = 0; c < 3; c++) {
+            pl_reset(&pl);
+            pl_str(&pl, "LQ0"); pl_str(&pl, "LQ8"); w32(&pl, 9); w8(&pl, 0); w64(&pl, 90);
+            assert(cl_call(lfd, 20 + (u32)c, OP_FIND_PATH, &pl, &body) == ST_OK);
+            rd_t r = body_rd(&body);
+            u32 n = r32(&r);
+            for (u32 i = 0; i < n; i++) { u16 l; (void)rstr(&r, &l); }
+            assert(r8(&r) == 0 && r8(&r) == 1);
+            toks[c] = r64(&r);
+            free(body.b);
+        }
+        assert(toks[0] != 0 && toks[1] != 0 && toks[2] == 0);
+
+        /* stale: a write advances the store txid; old tokens say so (code 2) */
+        pl_reset(&pl);
+        w32(&pl, 1);
+        pl_str(&pl, "LQExtra"); pl_str(&pl, "lbg"); w64(&pl, 1300);
+        assert(cl_call(lfd, 30, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        w64(&pl, toks[0]); w64(&pl, 1000);
+        assert(cl_call(lfd, 31, OP_RESUME, &pl, &body) == ST_ERR);
+        { rd_t r = body_rd(&body); assert(r8(&r) == 2); }
+        free(body.b);
+
+        close(lfd);
+        stop_daemon(lpid);
+        char lcmd[600];
+        snprintf(lcmd, sizeof lcmd, "rm -rf %s", ldir);
+        assert(system(lcmd) == 0);
+    }
+    PASS();
+
+    TEST(lease_expiry);
+    {
+        /* TTL=1ms daemon: a token older than the TTL replies code 1 */
+        setenv("KBD_LEASE_TTL_MS", "1", 1);
+        char edir[] = "/tmp/kbd4_test_XXXXXX";
+        assert(mkdtemp(edir));
+        unsigned short eport = 0;
+        pid_t epid = spawn_daemon(edir, TOKEN, &eport);
+        unsetenv("KBD_LEASE_TTL_MS");
+        usleep(100000);
+        int efd = cl_connect(eport);
+        assert(efd >= 0);
+        pl_reset(&pl); pl_str(&pl, TOKEN);
+        assert(cl_call(efd, 1, OP_AUTH, &pl, &body) == ST_OK);
+        free(body.b);
+
+        pl_reset(&pl);
+        w32(&pl, 4);
+        for (int i = 0; i < 4; i++) {
+            char nm[8]; snprintf(nm, sizeof nm, "EQ%d", i);
+            pl_str(&pl, nm); pl_str(&pl, "lbg"); w64(&pl, 1400 + (u64)i);
+        }
+        assert(cl_call(efd, 2, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 3);
+        for (int i = 0; i < 3; i++) {
+            char a[8], c[8];
+            snprintf(a, sizeof a, "EQ%d", i); snprintf(c, sizeof c, "EQ%d", i + 1);
+            pl_str(&pl, a); pl_str(&pl, c); pl_str(&pl, "NX"); w64(&pl, 1500 + (u64)i);
+        }
+        assert(cl_call(efd, 3, OP_CREATE_RELATIONS, &pl, &body) == ST_OK);
+        free(body.b);
+
+        /* budget 40: root 31, EQ1 at 64 ≥ 40 → trip, token issued */
+        pl_reset(&pl);
+        pl_str(&pl, "EQ0"); pl_str(&pl, "EQ3"); w32(&pl, 9); w8(&pl, 0); w64(&pl, 40);
+        assert(cl_call(efd, 4, OP_FIND_PATH, &pl, &body) == ST_OK);
+        u64 et = 0;
+        {
+            rd_t r = body_rd(&body);
+            u32 n = r32(&r);
+            for (u32 i = 0; i < n; i++) { u16 l; (void)rstr(&r, &l); }
+            assert(r8(&r) == 0 && r8(&r) == 1);
+            et = r64(&r);
+            assert(et != 0);
+        }
+        free(body.b);
+
+        usleep(5000);                      /* > 1ms TTL */
+        pl_reset(&pl);
+        w64(&pl, et); w64(&pl, 1000);
+        assert(cl_call(efd, 5, OP_RESUME, &pl, &body) == ST_ERR);
+        { rd_t r = body_rd(&body); assert(r8(&r) == 1); }
+        free(body.b);
+
+        close(efd);
+        stop_daemon(epid);
+        char ecmd[600];
+        snprintf(ecmd, sizeof ecmd, "rm -rf %s", edir);
+        assert(system(ecmd) == 0);
+    }
+    PASS();
+
     close(fd);
     stop_daemon(pid);
     free(pl.buf);

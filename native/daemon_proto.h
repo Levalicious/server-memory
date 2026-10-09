@@ -35,6 +35,12 @@
  * eids (0=ok, 1=name over record cap, 2=type over record cap, 3=other) so a
  * refused create is a fact the client can turn into a visible error instead
  * of an ambiguous eid=0.
+ *
+ * v1.5: continuations (leases — spec §4 as r3.1). OP_FIND_PATH's reply
+ * appends u64 `continuation` (0 = none), issued exactly when a budgeted run
+ * cut mid-search (§6.2 v4.0 rule). New OP_RESUME { u64 token, u64 budget } ->
+ * find_path-shaped reply; failures reply ERR with [u8 code][str message],
+ * codes: 1 = expired, 2 = stale (store advanced), 3 = unknown.
  */
 #ifndef DAEMON_PROTO_H
 #define DAEMON_PROTO_H
@@ -80,6 +86,8 @@ enum {
                                         n x {u32 eid, str name, str type, u8 obs_count,
                                              obs_count x str obs} */
     OP_REGEX_VALID      = 0x2d,   /* str pattern -> u8 ok (same ERE dialect as SEARCH) */
+    OP_RESUME           = 0x2e,   /* u64 token, u64 budget -> find_path-shaped reply;
+                                     ERR payload = [u8 code][str msg] (v1.5)     */
 };
 
 /* OPEN_NODES entity blob (per requested name):

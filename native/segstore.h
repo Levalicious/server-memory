@@ -540,6 +540,15 @@ u32 g4_find_path(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
 u32 g4_find_path_ex(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
                     u64 budget_bytes, u32 *out_path, u32 max_path,
                     int *target_reached, int *budget_exhausted, u32 *farthest);
+/* g4_find_path_ex2: the same engine plus continuation support —
+ * replay_until = cumulative bytes where a prior run stopped (0 = fresh);
+ * cut_out = the trip value (next replay_until). Exact replay holds under an
+ * unchanged store txid (frozen discovery order). See seg_graph4.c. */
+u32 g4_find_path_ex2(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
+                     u64 budget_bytes, u64 replay_until,
+                     u32 *out_path, u32 max_path,
+                     int *target_reached, int *budget_exhausted, u32 *farthest,
+                     u64 *cut_out);
 
 /* ---- indexes + search (minimal-core port: trigram prefilter decoupled
  * from writes via dirty-set, type index O(1)-maintained, both owner-private

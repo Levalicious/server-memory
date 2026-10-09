@@ -946,18 +946,31 @@ done:
  *  - else best-effort: out_path = from..farthest (the LAST node discovered,
  *    BFS order) so the caller has a retry anchor; farthest = 0 if no edge
  *    was expanded at all.
- *  - budget_exhausted: stopped because per-node bytes crossed budget_bytes.
- *    The target check fires BEFORE the budget check, so a discovery that IS
- *    the target succeeds even at budget 0. budget == (u64)-1 = untracked.
+ *  - budget_exhausted: stopped because per-node bytes crossed the stop
+ *    threshold. The target check fires BEFORE the budget check, so a
+ *    discovery that IS the target succeeds even at budget 0. (u64)-1 =
+ *    untracked.
  *  - Per-node cost = name bytes + rel-type bytes + 28 (C BFS bookkeeping) —
  *    the same mechanism/sizing as v3, not V8 layout constants.
  *
+ * g4_find_path_ex2 is the core engine shared with continuations
+ * (v1.5/leases): `replay_until` = the cumulative byte value at which a PRIOR
+ * run stopped (0 = fresh). Replay is exact because a validated store txid
+ * freezes the graph AND the discovery order; the stop threshold becomes
+ * `replay_until + budget` and every node below it is adopted — including
+ * prior cut nodes, which a resumed run must expand (progress). `cut_out`
+ * reports the trip value so it can become the next continuation's
+ * replay_until. Payloads stay O(1): a descriptor, not a serialized frontier.
+ *
  * Returns the emitted path's node count.
  */
-u32 g4_find_path_ex(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
-                    u64 budget_bytes, u32 *out_path, u32 max_path,
-                    int *target_reached, int *budget_exhausted, u32 *farthest) {
+u32 g4_find_path_ex2(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
+                     u64 budget_bytes, u64 replay_until,
+                     u32 *out_path, u32 max_path,
+                     int *target_reached, int *budget_exhausted, u32 *farthest,
+                     u64 *cut_out) {
     *target_reached = 0; *budget_exhausted = 0; *farthest = 0;
+    if (cut_out) *cut_out = 0;
     g4_entity_t e;
     if (!g4_read_entity(g, from, &e) || !g4_read_entity(g, to, &e)) return 0;
     if (from == to) { if (max_path >= 1) out_path[0] = from; *target_reached = 1; return 1; }
@@ -973,6 +986,10 @@ u32 g4_find_path_ex(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
     q[tail] = from; qd[tail] = 0; tail++;
 
     int track = (budget_bytes != (u64)-1);
+    u64 stop_at = 0;
+    if (track)
+        stop_at = (replay_until > (u64)-1 - budget_bytes)
+                ? (u64)-1 : replay_until + budget_bytes;
     u64 bytes_used = 0;
     if (track) {
         u16 fl = 0;
@@ -1002,7 +1019,11 @@ u32 g4_find_path_ex(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
                 if (g4_read_entity(g, t, &te)) { const u8 *b = st4_get(g->st, te.name_sid, &nl); (void)b; }
                 const u8 *rb = st4_get(g->st, es[k].rel_sid, &rl); (void)rb;
                 bytes_used += (u64)nl + (u64)rl + 28;
-                if (bytes_used >= budget_bytes) { exhausted = 1; break; }
+                if (bytes_used >= stop_at) {
+                    exhausted = 1;
+                    if (cut_out) *cut_out = bytes_used;
+                    break;
+                }
             }
             if (tail == qcap) {
                 u32 nc = qcap * 2;
@@ -1036,6 +1057,15 @@ done:
         *target_reached = found; *budget_exhausted = exhausted;
         return n;
     }
+}
+
+/* Fresh search (no continuation): ex2 with replay_until = 0. */
+u32 g4_find_path_ex(graph4_t *g, u32 from, u32 to, u32 max_depth, u32 direction,
+                    u64 budget_bytes, u32 *out_path, u32 max_path,
+                    int *target_reached, int *budget_exhausted, u32 *farthest) {
+    return g4_find_path_ex2(g, from, to, max_depth, direction, budget_bytes, 0,
+                            out_path, max_path, target_reached, budget_exhausted,
+                            farthest, NULL);
 }
 
 /* ================= indexes + search ================= */
