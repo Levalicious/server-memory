@@ -116,23 +116,23 @@ bench_segstore: $(SEGBENCH_SRC)
 test_str4: test_str4.c seg_str4.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_str4 && $(OUT)_str4
 
-test_graph4: test_graph4.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c seg_meta.c
+test_graph4: test_graph4.c seg_tree.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c seg_meta.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_graph4 && $(OUT)_graph4
 
-test_parity: test_parity.c graph.c stringtable.c memoryfile.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
+test_parity: test_parity.c graph.c stringtable.c memoryfile.c seg_tree.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_parity && $(OUT)_parity
 
-IMPORT_SRC = v4_import.c graph.c stringtable.c memoryfile.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
+IMPORT_SRC = v4_import.c graph.c stringtable.c memoryfile.c seg_tree.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
 v4_import: $(IMPORT_SRC)
 	$(CC) $(BENCH_CFLAGS) $(IMPORT_SRC) -lm -o v4_import
 
 test_import: test_import.c graph.c stringtable.c memoryfile.c $(DAEMON_SRC)
 	$(CC) $(CFLAGS) test_import.c graph.c stringtable.c memoryfile.c $(DAEMON_SRC) $(LIBS) -o $(OUT)_import && $(OUT)_import
 
-test_segtree: test_segtree.c seg_tree.c $(DAEMON_SRC)
-	$(CC) $(CFLAGS) test_segtree.c seg_tree.c $(DAEMON_SRC) $(LIBS) -o $(OUT)_segtree && $(OUT)_segtree
+test_segtree: test_segtree.c $(DAEMON_SRC)
+	$(CC) $(CFLAGS) test_segtree.c $(DAEMON_SRC) $(LIBS) -o $(OUT)_segtree && $(OUT)_segtree
 
-DAEMON_SRC = seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
+DAEMON_SRC = seg_tree.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
 kbd4: seg_daemon.c $(DAEMON_SRC)
 	$(CC) -std=c11 -O2 -march=native -Wall -Wextra -D_GNU_SOURCE -I. $^ $(LIBS) -o kbd4
 

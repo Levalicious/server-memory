@@ -996,6 +996,13 @@ void re_trigram_live_set(ReTrigramLive *L, uint64_t doc,
 uint32_t re_trigram_live_ndocs   (const ReTrigramLive *L) { return L ? L->dbcnt : 0; }
 uint32_t re_trigram_live_distinct(const ReTrigramLive *L) { return L ? L->tbcnt : 0; }
 
+/* Emit every 3-byte window of s[0..len) (raw order; duplicates included). */
+void re_trigram_foreach(const char *s, size_t len,
+                        void (*cb)(void *ctx, uint32_t tri), void *ctx) {
+    const uint8_t *b = (const uint8_t *)s;
+    for (size_t i = 0; i + 3 <= len; i++) cb(ctx, pack_tri(b, (int)i));
+}
+
 size_t re_trigram_live_bytes(const ReTrigramLive *L) {
     if (!L) return 0;
     size_t b = sizeof *L
@@ -1129,6 +1136,79 @@ ReCandidates64 re_trigram_live_eval(const ReTrigramQuery *q, const ReTrigramLive
     if (!q || !L || L->broken) return out;   /* broken => full scan (sound) */
     CL64 c = eval_live(q->root, L);
     if (!c.all && c.n > 1) radix_u64(c.ids, c.n);  /* ascending candidate contract */
+    out.all = c.all; out.ids = c.ids; out.n = c.n;
+    return out;
+}
+
+/* ---- eval over a caller-provided posting store (array-only) ---------------- */
+
+static CL64 eval_prov(const TQ *q, const ReTriProvider *p) {
+    switch (q->kind) {
+        case TQ_ALL:  return cl64_all();
+        case TQ_NONE: return cl64_empty();
+        case TQ_TRI: {
+            uint32_t n = 0;
+            uint64_t *ids = p->leaf(p->ctx, q->tri, &n);
+            if (!ids || n == 0) { free(ids); return cl64_empty(); }
+            { CL64 c; c.all = 0; c.ids = ids; c.n = n; return c; }  /* ascending by contract */
+        }
+        case TQ_AND: {
+            CL64 *v = (CL64 *)malloc((size_t)(q->nk ? q->nk : 1) * sizeof *v);
+            if (!v) return cl64_all();
+            int nv = 0, empty = 0;
+            for (int i = 0; i < q->nk; i++) {
+                CL64 c = eval_prov(q->ks[i], p);
+                if (c.all) { free(c.ids); continue; }         /* no constraint */
+                if (c.n == 0) { free(c.ids); empty = 1; break; }
+                v[nv++] = c;
+            }
+            if (empty) { for (int i = 0; i < nv; i++) cl64_free(&v[i]); free(v); return cl64_empty(); }
+            if (nv == 0) { free(v); return cl64_all(); }
+            /* seed from the smallest survivor set; probe it through the rest
+             * (sorted => binary-search probes; the recorded smallest-first policy) */
+            uint32_t mi = 0;
+            for (int i = 1; i < nv; i++) if (v[i].n < v[mi].n) mi = (uint32_t)i;
+            CL64 acc = v[mi]; v[mi].ids = NULL; v[mi].n = 0;
+            for (int i = 0; i < nv; i++)
+                if (i != (int)mi) { cl64_probe(&acc, v[i].ids, v[i].n); cl64_free(&v[i]); }
+            free(v);
+            return acc;
+        }
+        case TQ_OR: {
+            CL64 *v = (CL64 *)malloc((size_t)(q->nk ? q->nk : 1) * sizeof *v);
+            if (!v) return cl64_all();
+            int nv = 0, all = 0;
+            uint64_t total = 0;
+            for (int i = 0; i < q->nk; i++) {
+                CL64 c = eval_prov(q->ks[i], p);
+                if (c.all) { all = 1; free(c.ids); break; }   /* union with everything = everything */
+                total += c.n;
+                v[nv++] = c;
+            }
+            if (all) { for (int i = 0; i < nv; i++) cl64_free(&v[i]); free(v); return cl64_all(); }
+            uint64_t *m = total ? (uint64_t *)malloc((size_t)total * sizeof *m) : NULL;
+            if (total && !m) { for (int i = 0; i < nv; i++) cl64_free(&v[i]); free(v); return cl64_all(); }
+            uint64_t w = 0;
+            for (int i = 0; i < nv; i++) {
+                if (v[i].n) memcpy(m + w, v[i].ids, (size_t)v[i].n * sizeof *m);
+                w += v[i].n;
+                cl64_free(&v[i]);
+            }
+            free(v);
+            if (w > 1) radix_u64(m, w);
+            uint64_t u = 0;
+            for (uint64_t i = 0; i < w; i++) if (i == 0 || m[i] != m[i - 1]) m[u++] = m[i];
+            CL64 c; c.all = 0; c.ids = m; c.n = (uint32_t)u;
+            return c;
+        }
+        default: return cl64_all();
+    }
+}
+
+ReCandidates64 re_trigram_eval_provider(const ReTrigramQuery *q, const ReTriProvider *p) {
+    ReCandidates64 out; out.ids = NULL; out.n = 0; out.all = 1;
+    if (!q || !p) return out;
+    CL64 c = eval_prov(q->root, p);
     out.all = c.all; out.ids = c.ids; out.n = c.n;
     return out;
 }

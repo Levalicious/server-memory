@@ -192,6 +192,35 @@ int seg_page_insert(u8 *pg, const u8 *rec, u16 size, u16 *slot_out) {
     return 1;
 }
 
+/* Bulk-refill a page with n records in order (the COW node-refresh path:
+ * a B+tree node is re-emitted whole on every mutation).  Equivalent to
+ * seg_page_init + n ordered appends, in ONE pass — records packed top-down
+ * in the order given, slots 0..n-1 pointing at them.  1 = ok, 0 = bad args
+ * or overflow. */
+/*@ requires \valid(pg + (0 .. SEG_PAGE_SIZE-1));
+    requires n <= SEG_PAGE_MAX_SLOTS;
+    requires \valid_read(recs + (0 .. n-1)) && \valid_read(sizes + (0 .. n-1));
+    assigns pg[0 .. SEG_PAGE_SIZE-1]; */
+int seg_page_fill(u8 *pg, u16 kind_hint, const u8 *const *recs, const u16 *sizes, u32 n) {
+    if (n > SEG_PAGE_MAX_SLOTS) return 0;
+    u32 total = SEG_PAGE_HDR_SIZE + n * SEG_SLOT_SIZE;
+    for (u32 i = 0; i < n; i++) {
+        if (sizes[i] < 1 || sizes[i] > SEG_PAGE_MAX_REC) return 0;
+        total += sizes[i];
+    }
+    if (total > SEG_PAGE_SIZE) return 0;
+    seg_page_init(pg, kind_hint);
+    u32 floor = SEG_PAGE_SIZE;
+    for (u32 i = 0; i < n; i++) {
+        floor -= sizes[i];
+        rec_copy(pg + floor, recs[i], sizes[i]);
+        slot_set(pg, (u16)i, (u16)floor, sizes[i]);
+    }
+    if (n) st16(pg + OFF_RECFLOOR, (u16)floor);
+    st16(pg + OFF_NSLOTS, (u16)n);
+    return 1;
+}
+
 /*@ requires \valid(pg + (0 .. SEG_PAGE_SIZE-1));
     requires size == 0 || \valid_read(rec + (0 .. size-1));
     requires \separated(pg + (0 .. SEG_PAGE_SIZE-1), rec + (0 .. size-1));

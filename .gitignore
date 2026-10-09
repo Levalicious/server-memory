@@ -301,3 +301,4 @@ cython_debug/
 
 # native build artifacts
 native/kbd4
+native/v4_import

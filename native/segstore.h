@@ -193,6 +193,10 @@ const u8 *seg_page_read(const u8 *pg, u16 slot, u16 *size_out);
  * slot else appends one. 1 = ok (*slot_out set), 0 = page full. */
 int seg_page_insert(u8 *pg, const u8 *rec, u16 size, u16 *slot_out);
 
+/* Bulk-refill a page with n records in order (the COW node-refresh path):
+ * init + n ordered appends in one pass. 1 = ok, 0 = bad args / overflow. */
+int seg_page_fill(u8 *pg, u16 kind_hint, const u8 *const *recs, const u16 *sizes, u32 n);
+
 /* Replace a live slot's record. Same-size: in place. Shrink: in place, slot
  * size updated (tail bytes become garbage). Grow: needs contiguous free
  * space for the new copy. 1 = ok, 0 = no space / dead slot / bad size. */

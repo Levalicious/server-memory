@@ -121,4 +121,25 @@ typedef struct { uint64_t *ids; uint32_t n; int all; } ReCandidates64;
 ReCandidates64 re_trigram_live_eval(const ReTrigramQuery *q, const ReTrigramLive *idx);
 void           re_candidates64_free(ReCandidates64 *c);
 
+/* ---- raw trigram emission + provider-driven evaluation ----------------------
+ * For the persistent seg_tree index (docs/v4-index-design-note.md): callers
+ * extract a string's trigram windows themselves and evaluate the query against
+ * their own posting store (a seg_tree prefix range-scan). Extraction uses the
+ * same packer as every other index here — one extractor, no dialect drift. */
+
+/* Emit every 3-byte window of s[0..len) in raw order (duplicates included;
+ * callers own dedup/sorting). */
+void re_trigram_foreach(const char *s, size_t len,
+                        void (*cb)(void *ctx, uint32_t tri), void *ctx);
+
+typedef struct {
+    void *ctx;
+    /* Posting list for `tri`: a malloc'd, ASCENDING array of ids (the
+     * evaluator takes ownership and frees it), or NULL with *n_out = 0. */
+    uint64_t *(*leaf)(void *ctx, uint32_t tri, uint32_t *n_out);
+} ReTriProvider;
+
+/* Same contract as re_trigram_live_eval, evaluated against the provider. */
+ReCandidates64 re_trigram_eval_provider(const ReTrigramQuery *q, const ReTriProvider *p);
+
 #endif /* RE_TRIGRAM_H */

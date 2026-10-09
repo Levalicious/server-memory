@@ -42,7 +42,9 @@ struct segstore {
     /* open txn */
     int txn_open;
     dirty_t *dirty; u32 ndirty, dirtycap;
+    u32 *dhash; u32 dhashcap;         /* open-addressed lpg -> dirty idx + 1 (0 = empty) */
     u32 *freed; u32 nfreed, freedcap;
+    u32 *fhash; u32 fhashcap;         /* open-addressed lpg + 1 set (0 = empty) */
     u64 txn_logical_pages;
     u32 txn_nameindex_root, txn_indirect_root;
 };
@@ -61,6 +63,122 @@ static int push_u32(u32 **a, u32 *n, u32 *cap, u32 v) {
     }
     (*a)[(*n)++] = v;
     return 1;
+}
+
+/* ---------- txn lookup indices (open addressing, linear probing) ----------
+ * find_dirty and the freed-membership scans were LINEAR; with the real-KB
+ * import (hundreds of thousands of dirty pages in one txn) every view/touch/
+ * free became O(ndirty|nfreed) => O(n^2) per import. The dirty array keeps
+ * its append + swap-remove shape (commit output unchanged); these indices
+ * only accelerate membership. Load factor stays <= 1/2, so a probe always
+ * terminates and backward-shift delete needs no tombstones. */
+
+static u32 hash32(u32 v) {
+    v ^= v >> 16; v *= 0x7feb352du; v ^= v >> 15; v *= 0x846ca68bu; v ^= v >> 16;
+    return v;
+}
+
+static int dhash_rehash(segstore_t *st, u32 ncap) {
+    u32 *nh = (u32 *)calloc(ncap, 4);
+    if (!nh) return 0;
+    u32 mask = ncap - 1;
+    for (u32 i = 0; i < st->ndirty; i++) {
+        u32 j = hash32(st->dirty[i].lpg) & mask;
+        while (nh[j]) j = (j + 1) & mask;
+        nh[j] = i + 1;
+    }
+    free(st->dhash);
+    st->dhash = nh; st->dhashcap = ncap;
+    return 1;
+}
+
+/* ensure room for one more dirty entry */
+static int dhash_reserve(segstore_t *st) {
+    if (st->dhashcap >= 2 * (st->ndirty + 1)) return 1;
+    u32 nc = st->dhashcap ? st->dhashcap : 16;
+    while (nc < 2 * (st->ndirty + 1)) nc *= 2;
+    return dhash_rehash(st, nc);
+}
+
+static void dhash_put(segstore_t *st, u32 lpg, u32 idx) {   /* pre-reserved */
+    u32 mask = st->dhashcap - 1;
+    u32 j = hash32(lpg) & mask;
+    while (st->dhash[j]) j = (j + 1) & mask;
+    st->dhash[j] = idx + 1;
+}
+
+static int dhash_slot(segstore_t *st, u32 lpg, u32 *slot_out) {
+    if (!st->dhashcap) return 0;
+    u32 mask = st->dhashcap - 1;
+    u32 j = hash32(lpg) & mask;
+    while (st->dhash[j]) {
+        u32 idx = st->dhash[j] - 1;
+        if (idx < st->ndirty && st->dirty[idx].lpg == lpg) { *slot_out = j; return 1; }
+        j = (j + 1) & mask;
+    }
+    return 0;
+}
+
+/* backward-shift delete (the cluster stays probe-tight) */
+static void dhash_del_slot(segstore_t *st, u32 j) {
+    u32 mask = st->dhashcap - 1;
+    st->dhash[j] = 0;
+    for (u32 x = (j + 1) & mask; st->dhash[x]; x = (x + 1) & mask) {
+        u32 idx = st->dhash[x] - 1;
+        u32 h = hash32(st->dirty[idx].lpg) & mask;
+        if (((x - h) & mask) >= ((x - j) & mask)) {
+            st->dhash[j] = st->dhash[x];
+            st->dhash[x] = 0;
+            j = x;
+        }
+    }
+}
+
+static int fhash_rehash(segstore_t *st, u32 ncap) {
+    u32 *nh = (u32 *)calloc(ncap, 4);
+    if (!nh) return 0;
+    u32 mask = ncap - 1;
+    for (u32 i = 0; i < st->nfreed; i++) {
+        u32 j = hash32(st->freed[i] + 1) & mask;
+        while (nh[j]) j = (j + 1) & mask;
+        nh[j] = st->freed[i] + 1;
+    }
+    free(st->fhash);
+    st->fhash = nh; st->fhashcap = ncap;
+    return 1;
+}
+
+static int freed_contains(const segstore_t *st, u32 lpg) {
+    if (!st->fhashcap) return 0;
+    u32 mask = st->fhashcap - 1;
+    u32 j = hash32(lpg + 1) & mask;
+    while (st->fhash[j]) {
+        if (st->fhash[j] == lpg + 1) return 1;
+        j = (j + 1) & mask;
+    }
+    return 0;
+}
+
+static int freed_push(segstore_t *st, u32 lpg) {            /* append-only */
+    if (st->fhashcap < 2 * (st->nfreed + 1)) {
+        u32 nc = st->fhashcap ? st->fhashcap : 16;
+        while (nc < 2 * (st->nfreed + 1)) nc *= 2;
+        if (!fhash_rehash(st, nc)) return 0;
+    }
+    if (!push_u32(&st->freed, &st->nfreed, &st->freedcap, lpg)) return 0;
+    u32 mask = st->fhashcap - 1;
+    u32 j = hash32(lpg + 1) & mask;
+    while (st->fhash[j]) j = (j + 1) & mask;
+    st->fhash[j] = lpg + 1;
+    return 1;
+}
+
+/* end-of-txn scratch reset (begin / abort / commit) */
+static void txn_clear_scratch(segstore_t *st) {
+    st->ndirty = 0;
+    st->nfreed = 0;
+    if (st->dhash) memset(st->dhash, 0, (size_t)st->dhashcap * 4);
+    if (st->fhash) memset(st->fhash, 0, (size_t)st->fhashcap * 4);
 }
 
 /* ---------- allocator state ---------- */
@@ -217,6 +335,7 @@ void segstore_close(segstore_t *st) {
     for (u32 i = 0; i < st->npend; i++) free(st->pend[i].pg);
     free(st->pend); free(st->freev); free(st->ptable);
     free(st->dirty); free(st->freed);
+    free(st->dhash); free(st->fhash);
     for (segpin_t *p = st->pins; p; ) {
         segpin_t *nx = p->next; free(p->ptable); free(p); p = nx;
     }
@@ -232,8 +351,7 @@ u64 segstore_logical_pages(const segstore_t *st) { return st->logical_pages; }
 
 const u8 *seg_txn_view(segstore_t *st, u32 lpg) {
     if (st->txn_open) {
-        for (u32 i = 0; i < st->nfreed; i++)
-            if (st->freed[i] == lpg) return NULL;
+        if (freed_contains(st, lpg)) return NULL;
         dirty_t *d = find_dirty(st, lpg);
         if (d) return d->buf;
         if (lpg >= st->txn_logical_pages) return NULL;
@@ -282,7 +400,7 @@ const u8 *seg_pin_read(segstore_t *st, const segpin_t *pin, u32 lpg) {
 int seg_txn_begin(segstore_t *st) {
     if (st->txn_open) return 0;
     st->txn_open = 1;
-    st->ndirty = 0; st->nfreed = 0;
+    txn_clear_scratch(st);
     st->txn_logical_pages = st->logical_pages;
     st->txn_nameindex_root = st->sf->meta.nameindex_root_pgno;
     st->txn_indirect_root  = st->sf->meta.indirect_root_pgno;
@@ -290,20 +408,22 @@ int seg_txn_begin(segstore_t *st) {
 }
 
 static dirty_t *find_dirty(segstore_t *st, u32 lpg) {
-    for (u32 i = 0; i < st->ndirty; i++)
-        if (st->dirty[i].lpg == lpg) return &st->dirty[i];
-    return NULL;
+    u32 j;
+    if (!dhash_slot(st, lpg, &j)) return NULL;
+    return &st->dirty[st->dhash[j] - 1];
 }
 
 static u8 *add_dirty(segstore_t *st, u32 lpg) {
+    u8 *buf = (u8 *)malloc(SEG_PAGE_SIZE);
+    if (!buf) return NULL;
     if (st->ndirty == st->dirtycap) {
         u32 nc = st->dirtycap ? st->dirtycap * 2 : 32;
         dirty_t *nd = (dirty_t *)realloc(st->dirty, (size_t)nc * sizeof *nd);
-        if (!nd) return NULL;
+        if (!nd) { free(buf); return NULL; }
         st->dirty = nd; st->dirtycap = nc;
     }
-    u8 *buf = (u8 *)malloc(SEG_PAGE_SIZE);
-    if (!buf) return NULL;
+    if (!dhash_reserve(st)) { free(buf); return NULL; }
+    dhash_put(st, lpg, st->ndirty);
     st->dirty[st->ndirty].lpg = lpg;
     st->dirty[st->ndirty].buf = buf;
     st->ndirty++;
@@ -312,8 +432,7 @@ static u8 *add_dirty(segstore_t *st, u32 lpg) {
 
 u8 *seg_txn_touch(segstore_t *st, u32 lpg) {
     if (!st->txn_open || lpg >= st->txn_logical_pages) return NULL;
-    for (u32 i = 0; i < st->nfreed; i++)
-        if (st->freed[i] == lpg) return NULL;         /* freed this txn */
+    if (freed_contains(st, lpg)) return NULL;         /* freed this txn */
     dirty_t *d = find_dirty(st, lpg);
     if (d) return d->buf;
     const u8 *cur = segstore_read(st, lpg);
@@ -340,16 +459,25 @@ u8 *seg_txn_alloc(segstore_t *st, u16 kind_hint, u32 *lpg_out) {
 
 int seg_txn_free(segstore_t *st, u32 lpg) {
     if (!st->txn_open || lpg >= st->txn_logical_pages) return 0;
-    for (u32 i = 0; i < st->nfreed; i++)
-        if (st->freed[i] == lpg) return 0;            /* double free */
-    dirty_t *d = find_dirty(st, lpg);
-    if (d) {                                          /* alloc'd/touched this txn */
-        free(d->buf);
-        *d = st->dirty[--st->ndirty];
+    if (freed_contains(st, lpg)) return 0;            /* double free */
+    u32 slot;
+    if (dhash_slot(st, lpg, &slot)) {                 /* alloc'd/touched this txn */
+        u32 pos = st->dhash[slot] - 1;
+        free(st->dirty[pos].buf);
+        dhash_del_slot(st, slot);
+        u32 last = st->ndirty - 1;
+        if (pos != last) {                            /* swap-remove; keep the
+                                                       * moved entry's index */
+            st->dirty[pos] = st->dirty[last];
+            u32 mslot;
+            if (dhash_slot(st, st->dirty[pos].lpg, &mslot))
+                st->dhash[mslot] = pos + 1;
+        }
+        st->ndirty = last;
         if (lpg >= st->logical_pages)                 /* never committed: no retire */
-            return push_u32(&st->freed, &st->nfreed, &st->freedcap, lpg);
+            return freed_push(st, lpg);
     } else if (st->ptable[lpg] == SEG_PT_NONE) return 0;   /* already unmapped */
-    return push_u32(&st->freed, &st->nfreed, &st->freedcap, lpg);
+    return freed_push(st, lpg);
 }
 
 void seg_txn_set_roots(segstore_t *st, u32 nameindex_root, u32 indirect_root) {
@@ -360,7 +488,7 @@ void seg_txn_set_roots(segstore_t *st, u32 nameindex_root, u32 indirect_root) {
 void seg_txn_abort(segstore_t *st) {
     if (!st->txn_open) return;
     for (u32 i = 0; i < st->ndirty; i++) free(st->dirty[i].buf);
-    st->ndirty = 0; st->nfreed = 0;
+    txn_clear_scratch(st);
     st->txn_open = 0;
 }
 
@@ -583,7 +711,7 @@ out:
     free(w.pgnos); free((void *)w.bufs); free(w.owned);
     free(newpt); free(retire);
     for (u32 i = 0; i < st->ndirty; i++) free(st->dirty[i].buf);
-    st->ndirty = 0; st->nfreed = 0;
+    txn_clear_scratch(st);
     st->txn_open = 0;
     return ok;
 }
