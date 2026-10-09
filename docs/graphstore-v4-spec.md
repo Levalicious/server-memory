@@ -259,6 +259,20 @@ never again meet an untested default).
   (Decision_Lev_ReconciliationRulings_2026_10_09). The retained seam arms:
   segments as the transaction/placement domain, segment-qualified refs, and
   the reserved SEG_KIND_INDIRECT page kind as the named future hook.)
+- (r3.3, 2026-10-09: **ACTIVATED** — `docs/shard-seam-design-note.md`
+  (Lev rulings D1–D5 + vertex-duplication + tombstone/RIBLT plans). The two
+  r3.2-deferred arms are build steps 1–2, taken at N=1 before any
+  deployment. Model: vertex-cut with duplicated vertices (mirrors carry
+  vertex data + ψ; adjacency halves endpoint-local — a relation create is
+  two idempotent local commits, sync-both-acked, not a distributed txn).
+  No coordinating role: placement is a pure function (hash(name)
+  directory + community assignment via indirection). Convergence: int-LWW
+  registers (stamps = per-shard monotone counters) + RIBLT anti-entropy
+  (sunder port, 32B symbol codecs) with a watermark-bounded tombstone
+  contract; SERIAL ops keep the v1.5 exactly-once token, now
+  shard-qualified. Community-clustered writes stay single-shard; the
+  "cross-shard txns ride §5" arm above is **superseded** by the two-local-
+  commits model.)
 - Op classes under sharding: **split-and-route** (search, by-type, scans,
   point reads — per-shard indexes, scatter-gather, ≥linear) vs
   **sequentially-bound** (traversals — placement hostage; cross-host edge
@@ -266,10 +280,10 @@ never again meet an untested default).
   crossings rare; TRAVERSE continuations grouped per shard per round keep
   them batched; bidir BFS halves the rounds.
 - Writes: community-clustered melts → mostly single-shard txns (zero
-  coordination); cross-shard txns ride §5 unchanged (the selection argument
-  is host-count-agnostic; only the manifest's home host is new engineering).
-- Open under sharding: ψ/MERW (per-shard iteration + boundary exchange is
-  an argument, not yet a measurement).
+  coordination).
+- ψ/MERW: **closed** by the note (§7): per-shard slices over the local
+  subgraph including mirror values; ψ published as int-LWW; convergence =
+  asynchronous contraction iteration — no boundary-epoch protocol.
 
 ## 7. Rank maintenance (amortized, background — unchanged from r2)
 
