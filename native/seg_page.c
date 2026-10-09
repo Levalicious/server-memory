@@ -93,6 +93,14 @@ void seg_page_init(u8 *pg, u16 kind_hint) {
 }
 
 /*@ requires \valid_read(pg + (0 .. SEG_PAGE_SIZE-1));
+    assigns \nothing; */
+u16 seg_page_nslots(const u8 *pg) { return pg_nslots(pg); }
+
+/*@ requires \valid_read(pg + (0 .. SEG_PAGE_SIZE-1));
+    assigns \nothing; */
+u16 seg_page_kind(const u8 *pg) { return ld16(pg + OFF_KIND); }
+
+/*@ requires \valid_read(pg + (0 .. SEG_PAGE_SIZE-1));
     assigns \nothing;
     ensures \result == 0 || \result == 1; */
 int seg_page_validate(const u8 *pg) {

@@ -150,6 +150,11 @@ typedef struct __attribute__((packed)) {
 #define SEG_KIND_STRING    5u
 #define SEG_KIND_FREELIST  6u
 #define SEG_KIND_EXTENT    7u   /* pages owned by an extent record (multi-page runs) */
+/* seg_tree (docs/v4-index-design-note.md): node type lives in KIND so it
+ * survives compact (kind and flags are both preserved). TREE_LEAF reuses the
+ * numeric value of the dead NAMEIDX kind (pre-release; stores are fresh-only). */
+#define SEG_KIND_TREE_LEAF   3u
+#define SEG_KIND_TREE_BRANCH 8u
 
 /* ------------------------------------------------------------------ *
  * Slotted page module (seg_page.c) — proof target #2.
@@ -168,6 +173,10 @@ typedef struct __attribute__((packed)) {
  * ------------------------------------------------------------------ */
 
 void seg_page_init(u8 *pg, u16 kind_hint);
+/* header read accessors (node bookkeeping lives in the header; both survive
+ * compact/touch — seg_page_compact re-emits kind AND flags). */
+u16  seg_page_nslots(const u8 *pg);
+u16  seg_page_kind(const u8 *pg);
 
 /* Structural well-formedness audit: header bounds, every live slot inside
  * [rec_floor, SEG_PAGE_SIZE), no live slot overlaps the slot array. 1 = ok. */
@@ -389,6 +398,46 @@ u8  *seg_txn_alloc(segstore_t *st, u16 kind_hint, u32 *lpg_out);
 int  seg_txn_free(segstore_t *st, u32 lpg);
 /* set graph-layer roots recorded in the next meta (logical pgnos) */
 void seg_txn_set_roots(segstore_t *st, u32 nameindex_root, u32 indirect_root);
+
+/* ------------------------------------------------------------------ *
+ * seg_tree — the generic B+tree over slotted pages (docs/v4-index-design
+ * -note.md; Design_IndexRedesign_2026_10_09). One implementation,
+ * parameterized by codec; instantiated as catalog / name index / posting
+ * trees. Entries are always stored in key order (bytewise compare, shorter
+ * -prefix-first on ties); mutation rebuilds the touched node's image in
+ * order; growth is incremental splits only; deletion is rewrite + empty
+ * -unlink + single-pass sibling merge when the pair fits.
+ * Node refs are lpg+1 (0 = none), matching the segment root slots.
+ * ------------------------------------------------------------------ */
+
+/* key: bytewise, either fixed-size or [u16 klen][bytes].
+ * value: 0 = none (posting-style), 1 = u32, 2 = [u16 vlen][bytes]. */
+typedef struct { u8 key_fix; u8 val_mode; } st_codec_t;
+
+typedef struct {
+    segstore_t *gs;
+    st_codec_t  cd;
+    u32 root;             /* root node lpg+1; 0 = empty tree */
+    u64 count;            /* entries, maintained by this module */
+} seg_tree_t;
+
+void seg_tree_open(seg_tree_t *t, segstore_t *gs, st_codec_t cd, u32 root);
+/* 1 = inserted new; 0 = key existed (replaced for valued trees / no-op for
+ * postings); -1 = error. */
+int  seg_tree_insert(seg_tree_t *t, const u8 *k, u16 klen, const u8 *v, u16 vlen);
+/* 1 = deleted; 0 = absent; -1 = error. */
+int  seg_tree_delete(seg_tree_t *t, const u8 *k, u16 klen);
+/* 1 = found (value copied if the codec has one); 0 = absent; -1 = error. */
+int  seg_tree_lookup(seg_tree_t *t, const u8 *k, u16 klen, u8 *v, u16 *vlen);
+/* Ordered scan within [lo, hi]; NULL bound = open end. cb returns 0 to stop.
+ * Returns 0 on completion, 1 if stopped by cb, -1 on error. */
+int  seg_tree_scan(seg_tree_t *t,
+                   const u8 *lo, u16 lol, int lo_incl,
+                   const u8 *hi, u16 hil, int hi_incl,
+                   int (*cb)(void *ctx, const u8 *k, u16 klen, const u8 *v, u16 vlen),
+                   void *ctx);
+u32  seg_tree_root(const seg_tree_t *t);
+u64  seg_tree_count(const seg_tree_t *t);
 /* publish: allocates physical pages (freelist/growth), writes data + ptable
  * + freelist snapshot + meta via segfile_commit. 1 = committed. */
 int  seg_txn_commit(segstore_t *st);
@@ -590,6 +639,9 @@ u32    g4_random_walk(graph4_t *g, u32 start, u32 depth, u32 direction,
                       int merw_mode, u64 seed, int avoid_cycles, u32 *out_path, u32 max_path,
                       u32 *out_uniform_steps);
 /* migration support: restore preserved fields on an existing entity */
+/* Restore global totals verbatim (v3->v4 import; source totals may exceed
+ * the sum of live per-entity visits when entities were deleted upstream). */
+void   g4_set_totals(graph4_t *g, u64 structural_total, u64 walker_total);
 int    g4_set_entity_fields(graph4_t *g, u32 eid, u64 mtime, u64 obs_mtime,
                             u64 svis, u64 wvis, double psi);
 

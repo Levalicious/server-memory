@@ -122,6 +122,7 @@ int main(void) {
     TEST(compact_preserves_slots_reclaims_garbage);
     {
         seg_page_init(pg, SEG_KIND_ADJ);
+        pg[6] = 0xAB; pg[7] = 0xCD;   /* flags pin: seg_tree encodes node type here-adjacent state; compact must preserve */
         u8 r[64]; u16 s0, s1, s2;
         memset(r, 7, 64); assert(seg_page_insert(pg, r, 64, &s0));
         memset(r, 8, 64); assert(seg_page_insert(pg, r, 64, &s1));
@@ -132,6 +133,7 @@ int main(void) {
         u32 before = seg_page_free_space(pg);
         assert(seg_page_compact(cp, pg) == 1);
         assert(seg_page_validate(cp) == 1);
+        assert(cp[6] == 0xAB && cp[7] == 0xCD);               /* flags preserved across compact */
         u32 after = seg_page_free_space(cp);
         assert(after > before);                               /* garbage reclaimed */
         u16 sz;
