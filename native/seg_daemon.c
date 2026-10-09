@@ -105,6 +105,7 @@ typedef struct kbd_lease {
     u32 from, to, maxd;     /* eids + wire depth bound as requested */
     u32 dir;                /* internal G4_DIR_* */
     u64 replay_until;       /* cumulative bytes where the last run stopped */
+    u8  shard;              /* v1.6: owning shard (KBD_SHARD_LOCAL at N=1) */
 } kbd_lease_t;
 
 static void pw_add(kbd_t *k, u32 eid) {
@@ -212,6 +213,7 @@ static u64 lease_new(kbd_t *k, u32 from, u32 to, u32 maxd, u32 dir, u64 replay_u
     slot->last_use_ms = kbd_now_ms();
     slot->from = from; slot->to = to; slot->maxd = maxd; slot->dir = dir;
     slot->replay_until = replay_until;
+    slot->shard = KBD_SHARD_LOCAL;                   /* v1.6: the shard-id space */
     return id;
 }
 
@@ -415,13 +417,18 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         w8(w, (u8)(reached ? 1 : 0));       /* v1.3 β-contract flags */
         w8(w, (u8)(exhausted ? 1 : 0));
         w64(w, token);                      /* v1.5 continuation (0 = none) */
+        w8(w, KBD_SHARD_LOCAL);             /* v1.6 shard-id space (0 at N=1) */
         return ST_OK;
     }
     case OP_RESUME: {
         /* v1.5: continue a budgeted find_path from its lease. Reply is
          * find_path-shaped; errors carry [u8 code][str msg]. */
         u64 token = r64(r), budget = r64(r);
+        /* v1.6: optional trailing u8 shard (absent = local). Nonzero is not
+         * routable at N=1; when shards arrive this becomes a forwarding key. */
+        u8 rshard = (r->p + 1 <= r->end) ? r8(r) : KBD_SHARD_LOCAL;
         if (r->err) { err_reply(w, "trunc"); return ST_ERR; }
+        if (rshard != KBD_SHARD_LOCAL) { err_reply_code(w, 3, "unknown shard"); return ST_ERR; }
         kbd_lease_t *L = lease_find(k, token);
         if (!L) { err_reply_code(w, 3, "unknown token"); return ST_ERR; }
         int64_t now = kbd_now_ms();
@@ -451,6 +458,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         w8(w, (u8)(reached ? 1 : 0));
         w8(w, (u8)(exhausted ? 1 : 0));
         w64(w, token_out);
+        w8(w, KBD_SHARD_LOCAL);             /* v1.6 shard-id space (0 at N=1) */
         return ST_OK;
     }
     case OP_SEARCH: case OP_BY_TYPE: case OP_ORPHANED: {

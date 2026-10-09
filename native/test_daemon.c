@@ -773,13 +773,14 @@ int main(void) {
             assert(r8(&r) == 0 && r8(&r) == 1);
             t1 = r64(&r);
             assert(t1 != 0);
+            assert(r8(&r) == 0);                       /* v1.6 shard byte */
         }
         free(body.b);
 
         /* RESUME(t1, 70): stop_at = 97+70 = 167 → LQ3 (130) LQ4 (163) push,
          * LQ5 (196) trips; path LQ0..LQ5; same lease id continues */
         pl_reset(&pl);
-        w64(&pl, t1); w64(&pl, 70);
+        w64(&pl, t1); w64(&pl, 70); w8(&pl, 0);        /* v1.6: explicit local shard */
         assert(cl_call(lfd, 5, OP_RESUME, &pl, &body) == ST_OK);
         u64 t2 = 0;
         {
@@ -791,11 +792,13 @@ int main(void) {
             assert(r8(&r) == 0 && r8(&r) == 1);
             t2 = r64(&r);
             assert(t2 == t1);
+            assert(r8(&r) == 0);                       /* v1.6 shard byte */
         }
         free(body.b);
 
         /* RESUME(t2, big): replay to 196, then LQ6/LQ7 push; LQ8 discovery
-         * hits the target check FIRST → reached; token retired */
+         * hits the target check FIRST → reached; token retired.
+         * (No trailing shard byte sent — the v1.5 request shape stays valid.) */
         pl_reset(&pl);
         w64(&pl, t2); w64(&pl, 100000);
         assert(cl_call(lfd, 6, OP_RESUME, &pl, &body) == ST_OK);
@@ -805,6 +808,7 @@ int main(void) {
             for (int i = 0; i < 9; i++) { char nm[8]; snprintf(nm, sizeof nm, "LQ%d", i); expect_name(&r, nm); }
             assert(r8(&r) == 1 && r8(&r) == 0);
             assert(r64(&r) == 0);
+            assert(r8(&r) == 0);                       /* v1.6 shard byte */
         }
         free(body.b);
 
@@ -812,6 +816,13 @@ int main(void) {
         pl_reset(&pl);
         w64(&pl, t2); w64(&pl, 1000);
         assert(cl_call(lfd, 7, OP_RESUME, &pl, &body) == ST_ERR);
+        { rd_t r = body_rd(&body); assert(r8(&r) == 3); }
+        free(body.b);
+
+        /* v1.6: a nonzero shard is not routable at N=1 (unknown shard, code 3) */
+        pl_reset(&pl);
+        w64(&pl, t2); w64(&pl, 1000); w8(&pl, 7);
+        assert(cl_call(lfd, 8, OP_RESUME, &pl, &body) == ST_ERR);
         { rd_t r = body_rd(&body); assert(r8(&r) == 3); }
         free(body.b);
 
@@ -826,6 +837,7 @@ int main(void) {
             for (u32 i = 0; i < n; i++) { u16 l; (void)rstr(&r, &l); }
             assert(r8(&r) == 0 && r8(&r) == 1);
             toks[c] = r64(&r);
+            assert(r8(&r) == 0);                       /* v1.6 shard byte */
             free(body.b);
         }
         assert(toks[0] != 0 && toks[1] != 0 && toks[2] == 0);

@@ -41,12 +41,20 @@
  * cut mid-search (§6.2 v4.0 rule). New OP_RESUME { u64 token, u64 budget } ->
  * find_path-shaped reply; failures reply ERR with [u8 code][str message],
  * codes: 1 = expired, 2 = stale (store advanced), 3 = unknown.
+ *
+ * v1.6: the shard-id space (docs/shard-seam-design-note.md §6/§10, spec §6.4
+ * r3.3). OP_FIND_PATH's and OP_RESUME's replies append a trailing u8 `shard`
+ * after the v1.5 continuation; OP_RESUME accepts an optional trailing u8
+ * shard (absent = KBD_SHARD_LOCAL). Nonzero is not routable at N=1 (ERR
+ * code 3, unknown shard). Leases carry their shard, so a continuation can
+ * migrate across shards (§6.2 SERIAL class) without a format break.
  */
 #ifndef DAEMON_PROTO_H
 #define DAEMON_PROTO_H
 
 #define KBD_MAX_FRAME   (1u << 20)
 #define KBD_PROTO_VER   1u
+#define KBD_SHARD_LOCAL 0u    /* v1.6: the single-shard id while N=1 */
 
 enum {
     OP_AUTH             = 0x01,   /* str token -> OK/ERR                     */
