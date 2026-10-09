@@ -531,6 +531,30 @@ int main(void) {
     }
     PASS();
 
+    TEST(create_reason_bytes);
+    {
+        /* v1.4: one reason byte per item after the eids (0=ok, 1=name over
+         * record cap, 2=type over record cap, 3=other). Old readers ignore
+         * the trailer. Kept at the END of the battery: it creates an entity
+         * and must not perturb earlier counts (types/orphans). */
+        static char big[9000];
+        memset(big, 'n', sizeof big - 1);
+        pl_reset(&pl);
+        w32(&pl, 3);
+        pl_str(&pl, "ReasonOk"); pl_str(&pl, "rt"); w64(&pl, 300);
+        wstr(&pl, (const u8 *)big, (u16)8000); pl_str(&pl, "rt"); w64(&pl, 301);
+        pl_str(&pl, "ReasonBadType"); wstr(&pl, (const u8 *)big, (u16)8000); w64(&pl, 302);
+        assert(cl_call(fd, 14, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        {
+            rd_t r = body_rd(&body);
+            u32 e1 = r32(&r), e2 = r32(&r), e3 = r32(&r);
+            assert(e1 != 0 && e2 == 0 && e3 == 0);
+            assert(r8(&r) == 0 && r8(&r) == 1 && r8(&r) == 2);
+        }
+        free(body.b);
+    }
+    PASS();
+
     TEST(find_path_beta_contract);
     {
         /* v1.3: the daemon FIND_PATH carries the v3 β-contract

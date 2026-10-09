@@ -30,6 +30,11 @@
  * v1.3: OP_FIND_PATH gains an optional trailing u64 `budget` (bytes; absent =
  * untracked) and its reply appends u8 targetReached + u8 budgetExhausted
  * after the name list — the v3 β-contract (Decision_FindPathBetaContractInC).
+ *
+ * v1.4: OP_CREATE_ENTITIES's reply appends one reason byte per item after the
+ * eids (0=ok, 1=name over record cap, 2=type over record cap, 3=other) so a
+ * refused create is a fact the client can turn into a visible error instead
+ * of an ambiguous eid=0.
  */
 #ifndef DAEMON_PROTO_H
 #define DAEMON_PROTO_H
@@ -42,7 +47,8 @@ enum {
     OP_PING             = 0x02,   /* -> OK, payload = u32 proto_ver          */
     OP_STATS            = 0x03,   /* -> u32 entities, u32 relations, u64 txid*/
 
-    OP_CREATE_ENTITIES  = 0x10,   /* u32 n x {str name, str type, u64 mtime} -> n x u32 eid   */
+    OP_CREATE_ENTITIES  = 0x10,   /* u32 n x {str name, str type, u64 mtime}
+                                     -> n x u32 eid, then n x u8 reason (v1.4) */
     OP_DELETE_ENTITIES  = 0x11,   /* u32 n x str name                        -> n x u8 ok     */
     OP_CREATE_RELATIONS = 0x12,   /* u32 n x {str f, str t, str rt, u64 mt}  -> n x u8 ok     */
     OP_DELETE_RELATIONS = 0x13,   /* u32 n x {str f, str t, str rt}          -> n x u8 ok     */

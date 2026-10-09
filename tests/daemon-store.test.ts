@@ -11,6 +11,7 @@ import { fileURLToPath } from 'url';
 import { jest } from '@jest/globals';
 import { DaemonClient } from '../src/daemon_client.js';
 import { DaemonStore } from '../src/daemon_store.js';
+import { StoreRecordError } from '../src/errors.js';
 import { DIR_FORWARD, DIR_BACKWARD } from '../src/store.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -99,6 +100,13 @@ describe('DaemonStore adapter', () => {
     const fnone = await store.findPath(p3, p1, 5, 'forward', 1n << 40n);
     expect(fnone.targetReached).toBe(false);
     expect(fnone.farthest).toBe(0n);
+  });
+
+  it('oversized name -> StoreRecordError (v1.4 reason byte)', async () => {
+    const bigName = 'L_' + 'x'.repeat(5000);
+    await expect(store.createEntity(bigName, 'bigT', 1n)).rejects.toThrow(StoreRecordError);
+    expect(await store.lookup(bigName)).toBe(0n);   // nothing was created
+    await expect(store.createEntity('OkName', 'okT', 2n)).resolves.toBeDefined();
   });
 
   it('randomWalk avoidCycles + uniformSteps trailer', async () => {

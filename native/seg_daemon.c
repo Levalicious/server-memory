@@ -195,16 +195,23 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
     case OP_CREATE_ENTITIES: {
         u32 n = r32(r);
         if (r->err || n > 100000) { err_reply(w, "bad batch"); return ST_ERR; }
-        if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
+        u8 *reasons = (u8 *)calloc(n ? n : 1, 1);
+        if (!reasons) { err_reply(w, "oom"); return ST_ERR; }
+        if (!mstore_txn_begin(k->ms)) { free(reasons); err_reply(w, "txn"); return ST_ERR; }
         if (k->dirty_counters) pw_flush_in_txn(k);
         for (u32 i = 0; i < n; i++) {
             u16 nl, tl;
             const u8 *nm = rstr(r, &nl), *ty = rstr(r, &tl);
             u64 mt = r64(r);
-            if (r->err) { mstore_txn_abort(k->ms); err_reply(w, "trunc"); return ST_ERR; }
+            if (r->err) { mstore_txn_abort(k->ms); free(reasons); err_reply(w, "trunc"); return ST_ERR; }
             u32 eid = g4_create_entity(k->g, nm, nl, ty, tl, mt);
+            if (!eid)   /* v1.4: why — the same cap st4_intern enforces */
+                reasons[i] = (nl > SEG_PAGE_MAX_REC - 4) ? 1
+                           : (tl > SEG_PAGE_MAX_REC - 4) ? 2 : 3;
             w32(w, eid);
         }
+        for (u32 i = 0; i < n; i++) w8(w, reasons[i]);
+        free(reasons);
         if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
         return ST_OK;
     }

@@ -13,6 +13,7 @@
  */
 import { DaemonClient, OP, R, ST_OK } from './daemon_client.js';
 import { DIR_FORWARD, DIR_BACKWARD, type Direction } from './store.js';
+import { StoreRecordError } from './errors.js';
 import type { GraphBackend, BackendEntity, BackendEdge, BackendRanks, BackendValidation, ScanRow } from './backend.js';
 
 /** Results-paging chunk size (frames are capped at 1 MiB by the daemon). */
@@ -129,8 +130,16 @@ export class DaemonStore implements GraphBackend {
     const body = await client.callOk(OP.CREATE_ENTITIES, (w) => {
       w.u32(1); w.str(name); w.str(type); w.u64(mtime);
     });
-    const eid = new R(body).u32();
-    if (!eid) throw new Error(`daemon store: create returned no eid for "${name}"`);
+    const r = new R(body);
+    const eid = r.u32();
+    if (!eid) {
+      // v1.4 reason byte: 1=name over cap, 2=type over cap, 3=other (absent on
+      // older daemons). Facts, not policy — server.ts maps to the envelope.
+      const reason = r.remaining >= 1 ? r.u8() : 3;
+      if (reason === 1) throw new StoreRecordError('name', Buffer.byteLength(name, 'utf8'));
+      if (reason === 2) throw new StoreRecordError('type', Buffer.byteLength(type, 'utf8'));
+      throw new Error(`daemon store: create returned no eid for "${name.slice(0, 64)}"`);
+    }
     return this.handle(name);
   }
 

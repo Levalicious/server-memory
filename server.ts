@@ -13,6 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { DIR_FORWARD, DIR_BACKWARD } from './src/store.js';
 import { createBackend, type GraphBackend, type BackendEntity } from './src/backend.js';
+import { StoreRecordError } from './src/errors.js';
 import { ensureV3 } from './src/migrate.js';
 import { validateExtension, loadDocument, type KbLoadResult } from './src/kb_load.js';
 import { toolDurationHistogram, traced, tracer } from './src/tracing.js';
@@ -675,7 +676,22 @@ export class KnowledgeGraphManager {
       // Pass 2 — create.
       const newEntities: Entity[] = [];
       for (const e of toCreate) {
-        const offset = await this.db.createEntity(e.name, e.entityType, now);
+        let offset: bigint;
+        try {
+          offset = await this.db.createEntity(e.name, e.entityType, now);
+        } catch (err) {
+          if (err instanceof StoreRecordError) {
+            // Storage fact -> policy: the record cap is a caller-actionable
+            // limit (R3); message truncates the name, details carry it whole.
+            const label = e.name.length > 64 ? `${e.name.slice(0, 64)}…` : e.name;
+            throw new ToolError(
+              'LIMIT_EXCEEDED',
+              `entity "${label}": ${err.message}`,
+              { entity: label, field: err.field, bytes: err.bytes },
+            );
+          }
+          throw err;
+        }
         for (const obs of e.observations) {
           await this.db.addObservation(offset, obs, now);
         }
