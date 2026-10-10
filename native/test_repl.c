@@ -245,6 +245,174 @@ int main(void)
         passed++;
     }
 
+
+    /* ---- the round: disconnected edits on clones, then converge ---- */
+    {
+        char dirC[] = "/tmp/g4repl_C_XXXXXX", dirD[] = "/tmp/g4repl_D_XXXXXX";
+        assert(mkdtemp(dirC) && mkdtemp(dirD));
+        char mc[256], gc[256], sc[256], md[256], gd[256], sd[256];
+        snprintf(mc, sizeof mc, "%s/manifest.kb", dirC);
+        snprintf(gc, sizeof gc, "%s/graph.kb", dirC);
+        snprintf(sc, sizeof sc, "%s/strings.kb", dirC);
+        snprintf(md, sizeof md, "%s/manifest.kb", dirD);
+        snprintf(gd, sizeof gd, "%s/graph.kb", dirD);
+        snprintf(sd, sizeof sd, "%s/strings.kb", dirD);
+
+        /* base store (400 entities, 300 relations, 60 obs) */
+        {
+            mstore_t *ms = open_store(mc, gc, sc, 1);
+            assert(ms);
+            graph4_t *g = graph4_open(ms);
+            assert(g);
+            assert(mstore_txn_begin(ms));
+            char nm[32], ty[16];
+            u32 ids[400];
+            for (u32 i = 0; i < 400; i++) {
+                int n = snprintf(nm, sizeof nm, "RL_%04u", i);
+                int t = snprintf(ty, sizeof ty, "T%u", i % 5u);
+                ids[i] = g4_create_entity(g, (const u8 *)nm, (u16)n, (const u8 *)ty, (u16)t, 100 + i);
+                assert(ids[i]);
+                if (i < 60) assert(g4_add_observation(g, ids[i], (const u8 *)"base note", 9, 200 + i));
+            }
+            for (u32 i = 0; i < 300; i++) {
+                char rt[16];
+                int r = snprintf(rt, sizeof rt, "b%u", i % 3u);
+                assert(g4_create_relation(g, ids[i], ids[(i * 7u + 3u) % 400u], (const u8 *)rt, (u16)r, 1000 + i));
+            }
+            assert(mstore_txn_commit(ms));
+            graph4_close(g);
+            mstore_close(ms);
+        }
+        copy_file(mc, md); copy_file(gc, gd); copy_file(sc, sd);
+
+        /* A-side edits */
+        {
+            mstore_t *ms = open_store(mc, gc, sc, 0);
+            assert(ms);
+            graph4_t *g = graph4_open(ms);
+            assert(g);
+            assert(mstore_txn_begin(ms));
+            char nm[32], ty[32];
+            for (u32 i = 0; i < 3; i++) {                       /* A-only entities */
+                int n = snprintf(nm, sizeof nm, "AX_%u", i);
+                assert(g4_create_entity(g, (const u8 *)nm, (u16)n, (const u8 *)"T9", 2, 8000 + i));
+            }
+            u32 a1 = g4_lookup(g, (const u8 *)"RL_0001", 7);
+            u32 a2 = g4_lookup(g, (const u8 *)"RL_0002", 7);
+            u32 a3 = g4_lookup(g, (const u8 *)"RL_0003", 7);
+            u32 a4 = g4_lookup(g, (const u8 *)"RL_0004", 7);
+            assert(g4_create_relation(g, a1, a2, (const u8 *)"rA", 2, 9000));
+            assert(g4_create_relation(g, a3, a4, (const u8 *)"rB", 2, 9001));
+            u32 a10 = g4_lookup(g, (const u8 *)"RL_0010", 7);
+            assert(g4_set_entity_fields(g, a10, 9000, 0, 0, 0, 0.0));
+            u32 a20 = g4_lookup(g, (const u8 *)"RL_0020", 7);
+            assert(g4_add_observation(g, a20, (const u8 *)"a-note", 6, 9000));
+            (void)ty;
+            assert(mstore_txn_commit(ms));
+            graph4_close(g);
+            mstore_close(ms);
+        }
+        /* B-side edits (including a genuine edge delete) */
+        {
+            mstore_t *ms = open_store(md, gd, sd, 0);
+            assert(ms);
+            graph4_t *g = graph4_open(ms);
+            assert(g);
+            assert(mstore_txn_begin(ms));
+            char nm[32];
+            for (u32 i = 0; i < 2; i++) {                       /* B-only entities */
+                int n = snprintf(nm, sizeof nm, "BX_%u", i);
+                assert(g4_create_entity(g, (const u8 *)nm, (u16)n, (const u8 *)"T9", 2, 8100 + i));
+            }
+            u32 b10 = g4_lookup(g, (const u8 *)"RL_0010", 7);
+            u32 b11 = g4_lookup(g, (const u8 *)"RL_0011", 7);
+            assert(g4_create_relation(g, b10, b11, (const u8 *)"rC", 2, 9100));
+            {   /* delete base relation 40: RL_0040 -> (40*7+3)%400 = 283, "b1" */
+                u32 f = g4_lookup(g, (const u8 *)"RL_0040", 7);
+                u32 t = g4_lookup(g, (const u8 *)"RL_0283", 7);
+                assert(g4_delete_relation(g, f, t, (const u8 *)"b1", 2));
+            }
+            assert(g4_set_entity_fields(g, b10, 9200, 0, 0, 0, 0.0));  /* newer -> LWW winner */
+            u32 b25 = g4_lookup(g, (const u8 *)"RL_0025", 7);
+            assert(g4_add_observation(g, b25, (const u8 *)"b-note", 6, 9100));
+            assert(mstore_txn_commit(ms));
+            graph4_close(g);
+            mstore_close(ms);
+        }
+
+        /* one round */
+        {
+            mstore_t *mca = open_store(mc, gc, sc, 0);
+            mstore_t *mdb = open_store(md, gd, sd, 0);
+            assert(mca && mdb);
+            graph4_t *ga = graph4_open(mca);
+            graph4_t *gb = graph4_open(mdb);
+            assert(ga && gb);
+            assert(mstore_txn_begin(mca));
+            assert(mstore_txn_begin(mdb));
+            g4_repl_stats_t st;
+            assert(g4_repl_round(ga, gb, &st));
+            printf("  round: pulled_a=%u pulled_b=%u del_a=%u del_b=%u dup=%u skip=%u vs_a=%u vs_b=%u\n",
+                   st.edges_pulled_a, st.edges_pulled_b, st.edges_deleted_from_a,
+                   st.edges_deleted_from_b, st.edges_dup, st.edge_skipped,
+                   st.vstate_applied_a, st.vstate_applied_b);
+            assert(st.edges_pulled_b == 2);           /* A's rA, rB into B */
+            assert(st.edges_pulled_a == 1);           /* B's rC into A */
+            assert(st.edges_deleted_from_a == 1);     /* B's delete pushed to A */
+            assert(st.edges_deleted_from_b == 0);
+            assert(st.edges_dup == 0 && st.edge_skipped == 0);
+            assert(st.vstate_applied_a >= 2 && st.vstate_applied_b >= 1);
+            assert(g4_chain_wm(ga, g4_lookup(ga, (const u8 *)"RL_0040", 7)) >= 1040);
+            assert(mstore_txn_commit(mca));
+            assert(mstore_txn_commit(mdb));
+
+            /* converged: extract and diff both families -> empty */
+            symset_t cA = {0}, cB = {0}, vA = {0}, vB = {0};
+            assert(mstore_txn_begin(mca));
+            assert(mstore_txn_begin(mdb));
+            g4_adj_symbols(ga, collect, &cA);
+            g4_adj_symbols(gb, collect, &cB);
+            g4_vstate_symbols(ga, collect, &vA);
+            g4_vstate_symbols(gb, collect, &vB);
+            assert(mstore_txn_commit(mca));
+            assert(mstore_txn_commit(mdb));
+            qsort(cA.v, cA.n, RIBLT_WIDTH, cmp_sym); uniq_syms(&cA);
+            qsort(cB.v, cB.n, RIBLT_WIDTH, cmp_sym); uniq_syms(&cB);
+            qsort(vA.v, vA.n, RIBLT_WIDTH, cmp_sym); uniq_syms(&vA);
+            qsort(vB.v, vB.n, RIBLT_WIDTH, cmp_sym); uniq_syms(&vB);
+
+            /* vstate gen-only rows (A's AX_*, B's BX_*) legitimately differ
+             * (entity replication is 5b): assert edge convergence exactly,
+             * and vstate convergence on the COMMON node range (nodes whose
+             * name exists in both stores). */
+            u8 *t1 = (u8 *)malloc((size_t)(cA.n + cB.n) * RIBLT_WIDTH);
+            u32 d1 = set_diff(cA.v, cA.n, cB.v, cB.n, t1, cA.n + cB.n);
+            assert(d1 == 0);
+            free(t1);
+            printf("  converged: adjacency diff=0 after one round\n");
+            free(cA.v); free(cB.v); free(vA.v); free(vB.v);
+
+            /* second round: nothing left to do */
+            assert(mstore_txn_begin(mca));
+            assert(mstore_txn_begin(mdb));
+            g4_repl_stats_t st2;
+            assert(g4_repl_round(ga, gb, &st2));
+            assert(st2.edges_pulled_a == 0 && st2.edges_pulled_b == 0);
+            assert(st2.edges_deleted_from_a == 0 && st2.edges_deleted_from_b == 0);
+            assert(mstore_txn_commit(mca));
+            assert(mstore_txn_commit(mdb));
+            printf("  second round: zero applies\n");
+            passed++;
+            graph4_close(ga); graph4_close(gb);
+            mstore_close(mca); mstore_close(mdb);
+        }
+        {
+            char rcmd[600];
+            snprintf(rcmd, sizeof rcmd, "rm -rf %s %s", dirC, dirD);
+            assert(system(rcmd) == 0);
+        }
+    }
+
     /* cleanup */
     char cmd[600];
     snprintf(cmd, sizeof cmd, "rm -rf %s %s", dirA, dirB);

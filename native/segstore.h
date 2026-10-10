@@ -549,6 +549,17 @@ u64  g4_relhash(graph4_t *g, u32 rel_sid); /* string-stable reltype hash (symbol
 int  g4_half_put(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u64 mtime, u32 dir_stored);
 int  g4_half_del(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u32 dir_stored);
 
+/* ---- the pairwise round (seam §5, step 5a-ii) ----
+ * One anti-entropy round between two clone-lineage stores; runs inside the
+ * caller's txns (one per store); extract-then-apply. 1 = round completed. */
+typedef struct {
+    u32 edges_pulled_a, edges_pulled_b;          /* edges pulled INTO a / b  */
+    u32 edges_deleted_from_a, edges_deleted_from_b;
+    u32 edges_dup, edge_skipped;
+    u32 vstate_applied_a, vstate_applied_b, vstate_skipped;
+} g4_repl_stats_t;
+int  g4_repl_round(graph4_t *a, graph4_t *b, g4_repl_stats_t *st);
+
 typedef struct {
     u32 eid, name_sid, type_sid, adj_ref;
     u64 mtime, obs_mtime;

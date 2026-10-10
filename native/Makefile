@@ -16,7 +16,7 @@ OUT ?= /tmp/mf_test.$(shell echo $$PPID)
 test_riblt: test_riblt.c riblt.c blake2s.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_riblt && $(OUT)_riblt
 
-REPL_SRC = test_repl.c riblt.c blake2s.c seg_tree.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
+REPL_SRC = test_repl.c seg_repl.c riblt.c blake2s.c seg_tree.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
 test_repl: $(REPL_SRC)
 	$(CC) $(CFLAGS) $(REPL_SRC) $(LIBS) -o $(OUT)_repl && $(OUT)_repl
 

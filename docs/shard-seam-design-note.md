@@ -204,9 +204,15 @@ unboundedly.**
 3. Name directory store (hash-routed bindings + generations).
    **DONE (this commit).**
 4. Replication channel + RIBLT port + symbol codecs + watermarks.
-   RIBLT port + codecs + reconcile-on-real-data **DONE (`13d5c1a` +
-   this commit)**; the daemon channel op classes and peer watermarks land
-   with the sharded fuzz (step 5), where peers exist to exercise them.
+   RIBLT port + codecs **DONE (`13d5c1a`, `b5f6f56`)**; canonical edge
+   symbols + remove-watermark + primitives **DONE (`edde1b9`)**; the
+   pairwise **round DONE (`seg_repl.c`)**: extract/dedup -> one RIBLT
+   decode (both diffs) -> apply (edge pull, watermark delete propagation,
+   whole-row LWW vstate) — `test_repl` converges disconnected clones with
+   a genuine edge delete in one round, second round is zero. Remaining
+   5b: daemon channel op classes (REPLICA/ANTI_ENTROPY), peer watermarks,
+   mirror tables, entity tombstones + directory reconciliation; then the
+   sharded fuzz (step 5 continuation) as the multi-daemon gate.
 5. Sharded fuzz: extend the existing 30-agent harness to N daemons over N
    shards, with kill-mid-half-write, offline-past-horizon resync, and
    convergence assertions. This is the gate for every step above.
