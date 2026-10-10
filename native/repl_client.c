@@ -334,6 +334,97 @@ static int wp_edge_del(void *ctx, const u8 *sym, u8 *status) {
     return 1;
 }
 
+static int wp_name_get(void *ctx, const u8 *name, u16 nl, u32 *node, u32 *gen) {
+    g4_wire_peer_t *p = (g4_wire_peer_t *)ctx;
+    cw_t pl = {0};
+    cw_u32(&pl, 1);
+    cw_str(&pl, name, nl);
+    u8 *body = NULL;
+    u32 blen = 0;
+    int r = wp_rt(p, OP_RE_NAME, &pl, &body, &blen);
+    free(pl.buf);
+    if (r != 1) { free(body); return 0; }
+    cr_t cr = { body, body + blen, 0 };
+    u8 found = cr_u8(&cr);
+    if (found == 1) { *node = cr_u32(&cr); *gen = cr_u32(&cr); }
+    int ok = found == 1 && !cr.err;
+    free(body);
+    return ok;
+}
+
+static int wp_name_set(void *ctx, const u8 *name, u16 nl, u32 node, u32 gen, u8 *status) {
+    g4_wire_peer_t *p = (g4_wire_peer_t *)ctx;
+    cw_t pl = {0};
+    cw_u32(&pl, 1);
+    cw_str(&pl, name, nl);
+    cw_u32(&pl, node);
+    cw_u32(&pl, gen);
+    u8 *body = NULL;
+    u32 blen = 0;
+    int r = wp_rt(p, OP_RE_NAME_SET, &pl, &body, &blen);
+    free(pl.buf);
+    if (r != 1) { free(body); return 0; }
+    cr_t cr = { body, body + blen, 0 };
+    u8 st = cr_u8(&cr);
+    free(body);
+    if (cr.err) return 0;
+    *status = st;
+    return 1;
+}
+
+static int wp_entity_get(void *ctx, u32 node, u8 *name, u16 *nl, u32 *gen,
+                         u8 *blob, u32 *blen) {
+    g4_wire_peer_t *p = (g4_wire_peer_t *)ctx;
+    cw_t pl = {0};
+    cw_u32(&pl, 1);
+    cw_u32(&pl, node);
+    u8 *body = NULL;
+    u32 rbl = 0;
+    int r = wp_rt(p, OP_RE_ENTITY, &pl, &body, &rbl);
+    free(pl.buf);
+    if (r != 1) { free(body); return 0; }
+    cr_t cr = { body, body + rbl, 0 };
+    u8 found = cr_u8(&cr);
+    int ok = 0;
+    if (found == 1 && !cr.err) {
+        const u8 *nm = cr_str(&cr, nl);
+        u32 g = cr_u32(&cr), bl = cr_u32(&cr);
+        if (nm && !cr.err && *nl <= G4_REPL_STR_CAP && bl <= G4_REPL_ROW_CAP &&
+            cr.p + bl <= cr.end) {
+            memcpy(name, nm, *nl);
+            memcpy(blob, cr.p, bl);
+            *gen = g;
+            *blen = bl;
+            ok = 1;
+        }
+    }
+    free(body);
+    return ok;
+}
+
+static int wp_entity_set(void *ctx, u32 node, const u8 *name, u16 nl, u32 gen,
+                         const u8 *blob, u32 blen, u8 *status) {
+    g4_wire_peer_t *p = (g4_wire_peer_t *)ctx;
+    cw_t pl = {0};
+    cw_u32(&pl, 1);
+    cw_u32(&pl, node);
+    cw_str(&pl, name, nl);
+    cw_u32(&pl, gen);
+    cw_u32(&pl, blen);
+    cw_bytes(&pl, blob, blen);
+    u8 *body = NULL;
+    u32 rbl = 0;
+    int r = wp_rt(p, OP_RE_ENTITY_SET, &pl, &body, &rbl);
+    free(pl.buf);
+    if (r != 1) { free(body); return 0; }
+    cr_t cr = { body, body + rbl, 0 };
+    u8 st = cr_u8(&cr);
+    free(body);
+    if (cr.err) return 0;
+    *status = st;
+    return 1;
+}
+
 repl_peer_t *g4_wire_peer_iface(g4_wire_peer_t *p) {
     p->iface.ctx = p;
     p->iface.begin = wp_begin;
@@ -344,5 +435,9 @@ repl_peer_t *g4_wire_peer_iface(g4_wire_peer_t *p) {
     p->iface.vrow_set = wp_vrow_set;
     p->iface.edge_pull = wp_edge_pull;
     p->iface.edge_del = wp_edge_del;
+    p->iface.name_get = wp_name_get;
+    p->iface.name_set = wp_name_set;
+    p->iface.entity_get = wp_entity_get;
+    p->iface.entity_set = wp_entity_set;
     return &p->iface;
 }

@@ -93,6 +93,8 @@ static mstore_t *open_store(const char *mp, const char *gp, const char *sp, int 
 
 /* ---- daemon spawn (test_daemon pattern) ---- */
 
+static const char *g_node_base = NULL;   /* KBD_NODE_BASE for spawned daemons */
+
 static pid_t spawn_daemon(const char *dir, const char *token, unsigned short *port_out) {
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
@@ -112,6 +114,7 @@ static pid_t spawn_daemon(const char *dir, const char *token, unsigned short *po
     assert(pid >= 0);
     if (pid == 0) {
         signal(SIGTERM, on_term);
+        if (g_node_base) setenv("KBD_NODE_BASE", g_node_base, 1);
         kbd_t *k = kbd_open(dir);
         if (!k) _exit(1);
         strncpy(k->token, token, sizeof k->token - 1);
@@ -191,6 +194,9 @@ int main(void) {
     printf("test_repl_wire:\n");
     assert(RIBLT_WIDTH == G4_SYM_LEN);
     const char *TOKEN = "repl-wire-token";
+    g_node_base = "8192";      /* B's id space; A takes 16384 below (5b-ii) */
+    u32 a_cc = 0, a_ii = 0, b_cc = 0, b_ii = 0;
+    char victim_name[32] = {0};
 
     char dirA[] = "/tmp/g4wire_A_XXXXXX", dirB[] = "/tmp/g4wire_B_XXXXXX";
     assert(mkdtemp(dirA) && mkdtemp(dirB));
@@ -236,6 +242,7 @@ int main(void) {
         graph4_t *g = graph4_open(ms);
         assert(g);
         assert(mstore_txn_begin(ms));
+        assert(g4_set_next_node(g, 16384) == 16384);
         char nm[32];
         for (u32 i = 0; i < 3; i++) {
             int n = snprintf(nm, sizeof nm, "AX_%u", i);
@@ -247,6 +254,10 @@ int main(void) {
         u32 a4 = g4_lookup(g, (const u8 *)"RW_0004", 7);
         assert(g4_create_relation(g, a1, a2, (const u8 *)"rA", 2, 9000));
         assert(g4_create_relation(g, a3, a4, (const u8 *)"rB", 2, 9001));
+        a_cc = g4_create_entity(g, (const u8 *)"CC_9", 4, (const u8 *)"T9", 2, 8300);
+        assert(a_cc >= 16384);
+        a_ii = g4_create_entity(g, (const u8 *)"II_9", 4, (const u8 *)"T9", 2, 8301);
+        assert(a_ii > a_cc);
         u32 a10 = g4_lookup(g, (const u8 *)"RW_0010", 7);
         assert(g4_set_entity_fields(g, a10, 9000, 0, 0, 0, 0.0));
         u32 a20 = g4_lookup(g, (const u8 *)"RW_0020", 7);
@@ -262,6 +273,7 @@ int main(void) {
         graph4_t *g = graph4_open(ms);
         assert(g);
         assert(mstore_txn_begin(ms));
+        assert(g4_set_next_node(g, 8192) == 8192);
         char nm[32];
         for (u32 i = 0; i < 2; i++) {
             int n = snprintf(nm, sizeof nm, "BX_%u", i);
@@ -278,6 +290,23 @@ int main(void) {
         assert(g4_set_entity_fields(g, b10, 9200, 0, 0, 0, 0.0));   /* newer: LWW winner */
         u32 b25 = g4_lookup(g, (const u8 *)"RW_0025", 7);
         assert(g4_add_observation(g, b25, (const u8 *)"b-note", 6, 9100));
+        b_cc = g4_create_entity(g, (const u8 *)"CC_9", 4, (const u8 *)"T9", 2, 8400);
+        assert(b_cc >= 8192 && b_cc < 16384);
+        b_ii = g4_create_entity(g, (const u8 *)"II_9", 4, (const u8 *)"T9", 2, 8401);
+        assert(b_ii > b_cc);
+        {   /* entity delete with no incident edges: clean tombstone carry */
+            u32 v = 0;
+            for (u32 c = 301; c < 400 && !v; c++) {
+                int hit = 0;
+                for (u32 i = 0; i < 300 && !hit; i++)
+                    if ((i * 7u + 3u) % 400u == c) hit = 1;
+                if (!hit) v = c;
+            }
+            assert(v);
+            snprintf(victim_name, sizeof victim_name, "RW_%04u", v);
+            u32 vid = g4_lookup(g, (const u8 *)victim_name, 7);
+            assert(vid && g4_delete_entity(g, vid));
+        }
         assert(mstore_txn_commit(ms));
         graph4_close(g);
         mstore_close(ms);
@@ -333,16 +362,23 @@ int main(void) {
         assert(peer);
         g4_repl_stats_t st;
         assert(g4_repl_round_wire(ga, g4_wire_peer_iface(peer), &st));
-        printf("(pulled_a=%u pulled_b=%u del_a=%u del_b=%u dup=%u skip=%u vs_a=%u vs_b=%u) ",
+        printf("(pulled_a=%u pulled_b=%u del_a=%u del_b=%u dup=%u skip=%u vs_a=%u vs_b=%u ent_a=%u ent_b=%u name_a=%u name_b=%u) ",
                st.edges_pulled_a, st.edges_pulled_b, st.edges_deleted_from_a,
                st.edges_deleted_from_b, st.edges_dup, st.edge_skipped,
-               st.vstate_applied_a, st.vstate_applied_b);
+               st.vstate_applied_a, st.vstate_applied_b,
+               st.entity_pulled_a, st.entity_pushed_b,
+               st.name_applied_a, st.name_applied_b);
         assert(st.edges_pulled_b == 2);            /* A's rA, rB into B       */
         assert(st.edges_pulled_a == 1);            /* B's rC into A           */
         assert(st.edges_deleted_from_a == 1);      /* B's delete, decided at B */
         assert(st.edges_deleted_from_b == 0);
         assert(st.edges_dup == 0 && st.edge_skipped == 0);
-        assert(st.vstate_applied_a >= 2 && st.vstate_applied_b >= 1);
+        assert(st.vstate_applied_a >= 1 && st.vstate_applied_b >= 1);
+        /* 5b-ii over the wire: mirrors + name rows, same counts as in-proc */
+        assert(st.entity_pushed_b == 5);           /* AX_0..2 + CC_9 + II_9  */
+        assert(st.entity_pulled_a == 2);           /* BX_0..1                */
+        assert(st.name_applied_a == 1);            /* victim tombstone adopted */
+        assert(st.name_applied_b == 2);            /* CC_9, II_9: A's nodes win */
         assert(g4_chain_wm(ga, g4_lookup(ga, (const u8 *)"RW_0040", 7)) >= 1040);
         assert(mstore_txn_commit(ma));
         g4_wire_peer_close(peer);
@@ -367,12 +403,43 @@ int main(void) {
         free(t1);
         free(cA.v); free(cB.v);
 
-        /* transport equivalence: one in-process round applies nothing */
+        /* entity mirrors + name rows (5b-ii) */
+        {
+            g4_entity_t tmp;
+            u32 nm2 = 0, gn2 = 0;
+            u32 ax0 = g4_lookup(gb, (const u8 *)"AX_0", 4);
+            assert(ax0 >= 16384 && g4_read_entity(gb, ax0, &tmp));
+            u32 bx0 = g4_lookup(ga, (const u8 *)"BX_0", 4);
+            assert(bx0 >= 8192 && bx0 < 16384 && g4_read_entity(ga, bx0, &tmp));
+            u32 ca = g4_lookup(ga, (const u8 *)"CC_9", 4);
+            u32 cb = g4_lookup(gb, (const u8 *)"CC_9", 4);
+            assert(ca && ca == cb && ca == a_cc);
+            u32 ia = g4_lookup(ga, (const u8 *)"II_9", 4);
+            u32 ib = g4_lookup(gb, (const u8 *)"II_9", 4);
+            assert(ia && ia == ib && ia == a_ii);
+            assert(!g4_read_entity(ga, b_cc, &tmp) && !g4_read_entity(gb, b_cc, &tmp));
+            assert(!g4_read_entity(ga, b_ii, &tmp) && !g4_read_entity(gb, b_ii, &tmp));
+            assert(!g4_lookup(ga, (const u8 *)victim_name, 7));
+            assert(!g4_lookup(gb, (const u8 *)victim_name, 7));
+            assert(g4_name_get(ga, (const u8 *)victim_name, 7, &nm2, &gn2) && nm2 == 0);
+            assert(gn2 == 2);
+            assert(g4_name_get(gb, (const u8 *)victim_name, 7, &nm2, &gn2) && nm2 == 0);
+            assert(gn2 == 2);
+        }
+
+        /* the daemon ran its background rank job (ψ churn is the relaxed-
+         * counter class) between/after the rounds; one settling in-process
+         * round absorbs it, and the round AFTER that must apply nothing */
         assert(mstore_txn_begin(ma));
         g4_repl_stats_t st2;
         assert(g4_repl_round(ga, gb, &st2));
-        assert(st2.edges_pulled_a == 0 && st2.edges_pulled_b == 0);
-        assert(st2.edges_deleted_from_a == 0 && st2.edges_deleted_from_b == 0);
+        g4_repl_stats_t st3;
+        assert(g4_repl_round(ga, gb, &st3));
+        assert(st3.edges_pulled_a == 0 && st3.edges_pulled_b == 0);
+        assert(st3.edges_deleted_from_a == 0 && st3.edges_deleted_from_b == 0);
+        assert(st3.vstate_applied_a == 0 && st3.vstate_applied_b == 0);
+        assert(st3.entity_pulled_a == 0 && st3.entity_pushed_b == 0);
+        assert(st3.name_applied_a == 0 && st3.name_applied_b == 0);
         assert(mstore_txn_commit(ma));
         assert(mstore_txn_commit(mb));
         graph4_close(ga); graph4_close(gb);
@@ -417,18 +484,23 @@ int main(void) {
             u8 *body = NULL; u32 blen = 0;
             int st = cl_call(fa, 13, OP_RE_ROUND, &pl, &body, &blen);
             assert(st == ST_OK);
-            assert(blen == 36);
+            assert(blen == 52);                 /* 13 u32 counters */
             rd_t rr = { body, body + blen, 0 };
             u32 pulled_a = r32(&rr), pulled_b = r32(&rr);
             u32 del_a = r32(&rr), del_b = r32(&rr);
             u32 dup = r32(&rr), skip = r32(&rr);
             u32 vs_a = r32(&rr), vs_b = r32(&rr);
             (void)r32(&rr);                     /* vs_skip */
-            printf("(pulled_a=%u pulled_b=%u del_a=%u del_b=%u dup=%u skip=%u vs_a=%u vs_b=%u) ",
-                   pulled_a, pulled_b, del_a, del_b, dup, skip, vs_a, vs_b);
+            u32 ent_a = r32(&rr), ent_b = r32(&rr);
+            u32 name_a = r32(&rr), name_b = r32(&rr);
+            printf("(pulled_a=%u pulled_b=%u del_a=%u del_b=%u dup=%u skip=%u vs_a=%u vs_b=%u ent_a=%u ent_b=%u name_a=%u name_b=%u) ",
+                   pulled_a, pulled_b, del_a, del_b, dup, skip, vs_a, vs_b,
+                   ent_a, ent_b, name_a, name_b);
             assert(pulled_a == 1 && pulled_b == 1);   /* wB into A, wA into B */
             assert(del_a == 0 && del_b == 0 && dup == 0 && skip == 0);
             assert(vs_a >= 1 && vs_b >= 1);           /* the mtime bumps      */
+            assert(ent_a == 0 && ent_b == 0);         /* no one-sided entities */
+            assert(name_a == 0 && name_b == 0);
             free(body);
             free(pl.buf);
         }
@@ -455,9 +527,14 @@ int main(void) {
         u32 d1 = set_diff(cA.v, cA.n, cB.v, cB.n, t1, cA.n + cB.n);
         assert(d1 == 0);
         free(t1); free(cA.v); free(cB.v);
+        g4_repl_stats_t st2s;
+        assert(g4_repl_round(ga, gb, &st2s));   /* settle daemon rank churn */
         g4_repl_stats_t st2;
         assert(g4_repl_round(ga, gb, &st2));
         assert(st2.edges_pulled_a == 0 && st2.edges_pulled_b == 0);
+        assert(st2.vstate_applied_a == 0 && st2.vstate_applied_b == 0);
+        assert(st2.entity_pulled_a == 0 && st2.entity_pushed_b == 0);
+        assert(st2.name_applied_a == 0 && st2.name_applied_b == 0);
         assert(mstore_txn_commit(ma));
         assert(mstore_txn_commit(mb));
         graph4_close(ga); graph4_close(gb);

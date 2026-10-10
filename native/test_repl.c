@@ -257,6 +257,8 @@ int main(void)
         snprintf(md, sizeof md, "%s/manifest.kb", dirD);
         snprintf(gd, sizeof gd, "%s/graph.kb", dirD);
         snprintf(sd, sizeof sd, "%s/strings.kb", dirD);
+        u32 a_cc = 0, a_ii = 0, b_cc = 0, b_ii = 0;
+        char victim_name[32] = {0};
 
         /* base store (400 entities, 300 relations, 60 obs) */
         {
@@ -292,6 +294,7 @@ int main(void)
             graph4_t *g = graph4_open(ms);
             assert(g);
             assert(mstore_txn_begin(ms));
+            assert(g4_set_next_node(g, 16384) == 16384);   /* disjoint id space (5b-ii) */
             char nm[32], ty[32];
             for (u32 i = 0; i < 3; i++) {                       /* A-only entities */
                 int n = snprintf(nm, sizeof nm, "AX_%u", i);
@@ -303,6 +306,10 @@ int main(void)
             u32 a4 = g4_lookup(g, (const u8 *)"RL_0004", 7);
             assert(g4_create_relation(g, a1, a2, (const u8 *)"rA", 2, 9000));
             assert(g4_create_relation(g, a3, a4, (const u8 *)"rB", 2, 9001));
+            a_cc = g4_create_entity(g, (const u8 *)"CC_9", 4, (const u8 *)"T9", 2, 8300);
+            assert(a_cc >= 16384);
+            a_ii = g4_create_entity(g, (const u8 *)"II_9", 4, (const u8 *)"T9", 2, 8301);
+            assert(a_ii > a_cc);
             u32 a10 = g4_lookup(g, (const u8 *)"RL_0010", 7);
             assert(g4_set_entity_fields(g, a10, 9000, 0, 0, 0, 0.0));
             u32 a20 = g4_lookup(g, (const u8 *)"RL_0020", 7);
@@ -319,6 +326,7 @@ int main(void)
             graph4_t *g = graph4_open(ms);
             assert(g);
             assert(mstore_txn_begin(ms));
+            assert(g4_set_next_node(g, 8192) == 8192);     /* disjoint id space (5b-ii) */
             char nm[32];
             for (u32 i = 0; i < 2; i++) {                       /* B-only entities */
                 int n = snprintf(nm, sizeof nm, "BX_%u", i);
@@ -335,6 +343,23 @@ int main(void)
             assert(g4_set_entity_fields(g, b10, 9200, 0, 0, 0, 0.0));  /* newer -> LWW winner */
             u32 b25 = g4_lookup(g, (const u8 *)"RL_0025", 7);
             assert(g4_add_observation(g, b25, (const u8 *)"b-note", 6, 9100));
+            b_cc = g4_create_entity(g, (const u8 *)"CC_9", 4, (const u8 *)"T9", 2, 8400);
+            assert(b_cc >= 8192 && b_cc < 16384);
+            b_ii = g4_create_entity(g, (const u8 *)"II_9", 4, (const u8 *)"T9", 2, 8401);
+            assert(b_ii > b_cc);
+            {   /* entity delete with no incident edges: clean tombstone carry */
+                u32 v = 0;
+                for (u32 c = 301; c < 400 && !v; c++) {
+                    int hit = 0;
+                    for (u32 i = 0; i < 300 && !hit; i++)
+                        if ((i * 7u + 3u) % 400u == c) hit = 1;
+                    if (!hit) v = c;
+                }
+                assert(v);
+                snprintf(victim_name, sizeof victim_name, "RL_%04u", v);
+                u32 vid = g4_lookup(g, (const u8 *)victim_name, 7);
+                assert(vid && g4_delete_entity(g, vid));
+            }
             assert(mstore_txn_commit(ms));
             graph4_close(g);
             mstore_close(ms);
@@ -352,17 +377,46 @@ int main(void)
             assert(mstore_txn_begin(mdb));
             g4_repl_stats_t st;
             assert(g4_repl_round(ga, gb, &st));
-            printf("  round: pulled_a=%u pulled_b=%u del_a=%u del_b=%u dup=%u skip=%u vs_a=%u vs_b=%u\n",
+            printf("  round: pulled_a=%u pulled_b=%u del_a=%u del_b=%u dup=%u skip=%u vs_a=%u vs_b=%u ent_a=%u ent_b=%u name_a=%u name_b=%u\n",
                    st.edges_pulled_a, st.edges_pulled_b, st.edges_deleted_from_a,
                    st.edges_deleted_from_b, st.edges_dup, st.edge_skipped,
-                   st.vstate_applied_a, st.vstate_applied_b);
+                   st.vstate_applied_a, st.vstate_applied_b,
+                   st.entity_pulled_a, st.entity_pushed_b,
+                   st.name_applied_a, st.name_applied_b);
             assert(st.edges_pulled_b == 2);           /* A's rA, rB into B */
             assert(st.edges_pulled_a == 1);           /* B's rC into A */
             assert(st.edges_deleted_from_a == 1);     /* B's delete pushed to A */
             assert(st.edges_deleted_from_b == 0);
             assert(st.edges_dup == 0 && st.edge_skipped == 0);
-            assert(st.vstate_applied_a >= 2 && st.vstate_applied_b >= 1);
+            assert(st.vstate_applied_a >= 1 && st.vstate_applied_b >= 1);
+            /* 5b-ii: entity mirrors + name rows */
+            assert(st.entity_pushed_b == 5);          /* AX_0..2 + CC_9 + II_9 */
+            assert(st.entity_pulled_a == 2);          /* BX_0..1 */
+            assert(st.name_applied_a == 1);           /* victim tombstone adopted */
+            assert(st.name_applied_b == 2);           /* CC_9, II_9: A's nodes win */
             assert(g4_chain_wm(ga, g4_lookup(ga, (const u8 *)"RL_0040", 7)) >= 1040);
+            {
+                g4_entity_t tmp;
+                u32 nm2 = 0, gn2 = 0;
+                u32 ax0 = g4_lookup(gb, (const u8 *)"AX_0", 4);
+                assert(ax0 >= 16384 && g4_read_entity(gb, ax0, &tmp));
+                u32 bx0 = g4_lookup(ga, (const u8 *)"BX_0", 4);
+                assert(bx0 >= 8192 && bx0 < 16384 && g4_read_entity(ga, bx0, &tmp));
+                u32 ca = g4_lookup(ga, (const u8 *)"CC_9", 4);
+                u32 cb = g4_lookup(gb, (const u8 *)"CC_9", 4);
+                assert(ca && ca == cb && ca == a_cc);      /* higher node wins */
+                u32 ia = g4_lookup(ga, (const u8 *)"II_9", 4);
+                u32 ib = g4_lookup(gb, (const u8 *)"II_9", 4);
+                assert(ia && ia == ib && ia == a_ii);
+                assert(!g4_read_entity(ga, b_cc, &tmp) && !g4_read_entity(gb, b_cc, &tmp));
+                assert(!g4_read_entity(ga, b_ii, &tmp) && !g4_read_entity(gb, b_ii, &tmp));
+                assert(!g4_lookup(ga, (const u8 *)victim_name, 7));
+                assert(!g4_lookup(gb, (const u8 *)victim_name, 7));
+                assert(g4_name_get(ga, (const u8 *)victim_name, 7, &nm2, &gn2) && nm2 == 0);
+                assert(gn2 == 2);
+                assert(g4_name_get(gb, (const u8 *)victim_name, 7, &nm2, &gn2) && nm2 == 0);
+                assert(gn2 == 2);                          /* both tombstoned at gen 2 */
+            }
             assert(mstore_txn_commit(mca));
             assert(mstore_txn_commit(mdb));
 
@@ -392,13 +446,18 @@ int main(void)
             printf("  converged: adjacency diff=0 after one round\n");
             free(cA.v); free(cB.v); free(vA.v); free(vB.v);
 
-            /* second round: nothing left to do */
+            /* second round: nothing left to do — a true fixpoint across all
+             * three families (the vstate hash is byte-based, so equal rows
+             * on both stores emit equal symbols) */
             assert(mstore_txn_begin(mca));
             assert(mstore_txn_begin(mdb));
             g4_repl_stats_t st2;
             assert(g4_repl_round(ga, gb, &st2));
             assert(st2.edges_pulled_a == 0 && st2.edges_pulled_b == 0);
             assert(st2.edges_deleted_from_a == 0 && st2.edges_deleted_from_b == 0);
+            assert(st2.vstate_applied_a == 0 && st2.vstate_applied_b == 0);
+            assert(st2.entity_pulled_a == 0 && st2.entity_pushed_b == 0);
+            assert(st2.name_applied_a == 0 && st2.name_applied_b == 0);
             assert(mstore_txn_commit(mca));
             assert(mstore_txn_commit(mdb));
             printf("  second round: zero applies\n");

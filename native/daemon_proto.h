@@ -63,9 +63,22 @@
  *   RE_VROW_SET {u32 n, n x {u32 node, u32 len, blob}} -> n x u8 status
  *   RE_EDGE_PULL{u32 n, n x {32B sym, str reltype}}    -> n x u8 status
  *   RE_EDGE_DEL {u32 n, n x 32B sym}                   -> n x u8 status
+ *   RE_NAME     {u32 n, n x str name}
+ *               -> n x {u8 found, [u32 node, u32 gen]}  (tombstone: node 0)
+ *   RE_NAME_SET {u32 n, n x {str name, u32 node, u32 gen}} -> n x u8 status
+ *   RE_ENTITY   {u32 n, n x u32 node}
+ *               -> n x {u8 found, [str name, u32 gen, u32 len, blob]}
+ *   RE_ENTITY_SET {u32 n, n x {u32 node, str name, u32 gen, u32 len, blob}}
+ *               -> n x u8 status
  *   RE_ROUND    {str host, u32 port, str token}
- *               -> u32 x 9: pulled_a, pulled_b, del_a, del_b, dup, skip,
- *                  vs_a, vs_b, vs_skip
+ *               -> u32 x 13: pulled_a, pulled_b, del_a, del_b, dup, skip,
+ *                  vs_a, vs_b, vs_skip, ent_pulled_a, ent_pushed_b,
+ *                  name_a, name_b
+ * RE_NAME_SET and RE_ENTITY_SET apply under the (gen, node) rule at the
+ * receiving store: incoming must beat the local row strictly (ties resolve
+ * by higher node), a replaced live binding's record is retired, node 0 is a
+ * tombstone. RE_NAME_SET status: 1 = applied, 0 = lost/equal.
+ * RE_ENTITY_SET status: 1 = applied, 2 = already equal, 0 = lost/invalid.
  * RE_ROUND drives one FULL anti-entropy round against the peer daemon
  * (repl_client.c): this daemon is the round driver ("a"), the peer is "b".
  * host is a dotted-quad IPv4 literal. The handler blocks this daemon's loop
@@ -140,7 +153,11 @@ enum {
     OP_RE_VROW_SET      = 0x35,   /* u32 n, n x {u32 node, u32 len, blob} -> n x u8 */
     OP_RE_EDGE_PULL     = 0x36,   /* u32 n, n x {32B sym, str rt} -> n x u8     */
     OP_RE_EDGE_DEL      = 0x37,   /* u32 n, n x 32B sym -> n x u8               */
-    OP_RE_ROUND         = 0x38,   /* str host, u32 port, str token -> u32 x 9   */
+    OP_RE_ROUND         = 0x38,   /* str host, u32 port, str token -> u32 x 13  */
+    OP_RE_NAME          = 0x39,   /* u32 n, n x str -> n x {u8,[u32,u32]}       */
+    OP_RE_NAME_SET      = 0x3a,   /* u32 n, n x {str, u32, u32} -> n x u8       */
+    OP_RE_ENTITY        = 0x3b,   /* u32 n, n x u32 -> n x {u8,[str,u32,u32,blob]} */
+    OP_RE_ENTITY_SET    = 0x3c,   /* u32 n, n x {u32, str, u32, u32, blob} -> n x u8 */
 };
 
 /* OPEN_NODES entity blob (per requested name):

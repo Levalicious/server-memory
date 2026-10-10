@@ -563,6 +563,8 @@ typedef struct {
     u32 edges_deleted_from_a, edges_deleted_from_b;
     u32 edges_dup, edge_skipped;
     u32 vstate_applied_a, vstate_applied_b, vstate_skipped;
+    u32 entity_pulled_a, entity_pushed_b;        /* mirrors (5b-ii)          */
+    u32 name_applied_a, name_applied_b;          /* name rows incl tombstones */
 } g4_repl_stats_t;
 int  g4_repl_round(graph4_t *a, graph4_t *b, g4_repl_stats_t *st);
 
@@ -595,6 +597,19 @@ typedef struct repl_peer {
     /* peer deletes an edge it holds (we hold the delete warrant);
      * status: 0 = not found, 1 = deleted */
     int (*edge_del)(void *ctx, const u8 *sym, u8 *status);
+    /* name-directory row fetch: 1 = row exists */
+    int (*name_get)(void *ctx, const u8 *name, u16 nl, u32 *node, u32 *gen);
+    /* name-row apply under the (gen, node) rule (node 0 = tombstone; a
+     * replace retires the beaten live binding's record); 0 = lost/equal,
+     * 1 = applied */
+    int (*name_set)(void *ctx, const u8 *name, u16 nl, u32 node, u32 gen, u8 *status);
+    /* mirrored entity fetch: binding + row blob for a node; 1 = found */
+    int (*entity_get)(void *ctx, u32 node, u8 *name, u16 *nl, u32 *gen,
+                      u8 *blob, u32 *blen);
+    /* mirrored entity apply (blob + binding under the rule);
+     * status: 0 = lost, 1 = applied, 2 = already equal */
+    int (*entity_set)(void *ctx, u32 node, const u8 *name, u16 nl, u32 gen,
+                      const u8 *blob, u32 blen, u8 *status);
 } repl_peer_t;
 int  g4_repl_round_wire(graph4_t *local, repl_peer_t *peer, g4_repl_stats_t *st);
 
@@ -630,9 +645,31 @@ u32  g4_vrow_pack(graph4_t *g, const g4_entity_t *e, u8 *out, u32 cap);
 int  g4_vrow_cmp(graph4_t *g, const u8 *blob, u32 len, const g4_entity_t *e);
 int  g4_vrow_apply(graph4_t *g, u32 node, const u8 *blob, u32 len);
 
+/* ---- mirroring (seam §4/§9, step 5b-ii) ----
+ * Move the id-mint counter up (disjoint id spaces per replica after a clone
+ * split — clones otherwise mint colliding ids). Returns the new value. */
+u32  g4_set_next_node(graph4_t *g, u32 base);
+/* name-directory row read (1 = exists; tombstone rows report node 0) */
+int  g4_name_get(graph4_t *g, const u8 *name, u16 nl, u32 *node, u32 *gen);
+/* name-row apply under the (gen, node) rule: incoming must be strictly
+ * greater; a replace of a live local binding retires that binding's record
+ * (no generation churn — the incoming row IS the new state); node 0 =
+ * tombstone. 1 = applied, 0 = lost/equal. */
+int  g4_mirror_name(graph4_t *g, const u8 *name, u16 nl, u32 node, u32 gen);
+/* retire an entity record + edges + id WITHOUT touching its name row
+ * (the beaten side of a name-rule replace; the winner's row is written by
+ * the caller). 1 = retired. */
+int  g4_entity_retire(graph4_t *g, u32 node);
+/* apply a mirrored entity: the name rule, then create-at-id (absent) or
+ * LWW-guarded row apply (present); 1 = applied, 2 = already equal (no-op),
+ * 0 = lost/invalid. */
+int  g4_mirror_apply(graph4_t *g, u32 node, const u8 *name, u16 nl, u32 gen,
+                     const u8 *blob, u32 blen);
+
 int  g4_read_entity(graph4_t *g, u32 eid, g4_entity_t *out); /* 1 = live */
 u32  g4_entity_count(graph4_t *g);
-/* enumerate live eids (bucket order); returns count written (<= max) */
+/* enumerate live eids (bucket order); writes up to `max`, returns the TRUE
+ * total (may exceed `max` — callers size buffers by entity_count and clamp) */
 u32  g4_list_entities(graph4_t *g, u32 *out, u32 max);
 
 /* observations (KB constraint: max 2, each <= 140 bytes enforced above) */

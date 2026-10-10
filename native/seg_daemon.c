@@ -638,6 +638,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         u32 *ids = (u32 *)malloc((size_t)(total ? total : 1) * 4);
         if (!ids) { err_reply(w, "oom"); return ST_ERR; }
         u32 n = g4_list_entities(k->g, ids, total);
+        if (n > total) n = total;      /* true-total return: clamp to the buffer */
         u32 nviol = 0;
         for (u32 i = 0; i < n; i++) {               /* pass 1: count */
             g4_entity_t e;
@@ -671,6 +672,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         u32 *ids = (u32 *)malloc((size_t)(total ? total : 1) * 4);
         if (!ids) { err_reply(w, "oom"); return ST_ERR; }
         u32 n = g4_list_entities(k->g, ids, total);
+        if (n > total) n = total;      /* true-total return: clamp to the buffer */
         qsort(ids, n, sizeof *ids, cmp_u32asc);
         u32 sel0 = 0, sel_n = 0;
         for (u32 i = 0; i < n; i++) {
@@ -921,6 +923,91 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         w32(w, st.vstate_applied_a);
         w32(w, st.vstate_applied_b);
         w32(w, st.vstate_skipped);
+        w32(w, st.entity_pulled_a);
+        w32(w, st.entity_pushed_b);
+        w32(w, st.name_applied_a);
+        w32(w, st.name_applied_b);
+        return ST_OK;
+    }
+    case OP_RE_NAME: {
+        u32 n = r32(r);
+        if (r->err || n > 4096) { err_reply(w, "bad batch"); return ST_ERR; }
+        for (u32 i = 0; i < n; i++) {
+            u16 nl = 0;
+            const u8 *nm = rstr(r, &nl);
+            if (r->err) { err_reply(w, "trunc"); return ST_ERR; }
+            u32 node = 0, gen = 0;
+            if (g4_name_get(k->g, nm, nl, &node, &gen)) {
+                w8(w, 1);
+                w32(w, node);
+                w32(w, gen);
+            } else w8(w, 0);
+        }
+        return ST_OK;
+    }
+    case OP_RE_NAME_SET: {
+        u32 n = r32(r);
+        if (r->err || n > 100000) { err_reply(w, "bad batch"); return ST_ERR; }
+        if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
+        if (k->dirty_counters) pw_flush_in_txn(k);
+        for (u32 i = 0; i < n; i++) {
+            u16 nl = 0;
+            const u8 *nm = rstr(r, &nl);
+            u32 node = r32(r), gen = r32(r);
+            if (r->err) { mstore_txn_abort(k->ms); err_reply(w, "trunc"); return ST_ERR; }
+            w8(w, (u8)(g4_mirror_name(k->g, nm, nl, node, gen) ? 1 : 0));
+        }
+        if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
+        return ST_OK;
+    }
+    case OP_RE_ENTITY: {
+        u32 n = r32(r);
+        if (r->err || n > 4096) { err_reply(w, "bad batch"); return ST_ERR; }
+        u8 *blob = (u8 *)malloc(G4_REPL_ROW_CAP);
+        if (!blob) { err_reply(w, "oom"); return ST_ERR; }
+        for (u32 i = 0; i < n; i++) {
+            u32 node = r32(r);
+            if (r->err) { free(blob); err_reply(w, "trunc"); return ST_ERR; }
+            g4_entity_t e;
+            u16 nl = 0;
+            const u8 *nm = NULL;
+            u32 gen = 0, bl = 0;
+            if (g4_read_entity(k->g, node, &e)) {
+                nm = g4_str(k->g, e.name_sid, &nl);
+                u32 n2 = 0;
+                if (nm && g4_name_get(k->g, nm, nl, &n2, &gen) && n2 == node)
+                    bl = g4_vrow_pack(k->g, &e, blob, G4_REPL_ROW_CAP);
+            }
+            if (!bl) { w8(w, 0); continue; }
+            w8(w, 1);
+            wstr(w, nm, nl);
+            w32(w, gen);
+            w32(w, bl);
+            wbytes(w, blob, bl);
+        }
+        free(blob);
+        return ST_OK;
+    }
+    case OP_RE_ENTITY_SET: {
+        u32 n = r32(r);
+        if (r->err || n > 100000) { err_reply(w, "bad batch"); return ST_ERR; }
+        if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
+        if (k->dirty_counters) pw_flush_in_txn(k);
+        for (u32 i = 0; i < n; i++) {
+            u32 node = r32(r);
+            u16 nl = 0;
+            const u8 *nm = rstr(r, &nl);
+            u32 gen = r32(r), blen = r32(r);
+            if (r->err || blen > 65536 || r->p + blen > r->end) {
+                mstore_txn_abort(k->ms);
+                err_reply(w, "trunc");
+                return ST_ERR;
+            }
+            const u8 *blob = r->p;
+            r->p += blen;
+            w8(w, (u8)g4_mirror_apply(k->g, node, nm, nl, gen, blob, blen));
+        }
+        if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
         return ST_OK;
     }
     default:
@@ -1098,6 +1185,13 @@ kbd_t *kbd_open(const char *dir) {
     if (!k->ms) { free(k); return NULL; }
     k->g = graph4_open(k->ms);
     if (!k->g) { mstore_close(k->ms); free(k); return NULL; }
+    /* 5b-ii: disjoint id spaces across clone-lineage replicas. Each replica
+     * is launched with KBD_NODE_BASE (e.g. replica << 13); ids below the
+     * base stay free for the shared base era, mirrors bump it further. */
+    {
+        const char *nb = getenv("KBD_NODE_BASE");
+        if (nb) g4_set_next_node(k->g, (u32)strtoul(nb, NULL, 0));
+    }
     /* Rank is a background job: ψ persists in the store, so nothing to warm
      * at open — mark the current txid and let slices catch up after edits.
      * (A restart mid-convergence loses only the pending flag; the persisted

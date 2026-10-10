@@ -1135,6 +1135,75 @@ int main(void) {
         assert(cl_call(fd, 921, OP_RE_EDGE_PULL, &pl, &body) == ST_OK);
         { rd_t rr = body_rd(&body); assert(r8(&rr) == 0); }    /* wm: no resurrection */
         free(body.b);
+
+        /* v1.7: name rows + entity mirrors (5b-ii) */
+        pl_reset(&pl); w32(&pl, 2); pl_str(&pl, "RE_A01"); pl_str(&pl, "nope");
+        assert(cl_call(fd, 922, OP_RE_NAME, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body);
+          u8 f1 = r8(&rr);
+          u32 n1 = r32(&rr), g1 = r32(&rr);
+          u8 f2 = r8(&rr);
+          assert(f1 == 1 && n1 == eidA && g1 == 1);
+          assert(f2 == 0 && !rr.err); }
+        free(body.b);
+
+        /* fetch RE_B02's entity; mirror its row as "RE_M01" at node 20000 */
+        pl_reset(&pl); w32(&pl, 1); w32(&pl, eidB);
+        assert(cl_call(fd, 923, OP_RE_ENTITY, &pl, &body) == ST_OK);
+        u8 eb[8192];
+        u32 ebl = 0;
+        { rd_t rr = body_rd(&body);
+          u8 found = r8(&rr);
+          assert(found == 1);
+          u16 nl2 = 0;
+          const u8 *nm2 = rstr(&rr, &nl2);
+          assert(nl2 == 6 && memcmp(nm2, "RE_B02", 6) == 0);
+          u32 gen2 = r32(&rr);
+          assert(gen2 == 1);
+          ebl = r32(&rr);
+          assert(ebl > 0 && ebl <= sizeof eb);
+          memcpy(eb, rr.p, ebl); }
+        free(body.b);
+
+        pl_reset(&pl);
+        w32(&pl, 1); w32(&pl, 20000); pl_str(&pl, "RE_M01"); w32(&pl, 1);
+        w32(&pl, ebl); wbytes(&pl, eb, ebl);
+        assert(cl_call(fd, 924, OP_RE_ENTITY_SET, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 1); }    /* applied */
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 1); w32(&pl, 20000); pl_str(&pl, "RE_M01"); w32(&pl, 1);
+        w32(&pl, ebl); wbytes(&pl, eb, ebl);
+        assert(cl_call(fd, 925, OP_RE_ENTITY_SET, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 2); }    /* already equal */
+        free(body.b);
+        pl_reset(&pl); w32(&pl, 1); pl_str(&pl, "RE_M01");
+        assert(cl_call(fd, 926, OP_RE_NAME, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body);
+          u8 f = r8(&rr);
+          u32 n2 = r32(&rr), g2 = r32(&rr);
+          assert(f == 1 && n2 == 20000 && g2 == 1); }
+        free(body.b);
+        pl_reset(&pl); w32(&pl, 1); w32(&pl, 20000);
+        assert(cl_call(fd, 927, OP_RE_ENTITY, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 1); }    /* the mirror is real */
+        free(body.b);
+
+        /* tombstone RE_B02 at gen 2: the record retires, the row reads 0 */
+        pl_reset(&pl);
+        w32(&pl, 1); pl_str(&pl, "RE_B02"); w32(&pl, 0); w32(&pl, 2);
+        assert(cl_call(fd, 928, OP_RE_NAME_SET, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 1); }
+        free(body.b);
+        pl_reset(&pl); w32(&pl, 1); w32(&pl, eidB);
+        assert(cl_call(fd, 929, OP_RE_ENTITY, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 0); }
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 1); pl_str(&pl, "RE_B02"); w32(&pl, 0); w32(&pl, 2);
+        assert(cl_call(fd, 930, OP_RE_NAME_SET, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 0); }    /* equal: lost */
+        free(body.b);
     }
     PASS();
 

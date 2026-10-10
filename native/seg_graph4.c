@@ -152,8 +152,9 @@ static u32 ind_append(graph4_t *g, u32 eid) {
     if (!dr || dsz < 4) return 0;
     u8 *dw = (u8 *)(dpg + (dr - dpg));
     u32 npages = g4ld32(dw);
-    if (page > npages) return 0;                      /* append-only numbering */
-    if (page == npages) {
+    while (npages <= page) {          /* holes are legal (sparse ids: a
+                                       * mirror or an id-base jump lands far
+                                       * above the dense prefix) */
         u32 plpg = 0;
         u8 *dp = seg_txn_alloc(g->gs, SEG_KIND_INDIRECT, &plpg);
         if (!dp) return 0;
@@ -163,8 +164,9 @@ static u32 ind_append(graph4_t *g, u32 eid) {
         int ok = seg_page_insert(dp, zrec, (u16)(IND_PAGE_SLOTS * 4u), &s);
         free(zrec);
         if (!ok) return 0;
-        g4st32(dw + 4 + page * 4u, plpg);             /* in-place: never moves */
-        g4st32(dw, npages + 1u);
+        g4st32(dw + 4 + npages * 4u, plpg);           /* in-place: never moves */
+        npages++;
+        g4st32(dw, npages);
     }
     u32 dlpg2 = g4ld32(dw + 4 + page * 4u);           /* same image: still valid */
     u8 *ppg = seg_txn_touch(g->gs, dlpg2);
@@ -600,7 +602,11 @@ int g4_read_entity(graph4_t *g, u32 eid, g4_entity_t *out) {
 
 static int adj_clear_all(graph4_t *g, u32 eid, const g4_entity_t *e);
 
-int g4_delete_entity(graph4_t *g, u32 node) {
+/* remove an entity's record + incident edges + its id. unbind_name=1 is the
+ * public g4_delete_entity (the name row is tombstoned, advancing the
+ * generation); unbind_name=0 is the mirror path's RETIRE — the name row is
+ * being overwritten by the winning binding instead, so no generation churn. */
+static int ent_remove(graph4_t *g, u32 node, int unbind_name) {
     g4_entity_t e;
     if (!g4_read_entity(g, node, &e)) return 0;
     u32 eid = ind_lookup(g, node);                 /* physical location */
@@ -609,9 +615,11 @@ int g4_delete_entity(graph4_t *g, u32 node) {
     u32set_t old = {0};
     tri_collect_entity(g, &e, &old);
     u16 nl = 0;
-    const u8 *nmp = st4_get(g->st, e.name_sid, &nl);
     u8 *nmc = NULL;
-    if (nmp) { nmc = (u8 *)malloc(nl ? nl : 1); if (nmc) memcpy(nmc, nmp, nl); }
+    if (unbind_name) {
+        const u8 *nmp = st4_get(g->st, e.name_sid, &nl);
+        if (nmp) { nmc = (u8 *)malloc(nl ? nl : 1); if (nmc) memcpy(nmc, nmp, nl); }
+    }
     /* remove every incident edge (mirrors on peers + own chain) first */
     if (!adj_clear_all(g, node, &e)) { free(old.v); free(nmc); return 0; }
     /* release string refs */
@@ -619,7 +627,7 @@ int g4_delete_entity(graph4_t *g, u32 node) {
     st4_decref(g->st, e.type_sid);
     if (e.obs_count >= 1 && e.obs0_sid) st4_decref(g->st, e.obs0_sid);
     if (e.obs_count >= 2 && e.obs1_sid) st4_decref(g->st, e.obs1_sid);
-    if (!nmc || !name_unbind(g, nmc, nl)) { free(old.v); free(nmc); return 0; }
+    if (unbind_name && (!nmc || !name_unbind(g, nmc, nl))) { free(old.v); free(nmc); return 0; }
     free(nmc);
     type_del(g, e.type_sid, node);
     u8 *pg = seg_txn_touch(g->gs, EID_LPG(eid));
@@ -637,6 +645,9 @@ int g4_delete_entity(graph4_t *g, u32 node) {
     free(old.v);
     return 1;
 }
+
+int g4_delete_entity(graph4_t *g, u32 node) { return ent_remove(g, node, 1); }
+int g4_entity_retire(graph4_t *g, u32 node) { return ent_remove(g, node, 0); }
 
 typedef struct { u32 *out; u32 n, max; } list_ctx_t;
 static int list_cb(void *c, u32 eid) {
@@ -1613,6 +1624,7 @@ u32 g4_structural_sample(graph4_t *g, u32 iterations, double damping) {
     u32 *eids = (u32 *)malloc((size_t)n * 4);
     if (!eids) return 0;
     u32 got = g4_list_entities(g, eids, n);
+    if (got > n) got = n;                  /* true-total return: clamp to the buffer */
     u32 total = 0;
     for (u32 it = 0; it < iterations; it++)
         for (u32 i = 0; i < got; i++) total += g4_structural_walk(g, eids[i], damping);
@@ -1699,6 +1711,7 @@ u32 g4_compute_merw_psi(graph4_t *g, double alpha, u32 max_iter, double tol) {
     u32 *eids = (u32 *)malloc((size_t)n * 4);
     if (!eids) return 0;
     u32 got = g4_list_entities(g, eids, n);
+    if (got > n) got = n;                  /* true-total return: clamp to the buffer */
     n = got;
 
     e2i_t idx;
@@ -1798,6 +1811,17 @@ static u64 sym_mix64(const u8 *p, u32 n) {
     return h ^ (h >> 31);
 }
 
+/* continued mix over one more piece (order matters), for content hashes that
+ * span several strings — BYTES only, never store-local sids, so two stores
+ * with equal content emit equal symbols */
+static u64 sym_mix64_acc(u64 h, const u8 *p, u32 n) {
+    h ^= (u64)n << 32;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001B3ull; h ^= h >> 29; }
+    h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 27; h *= 0x94D049BB133111EBull;
+    return h ^ (h >> 31);
+}
+
 static int sym_adj_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
     (void)k; (void)kl;
     sym_walk_t *w = (sym_walk_t *)c;
@@ -1848,19 +1872,30 @@ static int sym_vstate_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
     u32 gen = g4ld32(v + 4);
     g4_entity_t e;
     if (!g4_read_entity(w->g, node, &e)) return 1;
-    u8 in[37];
-    g4st32(in, e.type_sid);
-    g4st32(in + 4, e.obs0_sid);
-    g4st32(in + 8, e.obs1_sid);
-    in[12] = e.obs_count;
-    g4st64(in + 13, e.mtime);
-    g4st64(in + 21, e.obs_mtime);
-    memcpy(in + 29, &e.psi, 8);
+    /* content hash over STRING BYTES (sids are store-local; hashing them
+     * made equal rows hash differently across stores — churn and a
+     * never-zero fixpoint), then count/mtimes/psi; fixed order. */
+    u16 lt = 0, l0 = 0, l1 = 0;
+    const u8 *tb = st4_get(w->g->st, e.type_sid, &lt);
+    if (!tb) return 1;
+    const u8 *o0 = (e.obs_count >= 1 && e.obs0_sid) ? st4_get(w->g->st, e.obs0_sid, &l0) : NULL;
+    const u8 *o1 = (e.obs_count >= 2 && e.obs1_sid) ? st4_get(w->g->st, e.obs1_sid, &l1) : NULL;
+    u64 h = 0x9E3779B97F4A7C15ull;
+    h = sym_mix64_acc(h, tb, lt);
+    h = sym_mix64_acc(h, o0 ? o0 : (const u8 *)"", o0 ? l0 : 0);
+    h = sym_mix64_acc(h, o1 ? o1 : (const u8 *)"", o1 ? l1 : 0);
+    u8 tail[25];
+    tail[0] = e.obs_count;
+    g4st64(tail + 1, e.mtime);
+    g4st64(tail + 9, e.obs_mtime);
+    u64 psi_bits; memcpy(&psi_bits, &e.psi, 8);
+    memcpy(tail + 17, &psi_bits, 8);
+    h = sym_mix64_acc(h, tail, sizeof tail);
     u8 s[G4_SYM_LEN];
     memset(s, 0, sizeof s);
     g4st32(s, node);
     g4st32(s + 4, gen);
-    g4st64(s + 8, sym_mix64(in, sizeof in));
+    g4st64(s + 8, h);
     w->cb(w->ctx, s);
     w->n++;
     return 1;
@@ -2057,45 +2092,61 @@ u32 g4_vrow_pack(graph4_t *g, const g4_entity_t *e, u8 *out, u32 cap) {
     return off;
 }
 
-int g4_vrow_cmp(graph4_t *g, const u8 *blob, u32 len, const g4_entity_t *e) {
-    /* parse the blob row ("a") — exact row_cmp order vs live row ("b",
-     * this store's strings). Malformed blob = NULL row: caller skips. */
+/* parsed row-blob fields (one parser feeds cmp/apply/mirror) */
+typedef struct {
+    const u8 *type; u16 tl;
+    u64 mtime, obs_mtime;
+    u8 ocount;
+    const u8 *obs[2]; u16 obslen[2];
+    double psi;
+} vf_t;
+
+static int vrow_parse(const u8 *blob, u32 len, vf_t *f) {
     u32 off = 0;
-    const u8 *tb; u16 tbl;
-    if (!blob_get_str(blob, len, &off, &tb, &tbl)) return 0;
+    if (!blob_get_str(blob, len, &off, &f->type, &f->tl)) return 0;
     if (off + 8 + 8 + 1 > len) return 0;
-    u64 mt = g4ld64(blob + off); off += 8;
-    u64 omt = g4ld64(blob + off); off += 8;
-    u8 oc = blob[off++];
-    const u8 *ob[2] = { NULL, NULL }; u16 obl[2] = { 0, 0 };
+    f->mtime = g4ld64(blob + off); off += 8;
+    f->obs_mtime = g4ld64(blob + off); off += 8;
+    f->ocount = blob[off++];
+    f->obs[0] = f->obs[1] = NULL;
+    f->obslen[0] = f->obslen[1] = 0;
     for (int k = 0; k < 2; k++) {
-        if ((u8)(k + 1) > oc) break;
-        if (!blob_get_str(blob, len, &off, &ob[k], &obl[k])) return 0;
+        if ((u8)(k + 1) > f->ocount) break;
+        if (!blob_get_str(blob, len, &off, &f->obs[k], &f->obslen[k])) return 0;
     }
     if (off + 8 > len) return 0;
-    u64 psi_a; { u64 b8 = g4ld64(blob + off); memcpy(&psi_a, &b8, 8); }
-    if (mt != e->mtime) return mt < e->mtime ? -1 : 1;
-    if (omt != e->obs_mtime) return omt < e->obs_mtime ? -1 : 1;
-    if (oc != e->obs_count) return oc < e->obs_count ? -1 : 1;
+    u64 pb = g4ld64(blob + off);
+    memcpy(&f->psi, &pb, 8);
+    return 1;
+}
+
+int g4_vrow_cmp(graph4_t *g, const u8 *blob, u32 len, const g4_entity_t *e) {
+    /* blob row ("a") vs live row ("b"): exact row_cmp order. Malformed
+     * blob = NULL row: caller skips. */
+    vf_t f;
+    if (!vrow_parse(blob, len, &f)) return 0;
+    if (f.mtime != e->mtime) return f.mtime < e->mtime ? -1 : 1;
+    if (f.obs_mtime != e->obs_mtime) return f.obs_mtime < e->obs_mtime ? -1 : 1;
+    if (f.ocount != e->obs_count) return f.ocount < e->obs_count ? -1 : 1;
     {
         u16 ll = 0;
         const u8 *tlive = g4_str(g, e->type_sid, &ll);
         if (!tlive) return 0;
-        u16 m = tbl < ll ? tbl : ll;
-        int c = m ? memcmp(tb, tlive, m) : 0;
+        u16 m = f.tl < ll ? f.tl : ll;
+        int c = m ? memcmp(f.type, tlive, m) : 0;
         if (c) return c < 0 ? -1 : 1;
-        if (tbl != ll) return tbl < ll ? -1 : 1;
+        if (f.tl != ll) return f.tl < ll ? -1 : 1;
     }
     for (int k = 0; k < 2; k++) {
         u32 sid = (k == 0) ? e->obs0_sid : e->obs1_sid;
         int pb = sid && (u8)k < e->obs_count;
-        int pa = (u8)(k + 1) <= oc && obl[k] > 0;
+        int pa = (u8)(k + 1) <= f.ocount && f.obslen[k] > 0;
         if (!pa && !pb) continue;
         u16 ll = 0;
         const u8 *lb = pb ? g4_str(g, sid, &ll) : NULL;
         if (pb && !lb) return 0;
-        const u8 *la = pa ? ob[k] : (const u8 *)"";
-        u16 al = pa ? obl[k] : 0;
+        const u8 *la = pa ? f.obs[k] : (const u8 *)"";
+        u16 al = pa ? f.obslen[k] : 0;
         u16 lv = pb ? ll : 0;
         u16 m = al < lv ? al : lv;
         int c = m ? memcmp(la, lb, m) : 0;
@@ -2103,25 +2154,175 @@ int g4_vrow_cmp(graph4_t *g, const u8 *blob, u32 len, const g4_entity_t *e) {
         if (al != lv) return al < lv ? -1 : 1;
     }
     u64 psi_b; memcpy(&psi_b, &e->psi, 8);
+    u64 psi_a; memcpy(&psi_a, &f.psi, 8);
     if (psi_a != psi_b) return psi_a < psi_b ? -1 : 1;
     return 0;
 }
 
 int g4_vrow_apply(graph4_t *g, u32 node, const u8 *blob, u32 len) {
-    u32 off = 0;
-    const u8 *tb; u16 tbl;
-    if (!blob_get_str(blob, len, &off, &tb, &tbl)) return 0;
-    if (off + 8 + 8 + 1 > len) return 0;
-    u64 mt = g4ld64(blob + off); off += 8;
-    u64 omt = g4ld64(blob + off); off += 8;
-    u8 oc = blob[off++];
-    const u8 *ob[2] = { NULL, NULL }; u16 obl[2] = { 0, 0 };
-    for (int k = 0; k < 2; k++) {
-        if ((u8)(k + 1) > oc) break;
-        if (!blob_get_str(blob, len, &off, &ob[k], &obl[k])) return 0;
+    vf_t f;
+    if (!vrow_parse(blob, len, &f)) return 0;
+    return g4_vstate_apply_raw(g, node, f.type, f.tl, f.mtime, f.obs_mtime,
+                               f.obs[0], f.obslen[0], f.obs[1], f.obslen[1],
+                               f.ocount, f.psi);
+}
+
+/* ================= mirroring (seam §4/§9, step 5b-ii) ================= */
+
+u32 g4_set_next_node(graph4_t *g, u32 base) {
+    if (base > g->next_node) { g->next_node = base; meta_store(g); }
+    return g->next_node;
+}
+
+int g4_name_get(graph4_t *g, const u8 *name, u16 nl, u32 *node, u32 *gen) {
+    return name_row(g, name, nl, node, gen);
+}
+
+/* the (gen, node) rule, one voice for every caller: incoming beats the local
+ * row iff strictly greater lexicographically; ties pass for nothing here
+ * (record-ensure is decided by g4_mirror_apply). On a replace that retires a
+ * live local binding, that binding's record is RETIRED (no gen churn — the
+ * incoming row IS the new state). node 0 = tombstone. 1 = applied. */
+int g4_mirror_name(graph4_t *g, const u8 *name, u16 nl, u32 node, u32 gen) {
+    u32 lnode = 0, lgen = 0;
+    int have = name_row(g, name, nl, &lnode, &lgen);
+    if (have) {
+        if (gen < lgen || (gen == lgen && node <= lnode)) return 0;   /* lost/equal */
+        if (lnode && lnode != node && !g4_entity_retire(g, lnode)) return 0;
     }
-    if (off + 8 > len) return 0;
-    double psi; { u64 b8 = g4ld64(blob + off); memcpy(&psi, &b8, 8); }
-    return g4_vstate_apply_raw(g, node, tb, tbl, mt, omt,
-                               ob[0], obl[0], ob[1], obl[1], oc, psi);
+    return name_bind_raw(g, name, nl, node, gen);
+}
+
+/* indirection entry at an EXPLICIT id: materializes dir pages up to the id
+ * (holes zero-filled — mirror ids arrive sparse), then pokes the eid. The
+ * mint counter is bumped separately by the mirror path. */
+static int ind_set(graph4_t *g, u32 node, u32 eid) {
+    if (!node || !eid) return 0;
+    u32 idx = node - 1u;
+    u32 page = idx / IND_PAGE_SLOTS, slot = idx % IND_PAGE_SLOTS;
+    if (!g->ind_root) {
+        u32 dlpg = 0;
+        u8 *dpg = seg_txn_alloc(g->gs, SEG_KIND_INDIRECT, &dlpg);
+        if (!dpg) return 0;
+        u8 *drec = (u8 *)calloc(1, 4u + IND_DIR_MAX * 4u);
+        if (!drec) return 0;
+        u16 s = 0;
+        int ok = seg_page_insert(dpg, drec, (u16)(4u + IND_DIR_MAX * 4u), &s);
+        free(drec);
+        if (!ok) return 0;
+        g->ind_root = dlpg;
+        cat_put_root(g, K_IND, 2, dlpg);
+    }
+    if (page >= IND_DIR_MAX) return 0;
+    u8 *dpg = seg_txn_touch(g->gs, g->ind_root);
+    if (!dpg) return 0;
+    u16 dsz = 0;
+    const u8 *dr = seg_page_read(dpg, 0, &dsz);
+    if (!dr || dsz < 4) return 0;
+    u8 *dw = (u8 *)(dpg + (dr - dpg));
+    u32 npages = g4ld32(dw);
+    while (npages <= page) {
+        u32 plpg = 0;
+        u8 *dp = seg_txn_alloc(g->gs, SEG_KIND_INDIRECT, &plpg);
+        if (!dp) return 0;
+        u8 *zrec = (u8 *)calloc(1, IND_PAGE_SLOTS * 4u);
+        if (!zrec) return 0;
+        u16 s = 0;
+        int ok = seg_page_insert(dp, zrec, (u16)(IND_PAGE_SLOTS * 4u), &s);
+        free(zrec);
+        if (!ok) return 0;
+        g4st32(dw + 4 + npages * 4u, plpg);
+        npages++;
+        g4st32(dw, npages);
+    }
+    u32 dlpg2 = g4ld32(dw + 4 + page * 4u);
+    u8 *ppg = seg_txn_touch(g->gs, dlpg2);
+    if (!ppg) return 0;
+    u16 psz = 0;
+    const u8 *p = seg_page_read(ppg, 0, &psz);
+    if (!p || (u32)psz < (slot + 1u) * 4u) return 0;
+    g4st32(ppg + (p - ppg) + slot * 4u, eid);
+    return 1;
+}
+
+/* create an entity record at an EXPLICIT node id from parsed blob fields
+ * (the mirror path — g4_create_entity mints ids, this implants one). */
+static int ent_create_at(graph4_t *g, u32 node, u32 name_sid, const vf_t *f) {
+    u32 type_sid = st4_intern(g->st, f->type, f->tl);
+    if (!type_sid) return 0;
+    u32 obs[2] = { 0, 0 };
+    if (f->ocount >= 1 && f->obslen[0]) {
+        obs[0] = st4_intern(g->st, f->obs[0], f->obslen[0]);
+        if (!obs[0]) { st4_decref(g->st, type_sid); return 0; }
+    }
+    if (f->ocount >= 2 && f->obslen[1]) {
+        obs[1] = st4_intern(g->st, f->obs[1], f->obslen[1]);
+        if (!obs[1]) { st4_decref(g->st, type_sid); if (obs[0]) st4_decref(g->st, obs[0]); return 0; }
+    }
+    g4_entity_t e;
+    memset(&e, 0, sizeof e);
+    e.name_sid = name_sid;
+    e.type_sid = type_sid;
+    e.mtime = f->mtime;
+    e.obs_mtime = f->obs_mtime;
+    e.obs0_sid = obs[0];
+    e.obs1_sid = obs[1];
+    e.obs_count = f->ocount;
+    e.psi = f->psi;
+    u8 rec[ENT_SIZE];
+    ent_encode(rec, &e);
+    u32 lpg = g->last_ent_page; u16 slot = 0;
+    u8 *pg = (lpg != (u32)SEG_PT_NONE) ? seg_txn_touch(g->gs, lpg) : NULL;
+    if (!pg || !seg_page_insert(pg, rec, ENT_SIZE, &slot)) {
+        pg = seg_txn_alloc(g->gs, SEG_KIND_ENTITY, &lpg);
+        if (!pg || lpg >= G4_MAX_LPG || !seg_page_insert(pg, rec, ENT_SIZE, &slot)) {
+            st4_decref(g->st, type_sid);
+            if (obs[0]) st4_decref(g->st, obs[0]);
+            if (obs[1]) st4_decref(g->st, obs[1]);
+            return 0;
+        }
+        g->last_ent_page = lpg;
+    }
+    u32 eid = EID_MAKE(lpg, slot);
+    if (!ind_set(g, node, eid)) return 0;
+    type_put(g, type_sid, node);
+    g->ent_count++;
+    meta_store(g);                         /* persists next_node + ent_count */
+    { u32set_t old = {0}; tri_apply(g, node, old.v, 0); free(old.v); }
+    return 1;
+}
+
+int g4_mirror_apply(graph4_t *g, u32 node, const u8 *name, u16 nl, u32 gen,
+                    const u8 *blob, u32 blen) {
+    if (!node) return 0;
+    vf_t f;
+    if (!vrow_parse(blob, blen, &f)) return 0;
+    u32 lnode = 0, lgen = 0;
+    int have = name_row(g, name, nl, &lnode, &lgen);
+    if (have) {
+        int cmp = (gen > lgen) - (gen < lgen);
+        if (cmp == 0) cmp = (node > lnode) - (node < lnode);
+        if (cmp < 0) return 0;                       /* incoming lost */
+        if (cmp > 0 || (lnode && lnode != node)) {
+            if (!g4_mirror_name(g, name, nl, node, gen)) return 0;
+        }
+        /* cmp == 0 && lnode == node: the binding is already ours — just
+         * ensure the record exists (transient: row set before record) */
+    } else {
+        if (!g4_mirror_name(g, name, nl, node, gen)) return 0;
+    }
+    g4_entity_t cur;
+    if (!g4_read_entity(g, node, &cur)) {
+        u32 name_sid = st4_intern(g->st, name, nl);
+        if (!name_sid) return 0;
+        if (!ent_create_at(g, node, name_sid, &f)) { st4_decref(g->st, name_sid); return 0; }
+    } else {
+        int c = g4_vrow_cmp(g, blob, blen, &cur);
+        if (c == 0) return 2;                    /* already equal: no-op */
+        if (c > 0) return 0;                     /* local content newer: never clobbered */
+        if (!g4_vrow_apply(g, node, blob, blen)) return 0;
+    }
+    u32 nn = node + 1u;
+    if (nn > g->next_node) { g->next_node = nn; meta_store(g); }
+    return 1;
 }
