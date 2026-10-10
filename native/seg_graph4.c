@@ -237,7 +237,7 @@ static const u8 K_NAME[2] = { 0x01, 'n' };
 static const u8 K_TRI[2]  = { 0x01, 't' };
 static const u8 K_TYPE[2] = { 0x01, 'y' };
 static const st_codec_t CD_CAT  = { 0, 2 };
-static const st_codec_t CD_NAME = { 0, 1 };
+static const st_codec_t CD_NAME = { 0, 2 };   /* name -> {node u32, gen u32} (step 3) */
 static const st_codec_t CD_TRI  = { 7, 0 };
 static const st_codec_t CD_TYPE = { 8, 0 };
 
@@ -272,24 +272,54 @@ static u32 cat_get_root(graph4_t *g, const u8 *key, u16 kl) {
 
 /* ---- name table ---- */
 
-static int name_put(graph4_t *g, const u8 *nm, u16 nl, u32 eid) {
-    u8 v[4];
-    g4st32(v, eid);
-    int r = seg_tree_insert(&g->namet, nm, nl, v, 4);
+/* ---- the name directory (build step 3; docs/shard-seam-design-note.md §3) ----
+ * Rows bind a name to {node-id, generation}:
+ *   node == 0  — a tombstone: the name is unbound. The row persists for the
+ *                in-flight window (§9's directory-tombstone contract) so a
+ *                later re-creation advances the generation; skipping
+ *                tombstones is the job of every consumer (ni_walk_scan_cb).
+ *   gen        — advances on EVERY transition (bind or unbind): any cache
+ *                holding (name, gen) detects a rebinding, and the sharded
+ *                era's per-name RIBLT symbol is exactly this pair.
+ * Routing (sharded era) is a pure function of the name bytes:
+ * shard = fnv1a32(name) % N (N=1 today); no per-store state is read to
+ * decide where a binding lives, so the row shape is the whole commitment. */
+
+static int name_row(graph4_t *g, const u8 *nm, u16 nl, u32 *node, u32 *gen) {
+    u8 v[8];
+    u16 vl = 8;
+    if (seg_tree_lookup(&g->namet, nm, nl, v, &vl) != 1 || vl != 8) {
+        *node = 0; *gen = 0;
+        return 0;
+    }
+    *node = g4ld32(v);
+    *gen = g4ld32(v + 4);
+    return 1;
+}
+
+static int name_bind_raw(graph4_t *g, const u8 *nm, u16 nl, u32 node, u32 gen) {
+    u8 v[8];
+    g4st32(v, node);
+    g4st32(v + 4, gen);
+    int r = seg_tree_insert(&g->namet, nm, nl, v, 8);
     cat_put_root(g, K_NAME, 2, g->namet.root);
-    return r;
+    return r >= 0;              /* 1 = fresh row, 0 = replaced (tombstone/live) */
 }
 
-static u32 name_get(graph4_t *g, const u8 *nm, u16 nl) {
-    u8 v[4];
-    u16 vl = 4;
-    return (seg_tree_lookup(&g->namet, nm, nl, v, &vl) == 1 && vl == 4) ? g4ld32(v) : 0;
+/* bind a fresh node to an unbound-or-tombstoned name (callers have already
+ * verified lookup == 0); returns 0 if a live binding exists */
+static int name_bind(graph4_t *g, const u8 *nm, u16 nl, u32 node) {
+    u32 cur = 0, gen = 0;
+    (void)name_row(g, nm, nl, &cur, &gen);
+    if (cur) return 0;
+    return name_bind_raw(g, nm, nl, node, gen + 1u);
 }
 
-static int name_del(graph4_t *g, const u8 *nm, u16 nl) {
-    int r = seg_tree_delete(&g->namet, nm, nl);
-    if (r == 1) cat_put_root(g, K_NAME, 2, g->namet.root);
-    return r;
+/* unbind: tombstone the row, advancing the generation */
+static int name_unbind(graph4_t *g, const u8 *nm, u16 nl) {
+    u32 cur = 0, gen = 0;
+    if (!name_row(g, nm, nl, &cur, &gen) || !cur) return 0;
+    return name_bind_raw(g, nm, nl, 0, gen + 1u);
 }
 
 /* ---- trigram posting table ---- */
@@ -447,8 +477,10 @@ typedef struct { int (*cb)(void *ctx, u32 eid); void *ctx; } ni_walk_t;
 static int ni_walk_scan_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
     (void)k; (void)kl;
     ni_walk_t *w = (ni_walk_t *)c;
-    if (!v || vl != 4) return 1;
-    return w->cb(w->ctx, g4ld32(v)) ? 1 : 0;
+    if (!v || vl != 8) return 1;
+    u32 node = g4ld32(v);
+    if (!node) return 1;                       /* tombstone row: unbound name */
+    return w->cb(w->ctx, node) ? 1 : 0;
 }
 static int ni_walk(graph4_t *g, int (*cb)(void *ctx, u32 eid), void *ctx) {
     ni_walk_t w = { cb, ctx };
@@ -509,8 +541,15 @@ const u8 *g4_str(graph4_t *g, u32 sid, u16 *len_out) { return st4_get(g->st, sid
 
 /* ---------- ops ---------- */
 
+u32 g4_lookup_ex(graph4_t *g, const u8 *name, u16 nlen, u32 *gen_out) {
+    u32 node = 0, gen = 0;
+    (void)name_row(g, name, nlen, &node, &gen);
+    if (gen_out) *gen_out = gen;
+    return node;
+}
+
 u32 g4_lookup(graph4_t *g, const u8 *name, u16 nlen) {
-    return name_get(g, name, nlen);
+    return g4_lookup_ex(g, name, nlen, NULL);
 }
 
 u32 g4_create_entity(graph4_t *g, const u8 *name, u16 nlen,
@@ -540,7 +579,7 @@ u32 g4_create_entity(graph4_t *g, const u8 *name, u16 nlen,
     u32 eid = EID_MAKE(lpg, slot);                 /* physical location */
     u32 node = ind_append(g, eid);                 /* logical id (the API's) */
     if (!node) return 0;
-    if (!name_put(g, name, nlen, node)) return 0;
+    if (!name_bind(g, name, nlen, node)) return 0;
     type_put(g, type_sid, node);
     g->ent_count++;
     meta_store(g);                                 /* persists next_node (META v2) */
@@ -578,7 +617,7 @@ int g4_delete_entity(graph4_t *g, u32 node) {
     st4_decref(g->st, e.type_sid);
     if (e.obs_count >= 1 && e.obs0_sid) st4_decref(g->st, e.obs0_sid);
     if (e.obs_count >= 2 && e.obs1_sid) st4_decref(g->st, e.obs1_sid);
-    if (!nmc || !name_del(g, nmc, nl)) { free(old.v); free(nmc); return 0; }
+    if (!nmc || !name_unbind(g, nmc, nl)) { free(old.v); free(nmc); return 0; }
     free(nmc);
     type_del(g, e.type_sid, node);
     u8 *pg = seg_txn_touch(g->gs, EID_LPG(eid));

@@ -383,6 +383,74 @@ int main(void) {
     }
     PASS();
 
+    TEST(name_directory_generations);
+    {
+        /* build step 3: name rows are directory bindings {node, gen}; every
+         * transition (bind/unbind) advances gen so (name, gen) caches detect
+         * rebinding; deleted names tombstone (row persists) rather than
+         * vanish, and re-creation binds a fresh node with a higher gen.
+         * Enumeration must skip tombstoned rows. */
+        char mp[] = "/tmp/g4dir_m_XXXXXX", gp[] = "/tmp/g4dir_g_XXXXXX",
+             sp[] = "/tmp/g4dir_s_XXXXXX";
+        int f;
+        f = mkstemp(mp); assert(f >= 0); close(f);
+        f = mkstemp(gp); assert(f >= 0); close(f);
+        f = mkstemp(sp); assert(f >= 0); close(f);
+        u32 first_node = 0;
+        {
+            seg_io_t *sios[2] = { seg_io_posix_open(gp, 1), seg_io_posix_open(sp, 1) };
+            mstore_t *ms = mstore_create(seg_io_posix_open(mp, 1), sios, 2, 2);
+            assert(ms);
+            graph4_t *g = graph4_open(ms);
+            assert(g);
+            assert(mstore_txn_begin(ms));
+            u32 gen = 0;
+            first_node = g4_lookup_ex(g, (const u8 *)"DirA", 4, &gen);
+            assert(first_node == 0 && gen == 0);               /* never bound */
+            u32 n1 = g4_create_entity(g, (const u8 *)"DirA", 4, (const u8 *)"T", 1, 1);
+            assert(n1 == 1);
+            assert(g4_lookup_ex(g, (const u8 *)"DirA", 4, &gen) == n1 && gen == 1);
+            /* dup-create: no transition, same binding, same gen */
+            assert(g4_create_entity(g, (const u8 *)"DirA", 4, (const u8 *)"T", 1, 2) == n1);
+            assert(g4_lookup_ex(g, (const u8 *)"DirA", 4, &gen) == n1 && gen == 1);
+            assert(g4_delete_entity(g, n1));
+            assert(g4_lookup_ex(g, (const u8 *)"DirA", 4, &gen) == 0 && gen == 2);  /* tombstone */
+            assert(g4_list_entities(g, NULL, 0) == 0);         /* tombstones skipped */
+            u32 n2 = g4_create_entity(g, (const u8 *)"DirA", 4, (const u8 *)"T", 1, 3);
+            assert(n2 != n1);                                  /* fresh node id */
+            assert(g4_lookup_ex(g, (const u8 *)"DirA", 4, &gen) == n2 && gen == 3);
+            assert(g4_delete_entity(g, n2));
+            u32 n3 = g4_create_entity(g, (const u8 *)"DirA", 4, (const u8 *)"T", 1, 4);
+            assert(n3 != n1 && n3 != n2);
+            assert(g4_lookup_ex(g, (const u8 *)"DirA", 4, &gen) == n3 && gen == 5);
+            /* generations are per-row: a sibling name starts at 1 */
+            u32 nb = g4_create_entity(g, (const u8 *)"DirB", 4, (const u8 *)"T", 1, 5);
+            assert(g4_lookup_ex(g, (const u8 *)"DirB", 4, &gen) == nb && gen == 1);
+            assert(mstore_txn_commit(ms));
+            graph4_close(g);
+            mstore_close(ms);
+        }
+        {   /* generations persist across reopen; the next rebind continues */
+            seg_io_t *rios[2] = { seg_io_posix_open(gp, 0), seg_io_posix_open(sp, 0) };
+            mstore_t *ms2 = mstore_open(seg_io_posix_open(mp, 0), rios, 2);
+            assert(ms2);
+            graph4_t *g2 = graph4_open(ms2);
+            assert(g2);
+            u32 gen = 0;
+            u32 n3 = g4_lookup_ex(g2, (const u8 *)"DirA", 4, &gen);
+            assert(n3 != 0 && gen == 5);
+            assert(mstore_txn_begin(ms2));
+            assert(g4_delete_entity(g2, n3));
+            assert(g4_lookup_ex(g2, (const u8 *)"DirA", 4, &gen) == 0 && gen == 6);
+            assert(mstore_txn_commit(ms2));
+            graph4_close(g2);
+            mstore_close(ms2);
+        }
+        unlink(mp); unlink(gp); unlink(sp);
+        (void)first_node;
+    }
+    PASS();
+
     TEST(relations_bidir_dup_delete);
     {
         mstore_t *ms = fresh_store();

@@ -526,6 +526,8 @@ u32  g4_create_entity(graph4_t *g, const u8 *name, u16 nlen,
                       const u8 *type, u16 tlen, u64 mtime);  /* existing -> its eid */
 int  g4_delete_entity(graph4_t *g, u32 eid);                 /* 1 = deleted */
 u32  g4_lookup(graph4_t *g, const u8 *name, u16 nlen);       /* eid or 0 */
+/* node-id or 0; *gen_out = the name binding's generation (directory, step 3) */
+u32  g4_lookup_ex(graph4_t *g, const u8 *name, u16 nlen, u32 *gen_out);
 
 typedef struct {
     u32 eid, name_sid, type_sid, adj_ref;

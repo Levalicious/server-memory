@@ -84,6 +84,14 @@ iteration over shards converges under exactly that condition — which is
   serialization point, hit on create/delete only (rare vs edits). Names
   immutable per generation; re-creation binds a new node-id generation, so
   stale caches self-invalidate on generation conflict.
+  **Landed (step 3):** rows are 8-byte `{node u32, gen u32}` values in the
+  name table; every transition (bind or unbind) advances `gen`; unbound
+  names keep a tombstone row (`node = 0`) so a later re-creation advances
+  the generation — enumeration skips tombstones; generations persist and
+  continue across reopen. Routing hash (normative once N>1):
+  `fnv1a32(name) % N` — a pure function of the name bytes, so no per-store
+  state is read to decide where a binding lives; implemented when the
+  directory becomes multi-shard addressable.
 - **N is growable** (D5); deployment starts at 1.
 
 ## 4. Replicated vertex record (+ mirrors)
@@ -181,6 +189,7 @@ unboundedly.**
    refs become logical; the existing battery + parity gate prove no
    behavior change. **DONE (this commit).**
 3. Name directory store (hash-routed bindings + generations).
+   **DONE (this commit).**
 4. Replication channel + RIBLT port + symbol codecs + watermarks.
 5. Sharded fuzz: extend the existing 30-agent harness to N daemons over N
    shards, with kill-mid-half-write, offline-past-horizon resync, and
