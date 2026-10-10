@@ -543,6 +543,14 @@ u32  g4_lookup_ex(graph4_t *g, const u8 *name, u16 nlen, u32 *gen_out);
 u32  g4_adj_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx);
 u32  g4_vstate_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx);
 
+/* ---- the name-directory family (seam §3/§9; step 5b-ii) ----
+ * ONE symbol per namet row, tombstones and ghosts INCLUDED (the vstate
+ * family cannot see row-only states):
+ *   [u64 mix64(name)][u32 gen][u32 node][pad], node 0 = tombstone.
+ * Resolve a hash to its row: 1 = found (name bytes copied, cap >= record). */
+u32  g4_ndir_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx);
+int  g4_ndir_find(graph4_t *g, u64 nh, u8 *name, u16 *nl, u32 *node, u32 *gen);
+
 /* ---- replication primitives (seam §5, step 5a) ---- */
 u64  g4_chain_wm(graph4_t *g, u32 node);   /* chain remove-watermark (0 = none) */
 u64  g4_relhash(graph4_t *g, u32 rel_sid); /* string-stable reltype hash (symbol identity) */
@@ -603,6 +611,8 @@ typedef struct repl_peer {
      * replace retires the beaten live binding's record); 0 = lost/equal,
      * 1 = applied */
     int (*name_set)(void *ctx, const u8 *name, u16 nl, u32 node, u32 gen, u8 *status);
+    /* resolve a name HASH to its row (directory family; 1 = found) */
+    int (*name_by_hash)(void *ctx, u64 nh, u8 *name, u16 *nl, u32 *node, u32 *gen);
     /* mirrored entity fetch: binding + row blob for a node; 1 = found */
     int (*entity_get)(void *ctx, u32 node, u8 *name, u16 *nl, u32 *gen,
                       u8 *blob, u32 *blen);
@@ -637,7 +647,8 @@ int  g4_vstate_apply_raw(graph4_t *g, u32 node,
 
 /* vstate row blob codec (repl wire + vtable; seam §8):
  *   [str type][u64 mtime][u64 obs_mtime][u8 obs_count]([str obs])×min(oc,2)
- *   [u64 psi bits]   — LE throughout; "str" = [u16 len][bytes].
+ *   [u64 psi]   — psi is the fixed-point int (1e-9 units); LE throughout;
+ *   "str" = [u16 len][bytes].
  * pack returns bytes written (0 = error/cap); cmp compares blob-row ("a")
  * vs live row ("b") with the EXACT row_cmp order (mtime, obs_mtime,
  * obs_count, type bytes, obs bytes, psi); apply parses then applies raw. */
@@ -646,11 +657,15 @@ int  g4_vrow_cmp(graph4_t *g, const u8 *blob, u32 len, const g4_entity_t *e);
 int  g4_vrow_apply(graph4_t *g, u32 node, const u8 *blob, u32 len);
 
 /* ---- mirroring (seam §4/§9, step 5b-ii) ----
- * Move the id-mint counter up (disjoint id spaces per replica after a clone
- * split — clones otherwise mint colliding ids). Returns the new value. */
+ * Move the id-mint counter up (disjoint id spaces per replica — mirrors
+ * carry foreign ids and NEVER move it; the base is set once per replica).
+ * Returns the new value. */
 u32  g4_set_next_node(graph4_t *g, u32 base);
 /* name-directory row read (1 = exists; tombstone rows report node 0) */
 int  g4_name_get(graph4_t *g, const u8 *name, u16 nl, u32 *node, u32 *gen);
+/* diagnostics: name rows whose node record is missing (ghosts — invisible
+ * to vstate symbols); cb per ghost; returns the count. */
+u32  g4_ghost_scan(graph4_t *g, void (*cb)(void *ctx, const u8 *nm, u16 nl, u32 node, u32 gen), void *ctx);
 /* name-row apply under the (gen, node) rule: incoming must be strictly
  * greater; a replace of a live local binding retires that binding's record
  * (no generation churn — the incoming row IS the new state); node 0 =

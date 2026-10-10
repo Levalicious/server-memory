@@ -38,8 +38,10 @@
 #include "segstore.h"
 #include "riblt.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define REPL_CELL_BATCH 256u       /* cells per fetch (256*44B ≈ 11 KiB) */
 #define REPL_ROW_CAP    G4_REPL_ROW_CAP   /* row blob cap (type + 2 obs + overhead) */
@@ -174,18 +176,19 @@ static int edge_present(graph4_t *g, u32 from, u32 to, const u8 *rt, u16 rl) {
 
 typedef struct {
     graph4_t *g;            /* the peer store */
-    riblt_enc enc[2];
-    int active[2];
+    riblt_enc enc[3];
+    int active[3];
     rmap_t *rmap;           /* lazy relhash -> sid over g's edges */
 } lp_t;
 
 static int lp_begin(void *ctx, u8 family, u32 *nsym) {
     lp_t *lp = (lp_t *)ctx;
-    if (family > 1) return 0;
+    if (family > 2) return 0;
     if (lp->active[family]) { riblt_enc_free(&lp->enc[family]); lp->active[family] = 0; }
     rsymset_t s = {0};
     if (family == 0) g4_adj_symbols(lp->g, rcollect, &s);
-    else g4_vstate_symbols(lp->g, rcollect, &s);
+    else if (family == 1) g4_vstate_symbols(lp->g, rcollect, &s);
+    else g4_ndir_symbols(lp->g, rcollect, &s);
     qsort(s.v, s.n, RIBLT_WIDTH, rsym_cmp);
     rsym_uniq(&s);
     if (nsym) *nsym = s.n;
@@ -198,7 +201,7 @@ static int lp_begin(void *ctx, u8 family, u32 *nsym) {
 
 static int lp_cells(void *ctx, u8 family, u32 from_idx, u32 max, u8 *out, u32 *nout) {
     lp_t *lp = (lp_t *)ctx;
-    if (family > 1 || !lp->active[family]) return 0;
+    if (family > 2 || !lp->active[family]) return 0;
     for (u32 i = 0; i < max; i++) {
         const riblt_cell *c = riblt_enc_cell(&lp->enc[family], from_idx + i);
         if (!c) return 0;
@@ -210,7 +213,7 @@ static int lp_cells(void *ctx, u8 family, u32 from_idx, u32 max, u8 *out, u32 *n
 
 static int lp_end(void *ctx, u8 family) {
     lp_t *lp = (lp_t *)ctx;
-    if (family > 1) return 0;
+    if (family > 2) return 0;
     if (lp->active[family]) { riblt_enc_free(&lp->enc[family]); lp->active[family] = 0; }
     return 1;
 }
@@ -282,6 +285,11 @@ static int lp_name_get(void *ctx, const u8 *name, u16 nl, u32 *node, u32 *gen) {
     return g4_name_get(lp->g, name, nl, node, gen);
 }
 
+static int lp_name_by_hash(void *ctx, u64 nh, u8 *name, u16 *nl, u32 *node, u32 *gen) {
+    lp_t *lp = (lp_t *)ctx;
+    return g4_ndir_find(lp->g, nh, name, nl, node, gen);
+}
+
 static int lp_name_set(void *ctx, const u8 *name, u16 nl, u32 node, u32 gen, u8 *status) {
     lp_t *lp = (lp_t *)ctx;
     *status = (u8)(g4_mirror_name(lp->g, name, nl, node, gen) ? 1 : 0);
@@ -321,15 +329,18 @@ int g4_repl_round_wire(graph4_t *local, repl_peer_t *peer, g4_repl_stats_t *st) 
     memset(&stats, 0, sizeof stats);
     int ok = 1;
 
-    u8 *local_only[2] = { NULL, NULL };
-    u8 *remote_only[2] = { NULL, NULL };
-    u32 nlocal[2] = { 0, 0 }, nremote[2] = { 0, 0 };
+    u8 *local_only[3] = { NULL, NULL, NULL };
+    u8 *remote_only[3] = { NULL, NULL, NULL };
+    u32 nlocal[3] = { 0, 0, 0 }, nremote[3] = { 0, 0, 0 };
 
-    /* 1. per family: snapshot LOCAL set, exchange cells, decode both diffs */
-    for (int f = 0; f < 2 && ok; f++) {
+    /* 1. per family: snapshot LOCAL set, exchange cells, decode both diffs.
+     * 0 = adjacency, 1 = vertex-state, 2 = name directory (per §3/§9 — the
+     * only family that can see tombstones and ghost rows). */
+    for (int f = 0; f < 3 && ok; f++) {
         rsymset_t loc = {0};
         if (f == 0) g4_adj_symbols(local, rcollect, &loc);
-        else g4_vstate_symbols(local, rcollect, &loc);
+        else if (f == 1) g4_vstate_symbols(local, rcollect, &loc);
+        else g4_ndir_symbols(local, rcollect, &loc);
         qsort(loc.v, loc.n, RIBLT_WIDTH, rsym_cmp);
         rsym_uniq(&loc);
 
@@ -369,6 +380,9 @@ int g4_repl_round_wire(graph4_t *local, repl_peer_t *peer, g4_repl_stats_t *st) 
             }
             idx += n;
         }
+        if (getenv("G4_REPL_DEBUG"))
+            fprintf(stderr, "[repl][%d] fam=%d loc=%u cells=%u done=%d\n",
+                    (int)getpid(), f, nsym, idx, done);
         free(buf);
         peer->end(peer->ctx, (u8)f);
         if (!ok || !done) { ok = 0; riblt_dec_free(&d); riblt_enc_free(&le); break; }
@@ -482,6 +496,10 @@ int g4_repl_round_wire(graph4_t *local, repl_peer_t *peer, g4_repl_stats_t *st) 
 
                 if (ha && hb) {
                     int c = g4_vrow_cmp(local, blob, bl, &le);
+                    if (getenv("G4_REPL_DEBUG") && c != 0)
+                        fprintf(stderr, "[replA] n=%u c=%d mt=%llu omt=%llu psi=%.12g bl=%u\n",
+                                node, c, (unsigned long long)le.mtime,
+                                (unsigned long long)le.obs_mtime, le.psi, bl);
                     if (c > 0) {
                         if (g4_vrow_apply(local, node, blob, bl)) stats.vstate_applied_a++;
                         else stats.vstate_skipped++;
@@ -569,9 +587,52 @@ int g4_repl_round_wire(graph4_t *local, repl_peer_t *peer, g4_repl_stats_t *st) 
         }
     }
 
+    /* 4. apply — name directory. Row-only states (tombstones, ghost rows)
+     * are visible ONLY here: resolve each differing symbol's hash to the
+     * local and peer rows and run the (gen, node) rule. A winning live
+     * node's RECORD arrives via family 1 (same round or the next). */
+    {
+        u32 n = nlocal[2] + nremote[2];
+        if (n) {
+            u8 *nm = (u8 *)malloc(REPL_STR_CAP);
+            if (!nm) abort();
+            for (int list = 0; list < 2; list++) {
+                const u8 *v = (list == 0) ? local_only[2] : remote_only[2];
+                u32 cnt = (list == 0) ? nlocal[2] : nremote[2];
+                for (u32 i = 0; i < cnt; i++) {
+                    const u8 *s = v + (size_t)i * RIBLT_WIDTH;
+                    u64 nh = sym_u64(s);
+                    u32 lnode = 0, lgen = 0, pn = 0, pg = 0;
+                    u16 nml = 0;
+                    if (!g4_ndir_find(local, nh, nm, &nml, &lnode, &lgen)) {
+                        /* no local row at all: fetch the name from the peer */
+                        if (!peer->name_by_hash(peer->ctx, nh, nm, &nml, &pn, &pg)) {
+                            stats.vstate_skipped++;
+                            continue;
+                        }
+                    } else if (!peer->name_get(peer->ctx, nm, nml, &pn, &pg)) {
+                        pn = 0;
+                        pg = 0;
+                    }
+                    if (pn == lnode && pg == lgen) { stats.vstate_skipped++; continue; }
+                    if (lgen > pg || (lgen == pg && lnode > pn)) {
+                        u8 st = 0;
+                        if (peer->name_set(peer->ctx, nm, nml, lnode, lgen, &st) && st)
+                            stats.name_applied_b++;
+                        else stats.vstate_skipped++;
+                    } else {
+                        if (g4_mirror_name(local, nm, nml, pn, pg)) stats.name_applied_a++;
+                        else stats.vstate_skipped++;
+                    }
+                }
+            }
+            free(nm);
+        }
+    }
+
 cleanup:
-    free(local_only[0]); free(local_only[1]);
-    free(remote_only[0]); free(remote_only[1]);
+    free(local_only[0]); free(local_only[1]); free(local_only[2]);
+    free(remote_only[0]); free(remote_only[1]); free(remote_only[2]);
     if (st) *st = stats;
     return ok;
 }
@@ -593,10 +654,11 @@ int g4_repl_round(graph4_t *a, graph4_t *b, g4_repl_stats_t *st) {
     peer.edge_del = lp_edge_del;
     peer.name_get = lp_name_get;
     peer.name_set = lp_name_set;
+    peer.name_by_hash = lp_name_by_hash;
     peer.entity_get = lp_entity_get;
     peer.entity_set = lp_entity_set;
     int ok = g4_repl_round_wire(a, &peer, st);
-    for (int f = 0; f < 2; f++)
+    for (int f = 0; f < 3; f++)
         if (lp.active[f]) riblt_enc_free(&lp.enc[f]);
     rmap_free(lp.rmap);
     return ok;

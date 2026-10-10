@@ -258,6 +258,7 @@ int main(void)
         snprintf(gd, sizeof gd, "%s/graph.kb", dirD);
         snprintf(sd, sizeof sd, "%s/strings.kb", dirD);
         u32 a_cc = 0, a_ii = 0, b_cc = 0, b_ii = 0;
+        u32 a_gg = 0, a_hh = 0, b_gg = 0, b_hh = 0;
         char victim_name[32] = {0};
 
         /* base store (400 entities, 300 relations, 60 obs) */
@@ -310,6 +311,12 @@ int main(void)
             assert(a_cc >= 16384);
             a_ii = g4_create_entity(g, (const u8 *)"II_9", 4, (const u8 *)"T9", 2, 8301);
             assert(a_ii > a_cc);
+            /* family-2 case: a GHOST row — record retired, row stays live */
+            a_gg = g4_create_entity(g, (const u8 *)"GG_9", 4, (const u8 *)"T9", 2, 8500);
+            assert(a_gg && g4_entity_retire(g, a_gg));
+            /* and the mirror-image: a tombstone at gen 2 */
+            a_hh = g4_create_entity(g, (const u8 *)"HH_9", 4, (const u8 *)"T9", 2, 8501);
+            assert(a_hh && g4_delete_entity(g, a_hh));
             u32 a10 = g4_lookup(g, (const u8 *)"RL_0010", 7);
             assert(g4_set_entity_fields(g, a10, 9000, 0, 0, 0, 0.0));
             u32 a20 = g4_lookup(g, (const u8 *)"RL_0020", 7);
@@ -347,6 +354,10 @@ int main(void)
             assert(b_cc >= 8192 && b_cc < 16384);
             b_ii = g4_create_entity(g, (const u8 *)"II_9", 4, (const u8 *)"T9", 2, 8401);
             assert(b_ii > b_cc);
+            b_gg = g4_create_entity(g, (const u8 *)"GG_9", 4, (const u8 *)"T9", 2, 8600);
+            assert(b_gg && g4_delete_entity(g, b_gg));           /* tombstone gen 2 */
+            b_hh = g4_create_entity(g, (const u8 *)"HH_9", 4, (const u8 *)"T9", 2, 8601);
+            assert(b_hh && g4_entity_retire(g, b_hh));           /* ghost */
             {   /* entity delete with no incident edges: clean tombstone carry */
                 u32 v = 0;
                 for (u32 c = 301; c < 400 && !v; c++) {
@@ -392,8 +403,8 @@ int main(void)
             /* 5b-ii: entity mirrors + name rows */
             assert(st.entity_pushed_b == 5);          /* AX_0..2 + CC_9 + II_9 */
             assert(st.entity_pulled_a == 2);          /* BX_0..1 */
-            assert(st.name_applied_a == 1);           /* victim tombstone adopted */
-            assert(st.name_applied_b == 2);           /* CC_9, II_9: A's nodes win */
+            assert(st.name_applied_a == 2);           /* victim + GG_9 (family 2) */
+            assert(st.name_applied_b == 3);           /* CC_9, II_9, HH_9 */
             assert(g4_chain_wm(ga, g4_lookup(ga, (const u8 *)"RL_0040", 7)) >= 1040);
             {
                 g4_entity_t tmp;
@@ -416,6 +427,15 @@ int main(void)
                 assert(gn2 == 2);
                 assert(g4_name_get(gb, (const u8 *)victim_name, 7, &nm2, &gn2) && nm2 == 0);
                 assert(gn2 == 2);                          /* both tombstoned at gen 2 */
+                /* family 2: row-only states reconcile (ghost vs tombstone) */
+                assert(g4_name_get(ga, (const u8 *)"GG_9", 4, &nm2, &gn2) && nm2 == 0);
+                assert(gn2 == 2);
+                assert(g4_name_get(gb, (const u8 *)"GG_9", 4, &nm2, &gn2) && nm2 == 0);
+                assert(gn2 == 2);
+                assert(g4_name_get(ga, (const u8 *)"HH_9", 4, &nm2, &gn2) && nm2 == 0);
+                assert(gn2 == 2);
+                assert(g4_name_get(gb, (const u8 *)"HH_9", 4, &nm2, &gn2) && nm2 == 0);
+                assert(gn2 == 2);
             }
             assert(mstore_txn_commit(mca));
             assert(mstore_txn_commit(mdb));

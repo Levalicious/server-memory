@@ -66,6 +66,8 @@
  *   RE_NAME     {u32 n, n x str name}
  *               -> n x {u8 found, [u32 node, u32 gen]}  (tombstone: node 0)
  *   RE_NAME_SET {u32 n, n x {str name, u32 node, u32 gen}} -> n x u8 status
+ *   RE_NDIR     {u32 n, n x u64 namehash}
+ *               -> n x {u8 found, [str name, u32 node, u32 gen]}
  *   RE_ENTITY   {u32 n, n x u32 node}
  *               -> n x {u8 found, [str name, u32 gen, u32 len, blob]}
  *   RE_ENTITY_SET {u32 n, n x {u32 node, str name, u32 gen, u32 len, blob}}
@@ -86,12 +88,14 @@
  * concurrently (mutual waits would deadlock — role asymmetry or an async
  * driver arrives with the sharded fuzz). Partial rounds are safe: applies
  * are idempotent, the next round repairs.
- * family: 0 = adjacency, 1 = vertex-state. Cells are [sum 32][count i32 LE]
- * [checksum u64 LE] (riblt_cell_pack). Row blob: [str type][u64 mtime]
- * [u64 obs_mtime][u8 obs_count]([str obs])x min(count,2)[u64 psi bits]
- * (g4_vrow_pack). Status bytes: RE_VROW_SET 1 = applied, 0 = lost/equal;
- * RE_EDGE_PULL 0 = covered by the local remove-watermark (the CALLER must
- * delete its copy), 1 = created, 2 = dup, 3 = failed; RE_EDGE_DEL 1 = deleted.
+ * family: 0 = adjacency, 1 = vertex-state, 2 = name directory (per-row
+ * namehash symbols; tombstones and ghost rows included). Cells are
+ * [sum 32][count i32 LE][checksum u64 LE] (riblt_cell_pack). Row blob:
+ * [str type][u64 mtime][u64 obs_mtime][u8 obs_count]([str obs])x min(count,2)
+ * [u64 psi] (g4_vrow_pack; psi is the fixed-point int, 1e-9 units).
+ * Status bytes: RE_VROW_SET 1 = applied, 0 = lost/equal; RE_EDGE_PULL
+ * 0 = covered by the local remove-watermark (the CALLER must delete its
+ * copy), 1 = created, 2 = dup, 3 = failed; RE_EDGE_DEL 1 = deleted.
  * RE_VROW_SET re-checks the LWW order against the live row at apply time, so
  * a stale push can never clobber a newer row (the same guard the in-process
  * adapter runs).
@@ -158,6 +162,7 @@ enum {
     OP_RE_NAME_SET      = 0x3a,   /* u32 n, n x {str, u32, u32} -> n x u8       */
     OP_RE_ENTITY        = 0x3b,   /* u32 n, n x u32 -> n x {u8,[str,u32,u32,blob]} */
     OP_RE_ENTITY_SET    = 0x3c,   /* u32 n, n x {u32, str, u32, u32, blob} -> n x u8 */
+    OP_RE_NDIR          = 0x3d,   /* u32 n, n x u64 hash -> n x {u8,[str,u32,u32]} */
 };
 
 /* OPEN_NODES entity blob (per requested name):

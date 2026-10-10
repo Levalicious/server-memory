@@ -9,6 +9,8 @@
 #include "re_dfa.h"
 #include "re_trigram.h"
 
+#include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,6 +50,17 @@ static void g4st32(u8 *p, u32 v) { p[0]=(u8)v; p[1]=(u8)(v>>8); p[2]=(u8)(v>>16)
 static u64  g4ld64(const u8 *p) { return (u64)g4ld32(p) | ((u64)g4ld32(p+4) << 32); }
 static void g4st64(u8 *p, u64 v) { g4st32(p, (u32)v); g4st32(p+4, (u32)(v>>32)); }
 
+/* ψ is STORED as a fixed-point int (1e-9 units; design note §4: "int
+ * encoding makes merges exact and reproducible"). Two stores whose MERW
+ * iterates agree to <1e-9 emit identical stored bytes — content hashes
+ * match and rounds stop churning; raw doubles would differ in low bits
+ * forever. The entity struct carries the unpacked double. */
+static u64 psi_pack(double v) {
+    if (!(v > 0)) return 0;                    /* also NaN-safe */
+    return (u64)(long long)(v * 1e9 + 0.5);
+}
+static double psi_unpack(u64 q) { return (double)q / 1e9; }
+
 /* ---------- entity record encode/decode ---------- */
 
 static void ent_encode(u8 *r, const g4_entity_t *e) {
@@ -62,7 +75,7 @@ static void ent_encode(u8 *r, const g4_entity_t *e) {
     r[40] = e->obs_count; r[41] = r[42] = r[43] = 0;
     g4st64(r + 44, e->structural_visits);
     g4st64(r + 52, e->walker_visits);
-    memcpy(r + 60, &e->psi, 8);
+    g4st64(r + 60, psi_pack(e->psi));      /* fixed-point ψ (1e-9 units) */
     g4st64(r + 68, 0);                     /* adj_wm: fresh entities start clean */
 }
 
@@ -78,7 +91,7 @@ static int ent_decode(const u8 *r, u16 sz, g4_entity_t *e) {
     e->obs_count = r[40];
     e->structural_visits = g4ld64(r + 44);
     e->walker_visits     = g4ld64(r + 52);
-    memcpy(&e->psi, r + 60, 8);
+    e->psi = psi_unpack(g4ld64(r + 60));
     e->adj_wm = g4ld64(r + 68);
     return 1;
 }
@@ -1556,7 +1569,7 @@ int g4_set_entity_fields(graph4_t *g, u32 eid, u64 mtime, u64 obs_mtime,
     g4st64(r + 24, obs_mtime);
     g4st64(r + 44, svis);
     g4st64(r + 52, wvis);
-    memcpy(r + 60, &psi, 8);
+    g4st64(r + 60, psi_pack(psi));
     meta_store(g);                       /* totals are store state (ruling 4-i) */
     return 1;
 }
@@ -1713,6 +1726,12 @@ u32 g4_compute_merw_psi(graph4_t *g, double alpha, u32 max_iter, double tol) {
     u32 got = g4_list_entities(g, eids, n);
     if (got > n) got = n;                  /* true-total return: clamp to the buffer */
     n = got;
+    /* CANONICAL iteration order: sorted ids + sorted per-row targets, so two
+     * stores with identical graphs compute bit-identical ψ (the fp sums add
+     * in the same order). Without this, per-store enumeration order made the
+     * iteration maps differ in the last bits and replicas' fixed-point
+     * roundings chased each other through the LWW forever (fuzz find). */
+    qsort(eids, n, sizeof *eids, cmp_u32v);
 
     e2i_t idx;
     idx.cap = 256; while (idx.cap < n * 2) idx.cap *= 2;
@@ -1754,6 +1773,7 @@ u32 g4_compute_merw_psi(graph4_t *g, double alpha, u32 max_iter, double tol) {
                 if (j) col[w++] = j - 1;
             }
             free(es);
+            qsort(col + rowoff[i], w - rowoff[i], sizeof *col, cmp_u32v);
         }
         double warm_sum = 0; u32 warm_cnt = 0;
         for (u32 i = 0; i < n; i++) {
@@ -1782,7 +1802,7 @@ u32 g4_compute_merw_psi(graph4_t *g, double alpha, u32 max_iter, double tol) {
         for (u32 i = 0; i < n; i++) {
             if (psi[i] < 0) psi[i] = 0;
             u8 *r = ent_rec_w(g, eids[i]);
-            if (r) memcpy(r + 60, &psi[i], 8);
+            if (r) g4st64(r + 60, psi_pack(psi[i]));
         }
         free(col); free(psi); free(nx); free(rowoff);
         free(eids); free(idx.k); free(idx.v);
@@ -1888,8 +1908,9 @@ static int sym_vstate_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
     tail[0] = e.obs_count;
     g4st64(tail + 1, e.mtime);
     g4st64(tail + 9, e.obs_mtime);
-    u64 psi_bits; memcpy(&psi_bits, &e.psi, 8);
+    u64 psi_bits = psi_pack(e.psi);
     memcpy(tail + 17, &psi_bits, 8);
+    h = sym_mix64_acc(h, tail, sizeof tail);
     h = sym_mix64_acc(h, tail, sizeof tail);
     u8 s[G4_SYM_LEN];
     memset(s, 0, sizeof s);
@@ -1911,6 +1932,59 @@ u32 g4_vstate_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *c
     sym_walk_t w = { g, cb, ctx, 0 };
     (void)seg_tree_scan(&g->namet, NULL, 0, 1, NULL, 0, 1, sym_vstate_cb, &w);
     return w.n;
+}
+
+/* ================= name-directory family (seam §3/§9, step 5b-ii) =========
+ * The vstate family only sees rows with LIVE records; tombstones and ghosts
+ * (row present, record dead) emit nothing, so an asymmetric row-only state
+ * is invisible to the round (a fuzz find). The directory family emits ONE
+ * symbol per namet row, INCLUDING tombstones and ghosts:
+ *   [u64 mix64(name)][u32 gen][u32 node][pad]
+ * Resolution: match the hash against the local namet (g4_ndir_find), fetch
+ * the peer's row by name, and reconcile with the (gen, node) rule. */
+static int sym_ndir_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
+    sym_walk_t *w = (sym_walk_t *)c;
+    if (!v || vl != 8) return 1;
+    u32 node = g4ld32(v);
+    u32 gen = g4ld32(v + 4);
+    u8 s[G4_SYM_LEN];
+    memset(s, 0, sizeof s);
+    g4st64(s, sym_mix64(k, kl));               /* namehash */
+    g4st32(s + 8, gen);
+    g4st32(s + 12, node);                      /* 0 = tombstone */
+    w->cb(w->ctx, s);
+    w->n++;
+    return 1;
+}
+
+u32 g4_ndir_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx) {
+    sym_walk_t w = { g, cb, ctx, 0 };
+    (void)seg_tree_scan(&g->namet, NULL, 0, 1, NULL, 0, 1, sym_ndir_cb, &w);
+    return w.n;
+}
+
+/* resolve a name hash to its row + name bytes; 1 = found. The name is
+ * copied INSIDE the scan callback (scan keys live in the scan's frame). */
+typedef struct { u64 nh; u8 *name; u16 cap, nl; u32 node, gen; int hit; } ndf_t;
+static int ndf_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
+    ndf_t *f = (ndf_t *)c;
+    if (f->hit || !v || vl != 8 || kl > f->cap) return 1;
+    if (sym_mix64(k, kl) != f->nh) return 1;
+    memcpy(f->name, k, kl);
+    f->nl = kl;
+    f->node = g4ld32(v);
+    f->gen = g4ld32(v + 4);
+    f->hit = 1;
+    return 1;
+}
+int g4_ndir_find(graph4_t *g, u64 nh, u8 *name, u16 *nl, u32 *node, u32 *gen) {
+    ndf_t f = { nh, name, (u16)G4_REPL_STR_CAP, 0, 0, 0, 0 };
+    (void)seg_tree_scan(&g->namet, NULL, 0, 1, NULL, 0, 1, ndf_cb, &f);
+    if (!f.hit) return 0;
+    *nl = f.nl;
+    *node = f.node;
+    *gen = f.gen;
+    return 1;
 }
 
 /* ================= replication primitives (seam §5, step 5a) ================= */
@@ -2031,8 +2105,8 @@ int g4_vstate_apply_raw(graph4_t *g, u32 node,
     r[40] = ocount;
     g4st64(r + 16, mtime);
     g4st64(r + 24, obs_mtime);
-    u64 psi_bits; memcpy(&psi_bits, &psi, 8);
-    memcpy(r + 60, &psi_bits, 8);       /* psi is stored native, like every writer */
+    u64 psi_bits = psi_pack(psi);
+    memcpy(r + 60, &psi_bits, 8);       /* fixed-point ψ (1e-9 units) */
     tri_apply(g, node, old.v, old.n);
     free(old.v);
     return 1;
@@ -2087,8 +2161,8 @@ u32 g4_vrow_pack(graph4_t *g, const g4_entity_t *e, u8 *out, u32 cap) {
         blob_put_str(out, &off, s, s ? l : 0);
     }
     if (cap < off + 8) return 0;
-    u64 psi_bits; memcpy(&psi_bits, &e->psi, 8);
-    g4st64(out + off, psi_bits); off += 8;
+    g4st64(out + off, psi_pack(e->psi));   /* blob carries the fixed-point ψ */
+    off += 8;
     return off;
 }
 
@@ -2115,8 +2189,7 @@ static int vrow_parse(const u8 *blob, u32 len, vf_t *f) {
         if (!blob_get_str(blob, len, &off, &f->obs[k], &f->obslen[k])) return 0;
     }
     if (off + 8 > len) return 0;
-    u64 pb = g4ld64(blob + off);
-    memcpy(&f->psi, &pb, 8);
+    f->psi = psi_unpack(g4ld64(blob + off));
     return 1;
 }
 
@@ -2178,6 +2251,29 @@ int g4_name_get(graph4_t *g, const u8 *name, u16 nl, u32 *node, u32 *gen) {
     return name_row(g, name, nl, node, gen);
 }
 
+/* diagnostics: walk name rows whose node's RECORD is missing (ghosts — a
+ * row-only state that vstate symbols cannot see). cb(name, nl, node, gen)
+ * per ghost; returns the ghost count. */
+typedef struct { graph4_t *g; void (*cb)(void *ctx, const u8 *nm, u16 nl, u32 node, u32 gen); void *ctx; u32 n; } gsc_ctx_t;
+static int gsc_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
+    gsc_ctx_t *w = (gsc_ctx_t *)c;
+    if (!v || vl != 8) return 1;
+    u32 node = g4ld32(v);
+    if (!node) return 1;
+    u32 gen = g4ld32(v + 4);
+    g4_entity_t e;
+    if (!g4_read_entity(w->g, node, &e)) {
+        w->cb(w->ctx, k, kl, node, gen);
+        w->n++;
+    }
+    return 1;
+}
+u32 g4_ghost_scan(graph4_t *g, void (*cb)(void *ctx, const u8 *nm, u16 nl, u32 node, u32 gen), void *ctx) {
+    gsc_ctx_t w = { g, cb, ctx, 0 };
+    (void)seg_tree_scan(&g->namet, NULL, 0, 1, NULL, 0, 1, gsc_cb, &w);
+    return w.n;
+}
+
 /* the (gen, node) rule, one voice for every caller: incoming beats the local
  * row iff strictly greater lexicographically; ties pass for nothing here
  * (record-ensure is decided by g4_mirror_apply). On a replace that retires a
@@ -2188,7 +2284,23 @@ int g4_mirror_name(graph4_t *g, const u8 *name, u16 nl, u32 node, u32 gen) {
     int have = name_row(g, name, nl, &lnode, &lgen);
     if (have) {
         if (gen < lgen || (gen == lgen && node <= lnode)) return 0;   /* lost/equal */
-        if (lnode && lnode != node && !g4_entity_retire(g, lnode)) return 0;
+        if (getenv("G4_REPL_DEBUG"))
+            fprintf(stderr, "[mname][%d] name=%.*s -> node=%u gen=%u (was %u,%u) retire=%u\n",
+                    (int)getpid(), (int)nl, (const char *)name, node, gen, lnode, lgen,
+                    (lnode && lnode != node) ? lnode : 0);
+        if (lnode && lnode != node) {
+            /* a loser whose record is ALREADY gone is not a failure: its row
+             * is a stale ghost, and refusing the rewrite here would make the
+             * ghost permanent (the losing side of a race had died first) */
+            if (!g4_entity_retire(g, lnode)) {
+                g4_entity_t tmp;
+                if (g4_read_entity(g, lnode, &tmp)) return 0;    /* real failure */
+            }
+        }
+    } else {
+        if (getenv("G4_REPL_DEBUG"))
+            fprintf(stderr, "[mname][%d] name=%.*s -> node=%u gen=%u (fresh)\n",
+                    (int)getpid(), (int)nl, (const char *)name, node, gen);
     }
     return name_bind_raw(g, name, nl, node, gen);
 }
@@ -2315,14 +2427,23 @@ int g4_mirror_apply(graph4_t *g, u32 node, const u8 *name, u16 nl, u32 gen,
     if (!g4_read_entity(g, node, &cur)) {
         u32 name_sid = st4_intern(g->st, name, nl);
         if (!name_sid) return 0;
-        if (!ent_create_at(g, node, name_sid, &f)) { st4_decref(g->st, name_sid); return 0; }
+        if (!ent_create_at(g, node, name_sid, &f)) {
+            if (getenv("G4_REPL_DEBUG"))
+                fprintf(stderr, "[mirror] create_at FAILED node=%u name=%.*s gen=%u\n",
+                        node, (int)nl, (const char *)name, gen);
+            st4_decref(g->st, name_sid);
+            return 0;
+        }
     } else {
         int c = g4_vrow_cmp(g, blob, blen, &cur);
         if (c == 0) return 2;                    /* already equal: no-op */
         if (c > 0) return 0;                     /* local content newer: never clobbered */
         if (!g4_vrow_apply(g, node, blob, blen)) return 0;
     }
-    u32 nn = node + 1u;
-    if (nn > g->next_node) { g->next_node = nn; meta_store(g); }
+    /* NOTE: the mint pointer is deliberately NOT bumped here. Mirrors carry
+     * FOREIGN ids; advancing next_node would walk this replica's mints into
+     * another replica's range and mint colliding ids (the fuzz caught
+     * exactly that — two names on one node). Disjoint ranges via
+     * g4_set_next_node / KBD_NODE_BASE are the replica contract. */
     return 1;
 }

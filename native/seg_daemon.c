@@ -106,6 +106,10 @@ typedef struct {
     int64_t    rank_cadence_ms;       /* min gap between rank slices on busy ticks */
     u32        rank_slice_iters;      /* ψ iters per slice (scheduling chunk only) */
     int        psi_pending;           /* ψ hit the chunk bound, not yet |Δ|<ε */
+    int        rank_off;              /* KBD_RANK_DISABLE: owner rank job frozen
+                                       * (convergence tests: proves REPLICATION
+                                       * convergence without the asymptotic
+                                       * MERW iterate still moving) */
     /* v1.5 leases (continuations — spec §4 as r3.1, design note 2026-10-08).
      * RAM-only, TTL+cap bounded, swept on the poll loop; at cap: evict expired
      * else don't issue (token 0). Payload is O(1): a deterministic replay
@@ -114,7 +118,7 @@ typedef struct {
     u32        lease_cap;
     u64        lease_next_id;
     int64_t    lease_ttl_ms;
-    kbd_repl_fam_t repl[2];           /* v1.7: anti-entropy serve snapshots */
+    kbd_repl_fam_t repl[3];           /* v1.7: serve snapshots (0 adj, 1 vstate, 2 dir) */
 } kbd_t;
 
 typedef struct kbd_lease {
@@ -159,13 +163,18 @@ static void pw_flush_in_txn(kbd_t *k) {
  * (PR_ErrorInverselyProportionalToRank).
  *
  * MERW ψ: warm-started power iteration run to MEASURED convergence,
- * |ψ(t+1) − ψ(t)| < ε (PR_PowerIteration; ε = 1e-8, same triple the v3
- * store used). The per-slice iteration count is a SCHEDULING chunk only —
- * if the chunk bound is hit before convergence, psi_pending keeps slicing
- * on later ticks (warm start resumes from the partial ψ just persisted)
- * until the criterion is met. Slices run only while there is work: a store
- * txid watermark (edits) or pending ψ convergence. KBD_RANK_CADENCE_MS
- * bounds how often a NON-idle tick may slice (default 250; tests set 0 for
+ * |ψ(t+1) − ψ(t)| < ε (PR_PowerIteration). ε is QUANTUM-AWARE: ψ is stored
+ * as a fixed-point int (1e-9 units) and replicates by value, so the slice
+ * must stop only when its update step is well below half a quantum —
+ * otherwise every slice nudges the stored int by ≥1 unit and anti-entropy
+ * rounds chase it forever (the fuzz caught exactly that at the v3-era
+ * ε = 1e-8, ~40 quanta coarse). ε = 5e-10 L2 ≈ 2e-11/component. The
+ * per-slice iteration count is a SCHEDULING chunk only — if the chunk
+ * bound is hit before convergence, psi_pending keeps slicing on later
+ * ticks (warm start resumes from the partial ψ just persisted) until the
+ * criterion is met. Slices run only while there is work: a store txid
+ * watermark (edits) or pending ψ convergence. KBD_RANK_CADENCE_MS bounds
+ * how often a NON-idle tick may slice (default 250; tests set 0 for
  * eagerly-consistent ranks); the cadence itself is measurement-deferred
  * (spec §10). */
 
@@ -178,6 +187,7 @@ static int64_t kbd_now_ms(void) {
 #define KBD_RANK_SLICE_DEFAULT_ITERS 50
 
 static void maybe_rank_slice(kbd_t *k, int idle, int64_t *last_slice) {
+    if (k->rank_off) return;                 /* frozen for convergence testing */
     if (k->rank_mark == mstore_txid(k->ms) && !k->psi_pending) return;
     int64_t t = kbd_now_ms();
     if (!idle && t - *last_slice < k->rank_cadence_ms) return;
@@ -188,7 +198,7 @@ static void maybe_rank_slice(kbd_t *k, int idle, int64_t *last_slice) {
     if (new_edits) g4_structural_sample(k->g, 1, 0.85);
     /* iters == chunk is treated as still-pending even when convergence
      * landed exactly there — one extra slice clears it. */
-    u32 iters = g4_compute_merw_psi(k->g, 0.85, k->rank_slice_iters, 1e-8);
+    u32 iters = g4_compute_merw_psi(k->g, 0.85, k->rank_slice_iters, 5e-10);
     k->psi_pending = (iters >= k->rank_slice_iters);
     if (mstore_txn_commit(k->ms)) k->rank_mark = mstore_txid(k->ms);
 }
@@ -524,7 +534,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         u32 total = 0, max = 0, skip = 0;
         u32 *out = NULL;
         if (op == OP_SEARCH) {
-            u16 pl; const u8 *pat = rstr(r, &pl);
+            u16 pl = 0; const u8 *pat = rstr(r, &pl);
             max = r32(r);
             skip = (r->p + 4 <= r->end) ? r32(r) : 0;   /* v1.2 optional trailer */
             if (r->err || max > 100000 || skip > 100000) { err_reply(w, "bad req"); return ST_ERR; }
@@ -537,7 +547,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
             total = g4_search(k->g, pz, out, max + skip);
             free(pz);
         } else if (op == OP_BY_TYPE) {
-            u16 tl; const u8 *ty = rstr(r, &tl);
+            u16 tl = 0; const u8 *ty = rstr(r, &tl);
             max = r32(r);
             skip = (r->p + 4 <= r->end) ? r32(r) : 0;   /* v1.2 optional trailer */
             if (r->err || max > 100000 || skip > 100000) { err_reply(w, "bad req"); return ST_ERR; }
@@ -627,7 +637,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
         if (k->dirty_counters) pw_flush_in_txn(k);
         g4_structural_sample(k->g, 1, 0.85);
-        u32 iters = g4_compute_merw_psi(k->g, 0.85, 200, 1e-8);
+        u32 iters = g4_compute_merw_psi(k->g, 0.85, 2000, 5e-10);
         k->psi_pending = (iters >= 200);
         if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
         k->rank_mark = mstore_txid(k->ms);
@@ -710,12 +720,13 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
 
     case OP_RE_BEGIN: {
         u8 fam = r8(r);
-        if (r->err || fam > 1) { err_reply(w, "bad family"); return ST_ERR; }
+        if (r->err || fam > 2) { err_reply(w, "bad family"); return ST_ERR; }
         kbd_repl_fam_t *rf = &k->repl[fam];
         if (rf->active) { riblt_enc_free(&rf->enc); rf->active = 0; }
         dcol_t set = {0};
         if (fam == 0) g4_adj_symbols(k->g, dcollect, &set);
-        else g4_vstate_symbols(k->g, dcollect, &set);
+        else if (fam == 1) g4_vstate_symbols(k->g, dcollect, &set);
+        else g4_ndir_symbols(k->g, dcollect, &set);
         qsort(set.v, set.n, RIBLT_WIDTH, dcol_cmp);
         u32 w2 = 0;                       /* dedup (canonical halves emit twice) */
         for (u32 i = 0; i < set.n; i++) {
@@ -740,7 +751,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
     case OP_RE_CELLS: {
         u8 fam = r8(r);
         u32 from = r32(r), max = r32(r);
-        if (r->err || fam > 1) { err_reply(w, "bad req"); return ST_ERR; }
+        if (r->err || fam > 2) { err_reply(w, "bad req"); return ST_ERR; }
         kbd_repl_fam_t *rf = &k->repl[fam];
         if (!rf->active) { err_reply(w, "no begin"); return ST_ERR; }
         if (max > 1024) max = 1024;       /* 1024 x 44B = 44 KiB per frame */
@@ -757,7 +768,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
     }
     case OP_RE_END: {
         u8 fam = r8(r);
-        if (r->err || fam > 1) { err_reply(w, "bad req"); return ST_ERR; }
+        if (r->err || fam > 2) { err_reply(w, "bad req"); return ST_ERR; }
         kbd_repl_fam_t *rf = &k->repl[fam];
         if (rf->active) { riblt_enc_free(&rf->enc); rf->active = 0; }
         return ST_OK;
@@ -819,10 +830,14 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
             r->p += blen;
             g4_entity_t cur;
             u8 status = 0;
-            if (g4_read_entity(k->g, node, &cur) &&
-                g4_vrow_cmp(k->g, blob, blen, &cur) > 0 &&
-                g4_vrow_apply(k->g, node, blob, blen))
-                status = 1;
+            if (g4_read_entity(k->g, node, &cur)) {
+                int cc = g4_vrow_cmp(k->g, blob, blen, &cur);
+                if (getenv("G4_REPL_DEBUG") && cc != 0)
+                    fprintf(stderr, "[replB] n=%u cc=%d mt=%llu omt=%llu psi=%.12g\n",
+                            node, cc, (unsigned long long)cur.mtime,
+                            (unsigned long long)cur.obs_mtime, cur.psi);
+                if (cc > 0 && g4_vrow_apply(k->g, node, blob, blen)) status = 1;
+            }
             w8(w, status);
         }
         if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
@@ -958,6 +973,26 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
             w8(w, (u8)(g4_mirror_name(k->g, nm, nl, node, gen) ? 1 : 0));
         }
         if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
+        return ST_OK;
+    }
+    case OP_RE_NDIR: {
+        u32 n = r32(r);
+        if (r->err || n > 4096) { err_reply(w, "bad batch"); return ST_ERR; }
+        u8 *nm = (u8 *)malloc(G4_REPL_STR_CAP);
+        if (!nm) { err_reply(w, "oom"); return ST_ERR; }
+        for (u32 i = 0; i < n; i++) {
+            u64 nh = r64(r);
+            if (r->err) { free(nm); err_reply(w, "trunc"); return ST_ERR; }
+            u16 nl = 0;
+            u32 node = 0, gen = 0;
+            if (g4_ndir_find(k->g, nh, nm, &nl, &node, &gen)) {
+                w8(w, 1);
+                wstr(w, nm, nl);
+                w32(w, node);
+                w32(w, gen);
+            } else w8(w, 0);
+        }
+        free(nm);
         return ST_OK;
     }
     case OP_RE_ENTITY: {
@@ -1202,6 +1237,8 @@ kbd_t *kbd_open(const char *dir) {
         const char *rc = getenv("KBD_RANK_CADENCE_MS");
         k->rank_cadence_ms = rc ? atol(rc) : 250;
         if (k->rank_cadence_ms < 0) k->rank_cadence_ms = 0;
+        { const char *rd = getenv("KBD_RANK_DISABLE");
+          k->rank_off = (rd && atoi(rd)) ? 1 : 0; }
         const char *ri = getenv("KBD_RANK_SLICE_ITERS");
         k->rank_slice_iters = ri ? (u32)atol(ri) : KBD_RANK_SLICE_DEFAULT_ITERS;
         if (k->rank_slice_iters < 1) k->rank_slice_iters = KBD_RANK_SLICE_DEFAULT_ITERS;
@@ -1224,7 +1261,7 @@ void kbd_close(kbd_t *k) {
     mstore_close(k->ms);
     free(k->pw.eids); free(k->pw.walks);
     free(k->leases);
-    for (int f = 0; f < 2; f++)
+    for (int f = 0; f < 3; f++)
         if (k->repl[f].active) riblt_enc_free(&k->repl[f].enc);
     free(k);
 }

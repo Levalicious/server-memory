@@ -74,8 +74,8 @@ static const u8 *cr_str(cr_t *r, u16 *len) {
 struct g4_wire_peer {
     int fd;
     u32 reqid;
-    u32 want_gen[2];
-    int begun[2];
+    u32 want_gen[3];
+    int begun[3];
     repl_peer_t iface;
 };
 
@@ -170,7 +170,7 @@ void g4_wire_peer_close(g4_wire_peer_t *p) {
 
 static int wp_begin(void *ctx, u8 family, u32 *nsym) {
     g4_wire_peer_t *p = (g4_wire_peer_t *)ctx;
-    if (family > 1) return 0;
+    if (family > 2) return 0;
     cw_t pl = {0};
     cw_u8(&pl, family);
     u8 *body = NULL;
@@ -190,7 +190,7 @@ static int wp_begin(void *ctx, u8 family, u32 *nsym) {
 
 static int wp_cells(void *ctx, u8 family, u32 from_idx, u32 max, u8 *out, u32 *nout) {
     g4_wire_peer_t *p = (g4_wire_peer_t *)ctx;
-    if (family > 1 || !p->begun[family]) return 0;
+    if (family > 2 || !p->begun[family]) return 0;
     cw_t pl = {0};
     cw_u8(&pl, family);
     cw_u32(&pl, from_idx);
@@ -215,7 +215,7 @@ static int wp_cells(void *ctx, u8 family, u32 from_idx, u32 max, u8 *out, u32 *n
 
 static int wp_end(void *ctx, u8 family) {
     g4_wire_peer_t *p = (g4_wire_peer_t *)ctx;
-    if (family > 1) return 0;
+    if (family > 2) return 0;
     cw_t pl = {0};
     cw_u8(&pl, family);
     u8 *body = NULL;
@@ -425,6 +425,34 @@ static int wp_entity_set(void *ctx, u32 node, const u8 *name, u16 nl, u32 gen,
     return 1;
 }
 
+static int wp_name_by_hash(void *ctx, u64 nh, u8 *name, u16 *nl, u32 *node, u32 *gen) {
+    g4_wire_peer_t *p = (g4_wire_peer_t *)ctx;
+    cw_t pl = {0};
+    cw_u32(&pl, 1);
+    cw_u64(&pl, nh);
+    u8 *body = NULL;
+    u32 blen = 0;
+    int r = wp_rt(p, OP_RE_NDIR, &pl, &body, &blen);
+    free(pl.buf);
+    if (r != 1) { free(body); return 0; }
+    cr_t cr = { body, body + blen, 0 };
+    u8 found = cr_u8(&cr);
+    int ok = 0;
+    if (found == 1 && !cr.err) {
+        const u8 *s2 = cr_str(&cr, nl);
+        u32 n2 = cr_u32(&cr);
+        u32 g2 = cr_u32(&cr);
+        if (s2 && !cr.err && *nl <= G4_REPL_STR_CAP) {
+            memcpy(name, s2, *nl);
+            *node = n2;
+            *gen = g2;
+            ok = 1;
+        }
+    }
+    free(body);
+    return ok;
+}
+
 repl_peer_t *g4_wire_peer_iface(g4_wire_peer_t *p) {
     p->iface.ctx = p;
     p->iface.begin = wp_begin;
@@ -437,6 +465,7 @@ repl_peer_t *g4_wire_peer_iface(g4_wire_peer_t *p) {
     p->iface.edge_del = wp_edge_del;
     p->iface.name_get = wp_name_get;
     p->iface.name_set = wp_name_set;
+    p->iface.name_by_hash = wp_name_by_hash;
     p->iface.entity_get = wp_entity_get;
     p->iface.entity_set = wp_entity_set;
     return &p->iface;
