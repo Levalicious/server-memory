@@ -48,6 +48,9 @@ export const OP = {
   SCAN: 0x2c,
   REGEX_VALID: 0x2d,
   RESUME: 0x2e,
+  RE_ROUND: 0x38,
+  RE_NAME: 0x39,
+  RE_ENTITY: 0x3b,
 } as const;
 
 export const ST_OK = 0;
@@ -95,6 +98,19 @@ export type PayloadBuilder = (w: W) => void;
 
 export interface DaemonStats { entities: number; relations: number; txid: bigint; }
 
+/** OP_RE_ROUND's 13 counters (native/daemon_proto.h v1.7). */
+export interface ReplStats {
+  pulledA: number; pulledB: number; delA: number; delB: number;
+  dup: number; skip: number; vsA: number; vsB: number; vsSkip: number;
+  entPulledA: number; entPushedB: number; nameA: number; nameB: number;
+}
+
+/** Total counters that represent a productive apply (skip/dup excluded). */
+export function replApplies(s: ReplStats): number {
+  return s.pulledA + s.pulledB + s.delA + s.delB + s.vsA + s.vsB
+       + s.entPulledA + s.entPushedB + s.nameA + s.nameB;
+}
+
 interface Pending { reqid: number; resolve: (r: CallResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout; }
 
 export class DaemonClient {
@@ -106,8 +122,18 @@ export class DaemonClient {
   private child: ChildProcess | null = null;
   private tokenFilePath: string | null = null;
   private closed = false;
+  /** Peer addressing (set by connect/spawn): enough for RE_ROUND's
+   * {host, port, token} payload from another daemon. */
+  host = '';
+  port = 0;
+  token = '';
 
   private constructor() {}
+
+  /** The spawned child's pid (undefined for externally managed daemons). */
+  get pid(): number | undefined {
+    return this.child?.pid;
+  }
 
   /** Connect to a running daemon and authenticate. */
   static async connect(host: string, port: number, token: string, timeoutMs = 5000): Promise<DaemonClient> {
@@ -118,15 +144,24 @@ export class DaemonClient {
       c.destroyNow();
       throw new Error(`kbd4 auth failed: ${auth.body.toString('utf8')}`);
     }
+    c.host = host;
+    c.port = port;
+    c.token = token;
     return c;
   }
 
   /**
    * Spawn a local kbd4 for `storeDir` on a free loopback port (token file
    * written 0600 inside the store dir) and connect to it. `close()` reaps
-   * the child with SIGTERM.
+   * the child with SIGTERM. `env` entries are merged over the process env
+   * (e.g. KBD_NODE_BASE for replica id-space partitioning).
    */
-  static async spawn(opts: { storeDir: string; binaryPath?: string; readyTimeoutMs?: number }): Promise<DaemonClient> {
+  static async spawn(opts: {
+    storeDir: string;
+    binaryPath?: string;
+    readyTimeoutMs?: number;
+    env?: Record<string, string>;
+  }): Promise<DaemonClient> {
     const binary = opts.binaryPath ?? defaultBinaryPath();
     if (!fs.existsSync(binary)) {
       throw new Error(`kbd4 binary not found at ${binary}; build it with: make -C native kbd4`);
@@ -137,7 +172,8 @@ export class DaemonClient {
     fs.writeFileSync(tokenPath, token, { mode: 0o600 });
 
     const child = spawn(binary, [opts.storeDir, String(port), tokenPath], {
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'ignore', process.env.KBD_STDERR_INHERIT ? 'inherit' : 'pipe'],
+      env: { ...process.env, ...opts.env },
     });
     let stderr = '';
     child.stderr?.on('data', (d) => { stderr += String(d); });
@@ -189,6 +225,77 @@ export class DaemonClient {
     const body = await this.callOk(OP.STATS);
     const r = new R(body);
     return { entities: r.u32(), relations: r.u32(), txid: r.u64() };
+  }
+
+  /**
+   * OP_RE_ROUND: drive one anti-entropy round against a peer daemon
+   * (seam 5b). The peer's RE_ROUND must NOT target us concurrently —
+   * callers serialize rounds across the fleet.
+   */
+  async replRound(peer: { host: string; port: number; token: string }): Promise<ReplStats> {
+    const body = await this.callOk(OP.RE_ROUND, (w) => {
+      w.str(peer.host);
+      w.u32(peer.port);
+      w.str(peer.token);
+    }, 120_000);
+    const r = new R(body);
+    return {
+      pulledA: r.u32(), pulledB: r.u32(), delA: r.u32(), delB: r.u32(),
+      dup: r.u32(), skip: r.u32(), vsA: r.u32(), vsB: r.u32(), vsSkip: r.u32(),
+      entPulledA: r.u32(), entPushedB: r.u32(), nameA: r.u32(), nameB: r.u32(),
+    };
+  }
+
+  /** SIGKILL the spawned daemon now (kill-mid-write testing), drop the
+   * connection, and wait for the child to be reaped. No token cleanup —
+   * the store dir stays usable for a respawn. */
+  async hardKill(): Promise<void> {
+    const child = this.child;
+    this.closed = true;
+    this.destroyNow();
+    if (child && child.exitCode === null) {
+      const exited = new Promise<void>((res) => child.once('exit', () => res()));
+      child.kill('SIGKILL');
+      await exited;
+    }
+  }
+
+  /** RE_NAME (raw name-directory row; diagnostics): tombstone rows report
+   * node 0. Returns null when the name was never seen here. */
+  async rawName(name: string): Promise<{ node: number; gen: number } | null> {
+    const body = await this.callOk(OP.RE_NAME, (w) => { w.u32(1); w.str(name); });
+    const r = new R(body);
+    if (r.u8() !== 1) return null;
+    return { node: r.u32(), gen: r.u32() };
+  }
+
+  /** OP_RANKS for a name batch (diagnostics). */
+  async ranks(names: string[]): Promise<Array<{ walker: number; structural: number; psi: number }>> {
+    const body = await this.callOk(OP.RANKS, (w) => {
+      w.u32(names.length);
+      for (const nm of names) w.str(nm);
+    });
+    const r = new R(body);
+    r.u64();                                   /* walker_total */
+    r.u64();                                   /* structural_total */
+    const out: Array<{ walker: number; structural: number; psi: number }> = [];
+    for (let i = 0; i < names.length; i++) {
+      out.push({ walker: r.f64(), structural: r.f64(), psi: r.f64() });
+    }
+    return out;
+  }
+
+  /** RE_ENTITY (raw mirror row; diagnostics): name + gen + row blob, or
+   * null when the node is absent here. */
+  async rawEntity(node: number): Promise<{ name: string; gen: number; blob: Buffer } | null> {
+    const body = await this.callOk(OP.RE_ENTITY, (w) => { w.u32(1); w.u32(node); });
+    const r = new R(body);
+    if (r.u8() !== 1) return null;
+    const name = r.strText();
+    const gen = r.u32();
+    const len = r.u32();
+    const blob = body.subarray(body.length - len);
+    return { name, gen, blob };
   }
 
   /** Close the connection and reap a spawned daemon (SIGTERM, then SIGKILL). */
