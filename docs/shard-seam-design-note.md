@@ -147,8 +147,14 @@ Blake2s.
 
 32-byte symbol codecs (landed, step 4; emitted inside a txn view):
 
-- **adjacency**: `[peer u32][dir u8][rel_sid u32][mtime u64][pad]` — one per
-  chain row; halves reconcile as plain symbol sets.
+- **adjacency**: `[lo u32][hi u32][relhash u64][dlo u8][mtime u64][pad]` —
+  **canonical**: both halves of an edge emit the same symbol, so a pair
+  round can detect and repair an unpaired half; a fully-resident edge
+  emits it twice (consumers dedup). `relhash` is over the relation-type
+  bytes (sids are per-store). Deletes propagate through the chain's
+  **remove-watermark** (one u64 per entity record, `adj_wm`): a peer
+  offering an edge at mtime ≤ the local watermark is answered with a
+  delete, never a re-add.
 - **vertex-state**: `[node u32][binding gen u32][content-hash u64][pad]` —
   the hash covers type_sid, obs sids/count, mtime, obs_mtime, psi; visits
   reconcile separately (the relaxed-counter class). The hash is a local

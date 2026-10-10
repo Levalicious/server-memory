@@ -17,7 +17,7 @@
 #define EID_SLOT(eid) (((eid) - 1u) & 0xFFFu)
 #define G4_MAX_LPG    (1u << 20)
 
-#define ENT_SIZE      68u
+#define ENT_SIZE      76u    /* +u64 adj_wm at 68 (chain remove-watermark, seam §5) */
 
 struct graph4 {
     mstore_t   *ms;
@@ -63,6 +63,7 @@ static void ent_encode(u8 *r, const g4_entity_t *e) {
     g4st64(r + 44, e->structural_visits);
     g4st64(r + 52, e->walker_visits);
     memcpy(r + 60, &e->psi, 8);
+    g4st64(r + 68, 0);                     /* adj_wm: fresh entities start clean */
 }
 
 static int ent_decode(const u8 *r, u16 sz, g4_entity_t *e) {
@@ -78,6 +79,7 @@ static int ent_decode(const u8 *r, u16 sz, g4_entity_t *e) {
     e->structural_visits = g4ld64(r + 44);
     e->walker_visits     = g4ld64(r + 52);
     memcpy(&e->psi, r + 60, 8);
+    e->adj_wm = g4ld64(r + 68);
     return 1;
 }
 
@@ -812,6 +814,17 @@ static int adj_remove(graph4_t *g, u32 eid, u32 target, u32 rel_sid, u32 dir) {
             adj_ent_decode(v.ents + i * ADJ_ENT, &ed);
             if (ed.target_eid != target || ed.rel_sid != rel_sid || ed.direction != dir)
                 continue;
+            /* shard-seam note §5: record the deletion in the chain's
+             * remove-watermark (max deleted mtime) BEFORE removing the row —
+             * replication propagates the delete from this, and a re-applied
+             * older add can never resurrect it. */
+            {
+                u8 *ww = ent_rec_w(g, eid);
+                if (ww) {
+                    u64 wm = g4ld64(ww + 68);
+                    if (ed.mtime > wm) g4st64(ww + 68, ed.mtime);
+                }
+            }
             /* swap-remove within this record */
             u32 nc = v.count - 1;
             g4st32(img, nc);
@@ -1789,10 +1802,10 @@ static int sym_adj_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
     (void)k; (void)kl;
     sym_walk_t *w = (sym_walk_t *)c;
     if (!v || vl != 8) return 1;
-    u32 node = g4ld32(v);
-    if (!node) return 1;                                /* tombstone */
+    u32 host = g4ld32(v);
+    if (!host) return 1;                                /* tombstone */
     g4_entity_t e;
-    if (!g4_read_entity(w->g, node, &e)) return 1;
+    if (!g4_read_entity(w->g, host, &e)) return 1;
     u32 aref = e.adj_ref;
     while (aref) {
         adj_view_t av;
@@ -1800,12 +1813,24 @@ static int sym_adj_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
         for (u32 i = 0; i < av.count; i++) {
             g4_edge_t ed;
             adj_ent_decode(av.ents + (size_t)i * ADJ_ENT, &ed);
+            /* CANONICAL edge symbol: both halves (host-side row and peer-side
+             * mirror) collapse to one form, so a pair reconciliation can
+             * detect and repair unpaired halves. A self-loop's BWD row is
+             * represented by its FWD row (skip the duplicate). */
+            if (ed.target_eid == host && ed.direction != G4_DIR_FORWARD) continue;
+            u32 lo = host < ed.target_eid ? host : ed.target_eid;
+            u32 hi = host < ed.target_eid ? ed.target_eid : host;
+            u8 dlo = (host == lo) ? (u8)ed.direction : (u8)(1u - ed.direction);
+            u16 rl = 0;
+            const u8 *rb = st4_get(w->g->st, ed.rel_sid, &rl);
+            if (!rb) continue;                          /* dead sid: not a fact */
             u8 s[G4_SYM_LEN];
             memset(s, 0, sizeof s);
-            g4st32(s, ed.target_eid);                   /* [peer u32]  */
-            s[4] = (u8)ed.direction;                    /* [dir u8]    */
-            g4st32(s + 5, ed.rel_sid);                  /* [rel u32]   */
-            g4st64(s + 9, ed.mtime);                    /* [mtime u64] */
+            g4st32(s, lo);                              /* [lo u32]     */
+            g4st32(s + 4, hi);                          /* [hi u32]     */
+            g4st64(s + 8, sym_mix64(rb, rl));           /* [relhash u64]*/
+            s[16] = dlo;                                /* [dlo u8]     */
+            g4st64(s + 17, ed.mtime);                   /* [mtime u64]  */
             w->cb(w->ctx, s);
             w->n++;
         }
@@ -1851,4 +1876,92 @@ u32 g4_vstate_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *c
     sym_walk_t w = { g, cb, ctx, 0 };
     (void)seg_tree_scan(&g->namet, NULL, 0, 1, NULL, 0, 1, sym_vstate_cb, &w);
     return w.n;
+}
+
+/* ================= replication primitives (seam §5, step 5a) ================= */
+
+/* chain remove-watermark (0 = none recorded) */
+u64 g4_chain_wm(graph4_t *g, u32 node) {
+    g4_entity_t e;
+    return g4_read_entity(g, node, &e) ? e.adj_wm : 0;
+}
+
+/* string-stable reltype hash — the adjacency symbol's identity for rel types
+ * (sids are per-store; the hash is over the bytes and comparable everywhere) */
+u64 g4_relhash(graph4_t *g, u32 rel_sid) {
+    u16 l = 0;
+    const u8 *s = st4_get(g->st, rel_sid, &l);
+    return s ? sym_mix64(s, l) : 0;
+}
+
+/* one half of an edge, written idempotently (half-repair's apply path) */
+int g4_half_put(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u64 mtime, u32 dir_stored) {
+    g4_entity_t he;
+    if (!g4_read_entity(g, host, &he)) return 0;
+    if (adj_find(g, host, peer, rel_sid, dir_stored, NULL)) return 1;   /* already there */
+    if (!st4_incref(g->st, rel_sid)) return 0;
+    g4_edge_t ed = { peer, rel_sid, mtime, dir_stored };
+    if (!adj_add(g, host, &ed)) { st4_decref(g->st, rel_sid); return 0; }
+    return 1;
+}
+
+/* one half removed; the chain's remove-watermark is captured inside
+ * adj_remove, so this deletion can propagate (never resurrect) */
+int g4_half_del(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u32 dir_stored) {
+    if (!adj_remove(g, host, peer, rel_sid, dir_stored)) return 0;
+    st4_decref(g->st, rel_sid);
+    return 1;
+}
+
+/* whole-row apply from a source store (LWW winner side): strings translate
+ * across stores; visits stay local (relaxed-counter class); type index and
+ * trigram postings follow. */
+int g4_vstate_apply(graph4_t *g, u32 node, graph4_t *src_g, const g4_entity_t *se) {
+    g4_entity_t e;
+    if (!g4_read_entity(g, node, &e)) return 0;
+    u16 tl = 0;
+    const u8 *ts = st4_get(src_g->st, se->type_sid, &tl);
+    if (!ts) return 0;
+    u32 ntype = st4_intern(g->st, ts, tl);
+    if (!ntype) return 0;
+    u32 nobs[2] = { 0, 0 };
+    if (se->obs_count >= 1 && se->obs0_sid) {
+        u16 ol = 0;
+        const u8 *ob = st4_get(src_g->st, se->obs0_sid, &ol);
+        if (!ob) { st4_decref(g->st, ntype); return 0; }
+        nobs[0] = st4_intern(g->st, ob, ol);
+        if (!nobs[0]) { st4_decref(g->st, ntype); return 0; }
+    }
+    if (se->obs_count >= 2 && se->obs1_sid) {
+        u16 ol = 0;
+        const u8 *ob = st4_get(src_g->st, se->obs1_sid, &ol);
+        if (!ob) { st4_decref(g->st, ntype); if (nobs[0]) st4_decref(g->st, nobs[0]); return 0; }
+        nobs[1] = st4_intern(g->st, ob, ol);
+        if (!nobs[1]) { st4_decref(g->st, ntype); if (nobs[0]) st4_decref(g->st, nobs[0]); return 0; }
+    }
+    u32set_t old = {0};
+    tri_collect_entity(g, &e, &old);
+    u8 *r = ent_rec_w(g, node);
+    if (!r) {
+        free(old.v);
+        st4_decref(g->st, ntype);
+        if (nobs[0]) st4_decref(g->st, nobs[0]);
+        if (nobs[1]) st4_decref(g->st, nobs[1]);
+        return 0;
+    }
+    type_del(g, e.type_sid, node);                 /* index follows the apply */
+    type_put(g, ntype, node);
+    st4_decref(g->st, e.type_sid);
+    g4st32(r + 8, ntype);
+    if (e.obs_count >= 1 && e.obs0_sid) st4_decref(g->st, e.obs0_sid);
+    if (e.obs_count >= 2 && e.obs1_sid) st4_decref(g->st, e.obs1_sid);
+    g4st32(r + 32, nobs[0]);
+    g4st32(r + 36, nobs[1]);
+    r[40] = se->obs_count;
+    g4st64(r + 16, se->mtime);
+    g4st64(r + 24, se->obs_mtime);
+    memcpy(r + 60, &se->psi, 8);
+    tri_apply(g, node, old.v, old.n);
+    free(old.v);
+    return 1;
 }

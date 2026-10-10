@@ -38,6 +38,18 @@ static void collect(void *ctx, const u8 *s) {
 
 static int cmp_sym(const void *a, const void *b) { return memcmp(a, b, RIBLT_WIDTH); }
 
+/* canonical edge symbols: a fully-resident edge emits its symbol twice
+ * (once per half) — reconciliation sets are deduped */
+static void uniq_syms(symset_t *s) {
+    u32 w = 0;
+    for (u32 i = 0; i < s->n; i++) {
+        if (w == 0 || memcmp(s->v + (size_t)(w - 1) * RIBLT_WIDTH,
+                             s->v + (size_t)i * RIBLT_WIDTH, RIBLT_WIDTH) != 0)
+            memcpy(s->v + (size_t)w++ * RIBLT_WIDTH, s->v + (size_t)i * RIBLT_WIDTH, RIBLT_WIDTH);
+    }
+    s->n = w;
+}
+
 /* exact symmetric difference of two sorted sets into out_two (A\B then B\A) */
 static u32 set_diff(const u8 *A, u32 na, const u8 *B, u32 nb, u8 *out, u32 out_cap)
 {
@@ -176,9 +188,12 @@ int main(void)
         u32 nb = g4_adj_symbols(gb, collect, &adjB);
         printf(" adj: A=%u B=%u symbols\n", na, nb);
         assert(na == adjA.n && nb == adjB.n);
-        assert(na > 1900u && nb > 1900u);                     /* both halves counted */
+        assert(na == 2000u);                                  /* both halves emitted raw */
         qsort(adjA.v, adjA.n, RIBLT_WIDTH, cmp_sym);
         qsort(adjB.v, adjB.n, RIBLT_WIDTH, cmp_sym);
+        uniq_syms(&adjA); uniq_syms(&adjB);                   /* canonical: pairs collapse */
+        assert(adjA.n == 1000u);                              /* 1000 distinct edges */
+        assert(adjB.n > 985u && adjB.n < 1005u);              /* -incident + added */
         u32 va = g4_vstate_symbols(ga, collect, &vsA);
         u32 vb = g4_vstate_symbols(gb, collect, &vsB);
         printf(" vstate: A=%u B=%u symbols\n", va, vb);
@@ -186,6 +201,7 @@ int main(void)
         assert(va == 1200u && vb == 1200u - 7u + 12u);        /* live bindings */
         qsort(vsA.v, vsA.n, RIBLT_WIDTH, cmp_sym);
         qsort(vsB.v, vsB.n, RIBLT_WIDTH, cmp_sym);
+        uniq_syms(&vsA); uniq_syms(&vsB);
         assert(mstore_txn_commit(ma));                        /* read-only txn: no-op commit */
         assert(mstore_txn_commit(mb));
         graph4_close(ga); graph4_close(gb);

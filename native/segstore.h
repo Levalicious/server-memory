@@ -533,13 +533,21 @@ u32  g4_lookup_ex(graph4_t *g, const u8 *name, u16 nlen, u32 *gen_out);
  * One G4_SYM_LEN-byte symbol per row, emitted in a consistent txn view —
  * call inside the caller's txn. Symbols are the RIBLT reconciliation unit;
  * the emitted layout:
- *   adjacency:    [peer u32][dir u8][rel_sid u32][mtime u64][pad]
+ *   adjacency:    [lo u32][hi u32][relhash u64][dlo u8][mtime u64][pad]
+ *                 (CANONICAL: both halves of an edge emit the SAME symbol —
+ *                  a fully-resident edge emits it twice; consumers dedup)
  *   vertex-state: [node u32][binding gen u32][content-hash u64][pad]
  * (content hash covers type_sid, obs sids/count, mtime, obs_mtime, psi —
  * visits reconcile separately, the relaxed-counter class). Returns count. */
 #define G4_SYM_LEN 32u
 u32  g4_adj_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx);
 u32  g4_vstate_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx);
+
+/* ---- replication primitives (seam §5, step 5a) ---- */
+u64  g4_chain_wm(graph4_t *g, u32 node);   /* chain remove-watermark (0 = none) */
+u64  g4_relhash(graph4_t *g, u32 rel_sid); /* string-stable reltype hash (symbol identity) */
+int  g4_half_put(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u64 mtime, u32 dir_stored);
+int  g4_half_del(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u32 dir_stored);
 
 typedef struct {
     u32 eid, name_sid, type_sid, adj_ref;
@@ -548,7 +556,12 @@ typedef struct {
     u8  obs_count;
     u64 structural_visits, walker_visits;
     double psi;
+    u64 adj_wm;              /* chain remove-watermark (seam §5); NOT part of
+                              * the vstate content hash */
 } g4_entity_t;
+
+/* whole-row apply from a source store (repl LWW winner side; seam §5) */
+int  g4_vstate_apply(graph4_t *g, u32 node, graph4_t *src_g, const g4_entity_t *src_e);
 
 int  g4_read_entity(graph4_t *g, u32 eid, g4_entity_t *out); /* 1 = live */
 u32  g4_entity_count(graph4_t *g);
