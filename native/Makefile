@@ -11,10 +11,13 @@ CFLAGS = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 LIBS = -lm
 OUT ?= /tmp/mf_test.$(shell echo $$PPID)
 
-.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon test_regex regex_cli bench bench_regex bench_sheng bench_widesheng proofs proofs-eva wp-segmeta clean
+.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon test_import test_riblt test_segtree test_regex regex_cli bench bench_regex bench_sheng bench_widesheng proofs proofs-eva wp-segmeta clean
+
+test_riblt: test_riblt.c riblt.c blake2s.c
+	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_riblt && $(OUT)_riblt
 
 # `make test` = prove the detector fires, then run every harness with it active.
-test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_segtree test_parity test_daemon test_import test_regex
+test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_segtree test_parity test_daemon test_import test_riblt test_regex
 
 test_segmeta: test_segmeta.c seg_meta.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_segmeta && $(OUT)_segmeta
