@@ -63,6 +63,16 @@
  *   RE_VROW_SET {u32 n, n x {u32 node, u32 len, blob}} -> n x u8 status
  *   RE_EDGE_PULL{u32 n, n x {32B sym, str reltype}}    -> n x u8 status
  *   RE_EDGE_DEL {u32 n, n x 32B sym}                   -> n x u8 status
+ *   RE_ROUND    {str host, u32 port, str token}
+ *               -> u32 x 9: pulled_a, pulled_b, del_a, del_b, dup, skip,
+ *                  vs_a, vs_b, vs_skip
+ * RE_ROUND drives one FULL anti-entropy round against the peer daemon
+ * (repl_client.c): this daemon is the round driver ("a"), the peer is "b".
+ * host is a dotted-quad IPv4 literal. The handler blocks this daemon's loop
+ * for the round's duration and the peer must not RE_ROUND back at us
+ * concurrently (mutual waits would deadlock — role asymmetry or an async
+ * driver arrives with the sharded fuzz). Partial rounds are safe: applies
+ * are idempotent, the next round repairs.
  * family: 0 = adjacency, 1 = vertex-state. Cells are [sum 32][count i32 LE]
  * [checksum u64 LE] (riblt_cell_pack). Row blob: [str type][u64 mtime]
  * [u64 obs_mtime][u8 obs_count]([str obs])x min(count,2)[u64 psi bits]
@@ -130,6 +140,7 @@ enum {
     OP_RE_VROW_SET      = 0x35,   /* u32 n, n x {u32 node, u32 len, blob} -> n x u8 */
     OP_RE_EDGE_PULL     = 0x36,   /* u32 n, n x {32B sym, str rt} -> n x u8     */
     OP_RE_EDGE_DEL      = 0x37,   /* u32 n, n x 32B sym -> n x u8               */
+    OP_RE_ROUND         = 0x38,   /* str host, u32 port, str token -> u32 x 9   */
 };
 
 /* OPEN_NODES entity blob (per requested name):

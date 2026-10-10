@@ -21,6 +21,7 @@
 #include "segstore.h"
 #include "daemon_proto.h"
 #include "riblt.h"
+#include "repl_client.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -326,7 +327,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         if (!mstore_txn_begin(k->ms)) { free(reasons); err_reply(w, "txn"); return ST_ERR; }
         if (k->dirty_counters) pw_flush_in_txn(k);
         for (u32 i = 0; i < n; i++) {
-            u16 nl, tl;
+            u16 nl = 0, tl = 0;
             const u8 *nm = rstr(r, &nl), *ty = rstr(r, &tl);
             u64 mt = r64(r);
             if (r->err) { mstore_txn_abort(k->ms); free(reasons); err_reply(w, "trunc"); return ST_ERR; }
@@ -361,7 +362,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
         if (k->dirty_counters) pw_flush_in_txn(k);
         for (u32 i = 0; i < n; i++) {
-            u16 fl, tl, rl;
+            u16 fl = 0, tl = 0, rl = 0;
             const u8 *f = rstr(r, &fl), *t = rstr(r, &tl), *rt = rstr(r, &rl);
             u64 mt = (op == OP_CREATE_RELATIONS) ? r64(r) : 0;
             if (r->err) { mstore_txn_abort(k->ms); err_reply(w, "trunc"); return ST_ERR; }
@@ -382,7 +383,7 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
         if (k->dirty_counters) pw_flush_in_txn(k);
         for (u32 i = 0; i < n; i++) {
-            u16 nl, ol;
+            u16 nl = 0, ol = 0;
             const u8 *nm = rstr(r, &nl), *ob = rstr(r, &ol);
             u64 mt = r64(r);
             if (r->err) { mstore_txn_abort(k->ms); err_reply(w, "trunc"); return ST_ERR; }
@@ -875,6 +876,51 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
             w8(w, (u8)(g4_edge_del_hashed(k->g, lo, hi, dlo, rh) ? 1 : 0));
         }
         if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
+        return ST_OK;
+    }
+    case OP_RE_ROUND: {
+        /* Drive one full round against the peer daemon (the "b" side). Runs
+         * synchronously inside this handler: the single-threaded loop is the
+         * round's private execution context, so its own store cannot move
+         * under it; the peer serves RE_* meanwhile. Do NOT run a RE_ROUND in
+         * the peer's direction at the same time (mutual waits deadlock —
+         * role asymmetry is the fuzz-era policy, daemon_proto.h v1.7). */
+        u16 hl = 0, tl2 = 0;
+        const u8 *host = rstr(r, &hl);
+        u32 port = r32(r);
+        const u8 *tok = rstr(r, &tl2);
+        if (r->err || !host || !tok || hl == 0 || hl >= 256 || port > 65535) {
+            err_reply(w, "bad req");
+            return ST_ERR;
+        }
+        char hz[256];
+        memcpy(hz, host, hl);
+        hz[hl] = 0;
+        g4_wire_peer_t *peer = g4_wire_peer_open(hz, (unsigned short)port, tok, tl2);
+        if (!peer) { err_reply(w, "peer unreachable"); return ST_ERR; }
+        if (!mstore_txn_begin(k->ms)) {
+            g4_wire_peer_close(peer);
+            err_reply(w, "txn");
+            return ST_ERR;
+        }
+        if (k->dirty_counters) pw_flush_in_txn(k);
+        g4_repl_stats_t st;
+        int ok = g4_repl_round_wire(k->g, g4_wire_peer_iface(peer), &st);
+        /* commit even a partial round: applies are idempotent and the next
+         * round repairs whatever the failure cut off */
+        int committed = mstore_txn_commit(k->ms);
+        g4_wire_peer_close(peer);
+        if (!committed) { err_reply(w, "commit"); return ST_ERR; }
+        if (!ok) { err_reply(w, "round failed"); return ST_ERR; }
+        w32(w, st.edges_pulled_a);
+        w32(w, st.edges_pulled_b);
+        w32(w, st.edges_deleted_from_a);
+        w32(w, st.edges_deleted_from_b);
+        w32(w, st.edges_dup);
+        w32(w, st.edge_skipped);
+        w32(w, st.vstate_applied_a);
+        w32(w, st.vstate_applied_b);
+        w32(w, st.vstate_skipped);
         return ST_OK;
     }
     default:
