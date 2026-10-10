@@ -30,6 +30,16 @@ struct graph4 {
     u32 ent_count;          /* live entities (persisted in META) */
     u64 structural_total, walker_total;   /* persisted in META (ruling 4-i) */
     u32 last_ent_page;      /* insertion affinity; SEG_PT_NONE = none */
+    /* node-id indirection (docs/shard-seam-design-note.md §3, build step 2;
+     * spec §6.4 r3.3): every id that crosses this module's API is a LOGICAL
+     * node id, resolved here to the physical EID_MAKE(lpg, slot). Dir page
+     * holds one record [u32 npages][u32 lpg x npages]; data page p holds one
+     * record of IND_PAGE_SLOTS u32 eids for nodes [p*S, (p+1)*S). Dir
+     * capacity 1018 pages ≈ 1.03M nodes — the named level-1 cliff (a
+     * second-level dir or a tree replaces it if the live KB ever crosses).
+     * ind_root lives in the catalog (K_IND); next_node in META v2. */
+    u32 ind_root;           /* dir page lpg; 0 = not yet created */
+    u32 next_node;          /* next logical id to hand out (>= 1) */
 };
 
 /* ---------- LE helpers ---------- */
@@ -71,8 +81,122 @@ static int ent_decode(const u8 *r, u16 sz, g4_entity_t *e) {
     return 1;
 }
 
-static const u8 *ent_rec(graph4_t *g, u32 eid, u16 *sz_out) {
-    if (eid == 0) return NULL;
+static const u8 *ent_rec(graph4_t *g, u32 node, u16 *sz_out);
+
+/* ---------- node-id indirection (build step 2) ----------
+ * Logical node ids are the ONLY ids this module hands out or accepts; the
+ * EID_* macros appear exclusively at the chokepoints below and in
+ * g4_create_entity/g4_delete_entity. A killed id resolves to 0 — reading
+ * through a stale node id fails cleanly instead of aliasing a recycled
+ * physical slot (the v3 reuse-aliasing failure class). */
+
+#define IND_PAGE_SLOTS (SEG_PAGE_MAX_REC / 4u)        /* 1019 eids per data page */
+#define IND_DIR_MAX    ((SEG_PAGE_MAX_REC - 4u) / 4u) /* 1018 lpg entries in the dir */
+
+/* catalog key for the indirection dir page (same namespace as the K_* set
+ * defined below with the other tables) */
+static const u8 K_IND[2] = { 0x01, 'i' };
+
+static void cat_put_root(graph4_t *g, const u8 *key, u16 kl, u32 root);
+
+static u32 ind_lookup(graph4_t *g, u32 node) {
+    if (!node || !g->ind_root) return 0;
+    u32 idx = node - 1u;
+    u32 page = idx / IND_PAGE_SLOTS, slot = idx % IND_PAGE_SLOTS;
+    const u8 *dpg = seg_txn_view(g->gs, g->ind_root);
+    if (!dpg) return 0;
+    u16 dsz = 0;
+    const u8 *d = seg_page_read(dpg, 0, &dsz);
+    if (!d || dsz < 4) return 0;
+    if (page >= g4ld32(d)) return 0;
+    u32 dlpg = g4ld32(d + 4 + page * 4u);
+    const u8 *ppg = seg_txn_view(g->gs, dlpg);
+    if (!ppg) return 0;
+    u16 psz = 0;
+    const u8 *p = seg_page_read(ppg, 0, &psz);
+    if (!p || (u32)psz < (slot + 1u) * 4u) return 0;
+    return g4ld32(p + slot * 4u);
+}
+
+/* Make `eid` reachable under a fresh logical id. 0 = failure (dir cliff or
+ * OOM — a loud create failure, never a silent wrong id). */
+static u32 ind_append(graph4_t *g, u32 eid) {
+    u32 node = g->next_node;
+    if (!node || !eid) return 0;
+    u32 idx = node - 1u;
+    u32 page = idx / IND_PAGE_SLOTS, slot = idx % IND_PAGE_SLOTS;
+    /* dir page: create at FULL size once, then poke npages + the new lpg in
+     * place. (A growing record would relocate on every append —
+     * seg_page_update's grow path consumes fresh space per copy and dies
+     * around 43 pages; the import gate caught exactly that at 43,817 nodes.) */
+    if (!g->ind_root) {
+        u32 dlpg = 0;
+        u8 *dpg = seg_txn_alloc(g->gs, SEG_KIND_INDIRECT, &dlpg);
+        if (!dpg) return 0;
+        u8 *drec = (u8 *)calloc(1, 4u + IND_DIR_MAX * 4u);
+        if (!drec) return 0;
+        u16 s = 0;
+        int ok = seg_page_insert(dpg, drec, (u16)(4u + IND_DIR_MAX * 4u), &s);
+        free(drec);
+        if (!ok) return 0;
+        g->ind_root = dlpg;
+        cat_put_root(g, K_IND, 2, dlpg);
+    }
+    if (page >= IND_DIR_MAX) return 0;                /* level-1 dir cliff */
+    u8 *dpg = seg_txn_touch(g->gs, g->ind_root);
+    if (!dpg) return 0;
+    u16 dsz = 0;
+    const u8 *dr = seg_page_read(dpg, 0, &dsz);
+    if (!dr || dsz < 4) return 0;
+    u8 *dw = (u8 *)(dpg + (dr - dpg));
+    u32 npages = g4ld32(dw);
+    if (page > npages) return 0;                      /* append-only numbering */
+    if (page == npages) {
+        u32 plpg = 0;
+        u8 *dp = seg_txn_alloc(g->gs, SEG_KIND_INDIRECT, &plpg);
+        if (!dp) return 0;
+        u8 *zrec = (u8 *)calloc(1, IND_PAGE_SLOTS * 4u);
+        if (!zrec) return 0;
+        u16 s = 0;
+        int ok = seg_page_insert(dp, zrec, (u16)(IND_PAGE_SLOTS * 4u), &s);
+        free(zrec);
+        if (!ok) return 0;
+        g4st32(dw + 4 + page * 4u, plpg);             /* in-place: never moves */
+        g4st32(dw, npages + 1u);
+    }
+    u32 dlpg2 = g4ld32(dw + 4 + page * 4u);           /* same image: still valid */
+    u8 *ppg = seg_txn_touch(g->gs, dlpg2);
+    if (!ppg) return 0;
+    u16 psz = 0;
+    const u8 *p = seg_page_read(ppg, 0, &psz);
+    if (!p || (u32)psz < (slot + 1u) * 4u) return 0;
+    g4st32(ppg + (p - ppg) + slot * 4u, eid);
+    g->next_node = node + 1u;
+    return node;
+}
+
+/* Retire a logical id (entity delete): it can never alias a later entity. */
+static void ind_kill(graph4_t *g, u32 node) {
+    if (!node || !g->ind_root) return;
+    u32 idx = node - 1u;
+    u32 page = idx / IND_PAGE_SLOTS, slot = idx % IND_PAGE_SLOTS;
+    const u8 *dpg = seg_txn_view(g->gs, g->ind_root);
+    if (!dpg) return;
+    u16 dsz = 0;
+    const u8 *d = seg_page_read(dpg, 0, &dsz);
+    if (!d || dsz < 4 || page >= g4ld32(d)) return;
+    u32 dlpg = g4ld32(d + 4 + page * 4u);
+    u8 *ppg = seg_txn_touch(g->gs, dlpg);
+    if (!ppg) return;
+    u16 psz = 0;
+    const u8 *p = seg_page_read(ppg, 0, &psz);
+    if (!p || (u32)psz < (slot + 1u) * 4u) return;
+    g4st32(ppg + (p - ppg) + slot * 4u, 0);
+}
+
+static const u8 *ent_rec(graph4_t *g, u32 node, u16 *sz_out) {
+    u32 eid = ind_lookup(g, node);
+    if (!eid) return NULL;
     const u8 *pg = seg_txn_view(g->gs, EID_LPG(eid));
     if (!pg) return NULL;
     u16 sz = 0;
@@ -83,7 +207,9 @@ static const u8 *ent_rec(graph4_t *g, u32 eid, u16 *sz_out) {
 }
 
 /* write-through: touch page, update record in place (same size) */
-static u8 *ent_rec_w(graph4_t *g, u32 eid) {
+static u8 *ent_rec_w(graph4_t *g, u32 node) {
+    u32 eid = ind_lookup(g, node);
+    if (!eid) return NULL;
     u8 *pg = seg_txn_touch(g->gs, EID_LPG(eid));
     if (!pg) return NULL;
     u16 sz = 0;
@@ -127,12 +253,13 @@ static void cat_put_root(graph4_t *g, const u8 *key, u16 kl, u32 root) {
 }
 
 static void meta_store(graph4_t *g) {
-    u8 v[24];
-    g4st32(v, 1);                                  /* format version */
+    u8 v[28];
+    g4st32(v, 2);                                  /* format version (v2: + next_node) */
     g4st64(v + 4, g->structural_total);
     g4st64(v + 12, g->walker_total);
     g4st32(v + 20, g->ent_count);
-    seg_tree_insert(&g->cat, K_META, 5, v, 24);
+    g4st32(v + 24, g->next_node);
+    seg_tree_insert(&g->cat, K_META, 5, v, 28);
     cat_sync_roots(g);
 }
 
@@ -350,18 +477,24 @@ graph4_t *graph4_open(mstore_t *ms) {
     g->namet.root = cat_get_root(g, K_NAME, 2);
     g->trit.root  = cat_get_root(g, K_TRI, 2);
     g->typet.root = cat_get_root(g, K_TYPE, 2);
+    g->ind_root   = cat_get_root(g, K_IND, 2);
     seg_tree_open(&g->namet, g->gs, CD_NAME, g->namet.root);
     seg_tree_open(&g->trit,  g->gs, CD_TRI,  g->trit.root);
     seg_tree_open(&g->typet, g->gs, CD_TYPE, g->typet.root);
     {
-        u8 v[24];
-        u16 vl = 24;
-        if (seg_tree_lookup(&g->cat, K_META, 5, v, &vl) == 1 && vl == 24) {
+        u8 v[28];
+        u16 vl = 28;
+        if (seg_tree_lookup(&g->cat, K_META, 5, v, &vl) == 1) {
+            /* pre-release: META v2 only (v1 stores carry no next_node and
+             * would mint colliding logical ids — refuse, never guess) */
+            if (vl != 28 || g4ld32(v) != 2) { graph4_close(g); return NULL; }
             g->structural_total = g4ld64(v + 4);
             g->walker_total     = g4ld64(v + 12);
             g->ent_count        = g4ld32(v + 20);
+            g->next_node        = g4ld32(v + 24);
         }
     }
+    if (!g->next_node) g->next_node = 1;
     return g;
 }
 
@@ -404,13 +537,15 @@ u32 g4_create_entity(graph4_t *g, const u8 *name, u16 nlen,
             return 0;
         g->last_ent_page = lpg;
     }
-    u32 eid = EID_MAKE(lpg, slot);
-    if (!name_put(g, name, nlen, eid)) return 0;
-    type_put(g, type_sid, eid);
+    u32 eid = EID_MAKE(lpg, slot);                 /* physical location */
+    u32 node = ind_append(g, eid);                 /* logical id (the API's) */
+    if (!node) return 0;
+    if (!name_put(g, name, nlen, node)) return 0;
+    type_put(g, type_sid, node);
     g->ent_count++;
-    meta_store(g);
-    { u32set_t old = {0}; tri_apply(g, eid, old.v, 0); free(old.v); }  /* index current fields */
-    return eid;
+    meta_store(g);                                 /* persists next_node (META v2) */
+    { u32set_t old = {0}; tri_apply(g, node, old.v, 0); free(old.v); }  /* index current fields */
+    return node;
 }
 
 int g4_read_entity(graph4_t *g, u32 eid, g4_entity_t *out) {
@@ -424,9 +559,11 @@ int g4_read_entity(graph4_t *g, u32 eid, g4_entity_t *out) {
 
 static int adj_clear_all(graph4_t *g, u32 eid, const g4_entity_t *e);
 
-int g4_delete_entity(graph4_t *g, u32 eid) {
+int g4_delete_entity(graph4_t *g, u32 node) {
     g4_entity_t e;
-    if (!g4_read_entity(g, eid, &e)) return 0;
+    if (!g4_read_entity(g, node, &e)) return 0;
+    u32 eid = ind_lookup(g, node);                 /* physical location */
+    if (!eid) return 0;
     /* the trigram set must be collected BEFORE the strings are released */
     u32set_t old = {0};
     tri_collect_entity(g, &e, &old);
@@ -435,7 +572,7 @@ int g4_delete_entity(graph4_t *g, u32 eid) {
     u8 *nmc = NULL;
     if (nmp) { nmc = (u8 *)malloc(nl ? nl : 1); if (nmc) memcpy(nmc, nmp, nl); }
     /* remove every incident edge (mirrors on peers + own chain) first */
-    if (!adj_clear_all(g, eid, &e)) { free(old.v); free(nmc); return 0; }
+    if (!adj_clear_all(g, node, &e)) { free(old.v); free(nmc); return 0; }
     /* release string refs */
     st4_decref(g->st, e.name_sid);
     st4_decref(g->st, e.type_sid);
@@ -443,14 +580,16 @@ int g4_delete_entity(graph4_t *g, u32 eid) {
     if (e.obs_count >= 2 && e.obs1_sid) st4_decref(g->st, e.obs1_sid);
     if (!nmc || !name_del(g, nmc, nl)) { free(old.v); free(nmc); return 0; }
     free(nmc);
-    type_del(g, e.type_sid, eid);
+    type_del(g, e.type_sid, node);
     u8 *pg = seg_txn_touch(g->gs, EID_LPG(eid));
     if (!pg || !seg_page_delete(pg, (u16)EID_SLOT(eid))) { free(old.v); return 0; }
     g->ent_count--;
+    ind_kill(g, node);                             /* id retired: never reused,
+                                                    * stale refs resolve dead  */
     meta_store(g);
     for (u32 i = 0; i < old.n; i++) {
         u8 k[7];
-        tri_key(old.v[i], eid, k);
+        tri_key(old.v[i], node, k);
         seg_tree_delete(&g->trit, k, 7);
     }
     if (old.n) cat_put_root(g, K_TRI, 2, g->trit.root);

@@ -262,7 +262,10 @@ never again meet an untested default).
 - (r3.3, 2026-10-09: **ACTIVATED** — `docs/shard-seam-design-note.md`
   (Lev rulings D1–D5 + vertex-duplication + tombstone/RIBLT plans). The two
   r3.2-deferred arms are build steps 1–2, taken at N=1 before any
-  deployment. Model: vertex-cut with duplicated vertices (mirrors carry
+  deployment (step 1 wire v1.6 landed `3d5a1ee`; step 2 node-id
+  indirection landed — logical u32 ids via the `SEG_KIND_INDIRECT` dir +
+  1019-slot data pages, `next_node` in META v2; parity gate holds). Model:
+  vertex-cut with duplicated vertices (mirrors carry
   vertex data + ψ; adjacency halves endpoint-local — a relation create is
   two idempotent local commits, sync-both-acked, not a distributed txn).
   No coordinating role: placement is a pure function (hash(name)

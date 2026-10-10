@@ -266,6 +266,123 @@ int main(void) {
     }
     PASS();
 
+    TEST(logical_ids_dead_on_delete_never_alias);
+    {
+        /* build step 2 (docs/shard-seam-design-note.md §3): ids crossing this
+         * API are logical node ids. A deleted id is retired — stale refs
+         * resolve dead instead of aliasing a reused physical slot (the v3
+         * reuse-aliasing failure class). */
+        mstore_t *ms = fresh_store();
+        assert(ms);
+        graph4_t *g = graph4_open(ms);
+        assert(g);
+        assert(mstore_txn_begin(ms));
+        u32 a = g4_create_entity(g, (const u8 *)"IdA", 3, (const u8 *)"T", 1, 1);
+        u32 b = g4_create_entity(g, (const u8 *)"IdB", 3, (const u8 *)"T", 1, 2);
+        assert(a == 1 && b == 2);                          /* dense from 1 */
+        assert(g4_delete_entity(g, a));
+        u32 c = g4_create_entity(g, (const u8 *)"IdC", 3, (const u8 *)"T", 1, 3);
+        assert(c == 3);                                    /* retired, not reused */
+        assert(g4_lookup(g, (const u8 *)"IdA", 3) == 0);
+        g4_entity_t e;
+        assert(g4_read_entity(g, a, &e) == 0);             /* dead id stays dead */
+        assert(g4_read_entity(g, b, &e) == 1);
+        assert(g4_read_entity(g, c, &e) == 1);
+        assert(g4_delete_entity(g, a) == 0);               /* double-delete: no-op */
+        assert(g4_entity_count(g) == 2);
+        assert(mstore_txn_commit(ms));
+        graph4_close(g);
+        mstore_close(ms);
+    }
+    PASS();
+
+    TEST(node_id_page_growth_and_reopen_continuation);
+    {
+        /* 1500 nodes cross the 1019-slot data-page boundary (dir npages=2);
+         * the mapping survives reopen and numbering continues monotonically
+         * (META v2 next_node). */
+        char mp[] = "/tmp/g4nid_m_XXXXXX", gp[] = "/tmp/g4nid_g_XXXXXX",
+             sp[] = "/tmp/g4nid_s_XXXXXX";
+        int f;
+        f = mkstemp(mp); assert(f >= 0); close(f);
+        f = mkstemp(gp); assert(f >= 0); close(f);
+        f = mkstemp(sp); assert(f >= 0); close(f);
+        static u32 ids[1500];
+        {
+            seg_io_t *sios[2] = { seg_io_posix_open(gp, 1), seg_io_posix_open(sp, 1) };
+            mstore_t *ms = mstore_create(seg_io_posix_open(mp, 1), sios, 2, 2);
+            assert(ms);
+            graph4_t *g = graph4_open(ms);
+            assert(g);
+            assert(mstore_txn_begin(ms));
+            char nm[32];
+            for (u32 i = 0; i < 1500; i++) {
+                int n = snprintf(nm, sizeof nm, "Nid_%u", i);
+                ids[i] = g4_create_entity(g, (const u8 *)nm, (u16)n, (const u8 *)"K", 1, i);
+                assert(ids[i] == i + 1);
+            }
+            assert(mstore_txn_commit(ms));
+            graph4_close(g);
+            mstore_close(ms);
+        }
+        {
+            seg_io_t *rios[2] = { seg_io_posix_open(gp, 0), seg_io_posix_open(sp, 0) };
+            mstore_t *ms2 = mstore_open(seg_io_posix_open(mp, 0), rios, 2);
+            assert(ms2);
+            graph4_t *g2 = graph4_open(ms2);
+            assert(g2);
+            char nm[32];
+            for (u32 i = 0; i < 1500; i += 137) {
+                int n = snprintf(nm, sizeof nm, "Nid_%u", i);
+                assert(g4_lookup(g2, (const u8 *)nm, (u16)n) == ids[i]);
+            }
+            g4_entity_t e;
+            assert(g4_read_entity(g2, ids[1018], &e) == 1);   /* page 0, last slot */
+            assert(g4_read_entity(g2, ids[1019], &e) == 1);   /* page 1, first slot */
+            assert(mstore_txn_begin(ms2));
+            u32 fresh = g4_create_entity(g2, (const u8 *)"Nid_1500", 8, (const u8 *)"K", 1, 1500);
+            assert(fresh == 1501);                            /* monotone continuation */
+            assert(mstore_txn_commit(ms2));
+            graph4_close(g2);
+            mstore_close(ms2);
+        }
+        unlink(mp); unlink(gp); unlink(sp);
+    }
+    PASS();
+
+    TEST(dir_growth_past_43_pages);
+    {
+        /* regression guard: the first ind_append implementation grew the dir
+         * record via seg_page_update's relocate-per-grow path, which
+         * exhausted the dir page at 43 data pages (43,817 nodes) — caught by
+         * the real-KB import gate, not by small tests. The record is now
+         * written at full size once and poked in place; this crosses 44
+         * data pages (45 dir entries). */
+        mstore_t *ms = fresh_store();
+        assert(ms);
+        graph4_t *g = graph4_open(ms);
+        assert(g);
+        assert(mstore_txn_begin(ms));
+        char nm[16];
+        enum { NG = 45000 };
+        for (u32 i = 0; i < NG; i++) {
+            int n = snprintf(nm, sizeof nm, "G%05u", i);
+            u32 node = g4_create_entity(g, (const u8 *)nm, (u16)n, (const u8 *)"K", 1, i);
+            assert(node == i + 1);
+        }
+        for (u32 i = 0; i < NG; i += 997) {           /* sample every dir page */
+            int n = snprintf(nm, sizeof nm, "G%05u", i);
+            assert(g4_lookup(g, (const u8 *)nm, (u16)n) == i + 1);
+        }
+        g4_entity_t e;
+        assert(g4_read_entity(g, 1, &e) == 1);
+        assert(g4_read_entity(g, NG, &e) == 1);
+        assert(mstore_txn_commit(ms));
+        graph4_close(g);
+        mstore_close(ms);
+    }
+    PASS();
+
     TEST(relations_bidir_dup_delete);
     {
         mstore_t *ms = fresh_store();

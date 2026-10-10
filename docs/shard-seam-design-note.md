@@ -60,14 +60,25 @@ iteration over shards converges under exactly that condition — which is
 
 ## 3. Identity & placement
 
-- **Node ids are logical** (u64, dense per creation); refs and wire ids
-  carry them, never physical locations.
+- **Node ids are logical, `u32`** — same width as the physical refs they
+  replaced, so every table layout (name values, posting keys, adjacency
+  entries, wire payloads) stayed byte-identical; only the meaning changed.
+  Dense from 1, minted on create, never reused.
 - **Indirection table** activates the reserved `SEG_KIND_INDIRECT`: a
-  per-store table `node-id → (shard, seg, lpg/slot)`. At N=1 it is the
+  per-store `node-id → (shard, seg, lpg/slot)` map. At N=1 it is the
   identity mapping; it is the mechanism that lets entities *move* —
   community migration (Fennel/LDG streaming assignment, lazy, piggybacked
   on COW writes) and resharding both reduce to: copy → flip indirection →
   tombstone old.
+  **Landed (step 2):** dir page holds one record `[u32 npages][u32 lpg ×
+  npages]`; data page `p` holds one record of 1019 `u32` eids for nodes
+  `[p·1019, (p+1)·1019)`. Dir capacity 1018 pages ≈ 1.03M nodes — the
+  named level-1 cliff (a second-level dir or a tree replaces it if
+  crossed; create fails loudly, never silently). `next_node` persists in
+  META v2 (pre-release: v2-only, strict — v1 stores refuse to open rather
+  than mint colliding ids). A killed id resolves dead: stale refs fail
+  cleanly instead of aliasing a recycled physical slot (the v3
+  reuse-aliasing class, closed by construction).
 - **Name directory**: `hash(name) → {node-id, generation}` bindings,
   one directory (tables per shard). The directory shard is the only global
   serialization point, hit on create/delete only (rare vs edits). Names
@@ -165,9 +176,10 @@ unboundedly.**
 ## 11. Build order (all at N=1)
 
 1. Wire shard-id space (v1.6). — protocol only, testable against v1.5.
+   **DONE (`3d5a1ee`).**
 2. Node-id indirection (identity-mapped; `SEG_KIND_INDIRECT` live). —
    refs become logical; the existing battery + parity gate prove no
-   behavior change.
+   behavior change. **DONE (this commit).**
 3. Name directory store (hash-routed bindings + generations).
 4. Replication channel + RIBLT port + symbol codecs + watermarks.
 5. Sharded fuzz: extend the existing 30-agent harness to N daemons over N
