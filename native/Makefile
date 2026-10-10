@@ -11,13 +11,17 @@ CFLAGS = -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 LIBS = -lm
 OUT ?= /tmp/mf_test.$(shell echo $$PPID)
 
-.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon test_import test_riblt test_segtree test_regex regex_cli bench bench_regex bench_sheng bench_widesheng proofs proofs-eva wp-segmeta clean
+.PHONY: test verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_parity test_daemon test_import test_riblt test_repl test_segtree test_regex regex_cli bench bench_regex bench_sheng bench_widesheng proofs proofs-eva wp-segmeta clean
 
 test_riblt: test_riblt.c riblt.c blake2s.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_riblt && $(OUT)_riblt
 
+REPL_SRC = test_repl.c riblt.c blake2s.c seg_tree.c seg_graph4.c seg_str4.c seg_mstore.c seg_txn.c seg_file.c seg_io.c seg_meta.c seg_page.c regex.c re_dfa.c re_trigram.c
+test_repl: $(REPL_SRC)
+	$(CC) $(CFLAGS) $(REPL_SRC) $(LIBS) -o $(OUT)_repl && $(OUT)_repl
+
 # `make test` = prove the detector fires, then run every harness with it active.
-test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_segtree test_parity test_daemon test_import test_riblt test_regex
+test: verify-detector test_memfile test_stringtable test_graph test_entity test_segmeta test_segpage test_segfile test_segtxn test_mstore test_str4 test_graph4 test_segtree test_parity test_daemon test_import test_riblt test_repl test_regex
 
 test_segmeta: test_segmeta.c seg_meta.c
 	$(CC) $(CFLAGS) $^ $(LIBS) -o $(OUT)_segmeta && $(OUT)_segmeta

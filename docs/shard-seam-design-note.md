@@ -145,12 +145,19 @@ invariant from `RIBLT_Bug_PeelMustTrackFutureCells_2026_05_23`
 (re-verify on port). Self-authored, no external dependence; vendored
 Blake2s.
 
-32-byte symbol codecs:
+32-byte symbol codecs (landed, step 4; emitted inside a txn view):
 
-- **adjacency**: `{peer u64, dir u8, reltype u32, mtime u64, pad}` — fits
-  exactly; halves reconcile as plain symbol sets.
-- **vertex-state**: `{node-id u64, stamp u64, value u64, field u16}` for
-  the int-LWW values — decoded diffs merge directly, no follow-up fetch.
+- **adjacency**: `[peer u32][dir u8][rel_sid u32][mtime u64][pad]` — one per
+  chain row; halves reconcile as plain symbol sets.
+- **vertex-state**: `[node u32][binding gen u32][content-hash u64][pad]` —
+  the hash covers type_sid, obs sids/count, mtime, obs_mtime, psi; visits
+  reconcile separately (the relaxed-counter class). The hash is a local
+  64-bit mix for diff *detection* only — the RIBLT's own checksum stays
+  blake2s-keyed, so peeling correctness never depends on it.
+- Verified against ground truth in `test_repl`: clone a committed store,
+  mutate (creates, deletes, observations, relation add/remove, a
+  delete+recreate name), extract both sides, reconcile — the decoded
+  symmetric difference equals the exact set difference, both families.
 
 Rounds run pairwise between shards over the daemon channel (REPLICA /
 ANTI_ENTROPY op classes, same binary protocol, versioned). Cost is
@@ -191,6 +198,9 @@ unboundedly.**
 3. Name directory store (hash-routed bindings + generations).
    **DONE (this commit).**
 4. Replication channel + RIBLT port + symbol codecs + watermarks.
+   RIBLT port + codecs + reconcile-on-real-data **DONE (`13d5c1a` +
+   this commit)**; the daemon channel op classes and peer watermarks land
+   with the sharded fuzz (step 5), where peers exist to exercise them.
 5. Sharded fuzz: extend the existing 30-agent harness to N daemons over N
    shards, with kill-mid-half-write, offline-past-horizon resync, and
    convergence assertions. This is the gate for every step above.

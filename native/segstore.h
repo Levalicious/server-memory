@@ -529,6 +529,18 @@ u32  g4_lookup(graph4_t *g, const u8 *name, u16 nlen);       /* eid or 0 */
 /* node-id or 0; *gen_out = the name binding's generation (directory, step 3) */
 u32  g4_lookup_ex(graph4_t *g, const u8 *name, u16 nlen, u32 *gen_out);
 
+/* ---- anti-entropy symbol extraction (shard-seam note §8) ----
+ * One G4_SYM_LEN-byte symbol per row, emitted in a consistent txn view —
+ * call inside the caller's txn. Symbols are the RIBLT reconciliation unit;
+ * the emitted layout:
+ *   adjacency:    [peer u32][dir u8][rel_sid u32][mtime u64][pad]
+ *   vertex-state: [node u32][binding gen u32][content-hash u64][pad]
+ * (content hash covers type_sid, obs sids/count, mtime, obs_mtime, psi —
+ * visits reconcile separately, the relaxed-counter class). Returns count. */
+#define G4_SYM_LEN 32u
+u32  g4_adj_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx);
+u32  g4_vstate_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx);
+
 typedef struct {
     u32 eid, name_sid, type_sid, adj_ref;
     u64 mtime, obs_mtime;

@@ -1766,3 +1766,89 @@ fail0:
     free(eids); free(idx.k); free(idx.v);
     return 0;
 }
+
+/* ================= anti-entropy symbol extraction =================
+ * (docs/shard-seam-design-note.md §8; consumers: the repl test and, later,
+ * the daemon's ANTI_ENTROPY op class). Must run inside a txn — the scan and
+ * the record reads share one consistent view. */
+
+typedef struct { graph4_t *g; void (*cb)(void *, const u8 *); void *ctx; u32 n; } sym_walk_t;
+
+/* 64-bit content mix for the vertex-state symbol. Diff DETECTION only —
+ * RIBLT's own checksum stays blake2s-keyed, so peeling correctness does not
+ * depend on this hash. */
+static u64 sym_mix64(const u8 *p, u32 n) {
+    u64 h = 0x9E3779B97F4A7C15ull ^ ((u64)n << 32);
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001B3ull; h ^= h >> 29; }
+    h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 27; h *= 0x94D049BB133111EBull;
+    return h ^ (h >> 31);
+}
+
+static int sym_adj_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
+    (void)k; (void)kl;
+    sym_walk_t *w = (sym_walk_t *)c;
+    if (!v || vl != 8) return 1;
+    u32 node = g4ld32(v);
+    if (!node) return 1;                                /* tombstone */
+    g4_entity_t e;
+    if (!g4_read_entity(w->g, node, &e)) return 1;
+    u32 aref = e.adj_ref;
+    while (aref) {
+        adj_view_t av;
+        if (!adj_view(w->g, aref, &av)) break;
+        for (u32 i = 0; i < av.count; i++) {
+            g4_edge_t ed;
+            adj_ent_decode(av.ents + (size_t)i * ADJ_ENT, &ed);
+            u8 s[G4_SYM_LEN];
+            memset(s, 0, sizeof s);
+            g4st32(s, ed.target_eid);                   /* [peer u32]  */
+            s[4] = (u8)ed.direction;                    /* [dir u8]    */
+            g4st32(s + 5, ed.rel_sid);                  /* [rel u32]   */
+            g4st64(s + 9, ed.mtime);                    /* [mtime u64] */
+            w->cb(w->ctx, s);
+            w->n++;
+        }
+        aref = av.next;
+    }
+    return 1;
+}
+
+static int sym_vstate_cb(void *c, const u8 *k, u16 kl, const u8 *v, u16 vl) {
+    (void)k; (void)kl;
+    sym_walk_t *w = (sym_walk_t *)c;
+    if (!v || vl != 8) return 1;
+    u32 node = g4ld32(v);
+    if (!node) return 1;
+    u32 gen = g4ld32(v + 4);
+    g4_entity_t e;
+    if (!g4_read_entity(w->g, node, &e)) return 1;
+    u8 in[37];
+    g4st32(in, e.type_sid);
+    g4st32(in + 4, e.obs0_sid);
+    g4st32(in + 8, e.obs1_sid);
+    in[12] = e.obs_count;
+    g4st64(in + 13, e.mtime);
+    g4st64(in + 21, e.obs_mtime);
+    memcpy(in + 29, &e.psi, 8);
+    u8 s[G4_SYM_LEN];
+    memset(s, 0, sizeof s);
+    g4st32(s, node);
+    g4st32(s + 4, gen);
+    g4st64(s + 8, sym_mix64(in, sizeof in));
+    w->cb(w->ctx, s);
+    w->n++;
+    return 1;
+}
+
+u32 g4_adj_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx) {
+    sym_walk_t w = { g, cb, ctx, 0 };
+    (void)seg_tree_scan(&g->namet, NULL, 0, 1, NULL, 0, 1, sym_adj_cb, &w);
+    return w.n;
+}
+
+u32 g4_vstate_symbols(graph4_t *g, void (*cb)(void *ctx, const u8 *sym), void *ctx) {
+    sym_walk_t w = { g, cb, ctx, 0 };
+    (void)seg_tree_scan(&g->namet, NULL, 0, 1, NULL, 0, 1, sym_vstate_cb, &w);
+    return w.n;
+}
