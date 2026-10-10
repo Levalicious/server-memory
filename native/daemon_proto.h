@@ -48,6 +48,30 @@
  * shard (absent = KBD_SHARD_LOCAL). Nonzero is not routable at N=1 (ERR
  * code 3, unknown shard). Leases carry their shard, so a continuation can
  * migrate across shards (§6.2 SERIAL class) without a format break.
+ *
+ * v1.7: the anti-entropy serve side (note §8/§10, step 5b-i). A round driver
+ * snapshots the peer's symbol set and pulls its RIBLT cell stream; the serve
+ * state (encoder per family) is per-daemon, replaced by the next BEGIN, and
+ * generation-stamped so an interleaved BEGIN makes the stale consumer fail
+ * cleanly instead of decoding garbage.
+ *   RE_BEGIN    {u8 family}                  -> u32 nsym, u32 gen
+ *   RE_CELLS    {u8 family, u32 from, u32 max}
+ *                                            -> u32 gen, u32 n, n x 44B cells
+ *   RE_END      {u8 family}                  -> OK
+ *   RE_RELNAME  {u32 n, n x u64 relhash}     -> n x {u8 found, [str]}
+ *   RE_VROW     {u32 n, n x u32 node}        -> n x {u8 found, [u32 len, blob]}
+ *   RE_VROW_SET {u32 n, n x {u32 node, u32 len, blob}} -> n x u8 status
+ *   RE_EDGE_PULL{u32 n, n x {32B sym, str reltype}}    -> n x u8 status
+ *   RE_EDGE_DEL {u32 n, n x 32B sym}                   -> n x u8 status
+ * family: 0 = adjacency, 1 = vertex-state. Cells are [sum 32][count i32 LE]
+ * [checksum u64 LE] (riblt_cell_pack). Row blob: [str type][u64 mtime]
+ * [u64 obs_mtime][u8 obs_count]([str obs])x min(count,2)[u64 psi bits]
+ * (g4_vrow_pack). Status bytes: RE_VROW_SET 1 = applied, 0 = lost/equal;
+ * RE_EDGE_PULL 0 = covered by the local remove-watermark (the CALLER must
+ * delete its copy), 1 = created, 2 = dup, 3 = failed; RE_EDGE_DEL 1 = deleted.
+ * RE_VROW_SET re-checks the LWW order against the live row at apply time, so
+ * a stale push can never clobber a newer row (the same guard the in-process
+ * adapter runs).
  */
 #ifndef DAEMON_PROTO_H
 #define DAEMON_PROTO_H
@@ -96,6 +120,16 @@ enum {
     OP_REGEX_VALID      = 0x2d,   /* str pattern -> u8 ok (same ERE dialect as SEARCH) */
     OP_RESUME           = 0x2e,   /* u64 token, u64 budget -> find_path-shaped reply;
                                      ERR payload = [u8 code][str msg] (v1.5)     */
+
+    OP_RE_BEGIN         = 0x30,   /* u8 family -> u32 nsym, u32 gen (v1.7)      */
+    OP_RE_CELLS         = 0x31,   /* u8 family, u32 from, u32 max
+                                     -> u32 gen, u32 n, n x 44B cells            */
+    OP_RE_END           = 0x32,   /* u8 family -> OK                            */
+    OP_RE_RELNAME       = 0x33,   /* u32 n, n x u64 relhash -> n x {u8,[str]}   */
+    OP_RE_VROW          = 0x34,   /* u32 n, n x u32 node -> n x {u8,[u32,blob]} */
+    OP_RE_VROW_SET      = 0x35,   /* u32 n, n x {u32 node, u32 len, blob} -> n x u8 */
+    OP_RE_EDGE_PULL     = 0x36,   /* u32 n, n x {32B sym, str rt} -> n x u8     */
+    OP_RE_EDGE_DEL      = 0x37,   /* u32 n, n x 32B sym -> n x u8               */
 };
 
 /* OPEN_NODES entity blob (per requested name):

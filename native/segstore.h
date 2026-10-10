@@ -548,10 +548,16 @@ u64  g4_chain_wm(graph4_t *g, u32 node);   /* chain remove-watermark (0 = none) 
 u64  g4_relhash(graph4_t *g, u32 rel_sid); /* string-stable reltype hash (symbol identity) */
 int  g4_half_put(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u64 mtime, u32 dir_stored);
 int  g4_half_del(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u32 dir_stored);
+int  g4_edge_find_hashed(graph4_t *g, u32 from, u32 to, u64 relhash, u8 *out, u16 *outcap);
+int  g4_edge_del_hashed(graph4_t *g, u32 lo, u32 hi, u8 dlo, u64 relhash);
 
-/* ---- the pairwise round (seam §5, step 5a-ii) ----
+/* ---- the pairwise round (seam §5, step 5a-ii; wire form 5b-i) ----
  * One anti-entropy round between two clone-lineage stores; runs inside the
- * caller's txns (one per store); extract-then-apply. 1 = round completed. */
+ * caller's txns (one per store); extract-then-apply. 1 = round completed.
+ * The wire form (step 5b) runs the SAME algorithm with the peer behind an
+ * abstract transport (repl_peer_t): the round driver owns its local store
+ * and ONE decode of both families; `local` is the driver ("a"), `peer` the
+ * other side ("b"). Stats keep the a/b naming. */
 typedef struct {
     u32 edges_pulled_a, edges_pulled_b;          /* edges pulled INTO a / b  */
     u32 edges_deleted_from_a, edges_deleted_from_b;
@@ -559,6 +565,38 @@ typedef struct {
     u32 vstate_applied_a, vstate_applied_b, vstate_skipped;
 } g4_repl_stats_t;
 int  g4_repl_round(graph4_t *a, graph4_t *b, g4_repl_stats_t *st);
+
+/* Abstract peer for the wire round. Implemented by the in-process adapter
+ * (g4_repl_round) and by the daemon channel client (seg_daemon.c / tests).
+ * All calls are synchronous. Cell bytes on the wire AND through this vtable
+ * are the 44-byte packed form [sum 32][count i32 LE][checksum u64 LE].
+ * Buffer contracts: `relname` output is G4_REPL_STR_CAP bytes; `vrow` and
+ * `vrow_set`/`edge_pull` inputs are G4_REPL_ROW_CAP / 32+str bytes. */
+#define G4_REPL_STR_CAP 4096u      /* reltype string cap (>= record cap) */
+#define G4_REPL_ROW_CAP 8192u      /* vstate row blob cap */
+typedef struct repl_peer {
+    void *ctx;
+    /* snapshot the peer's symbol set for `family` (0 = adjacency, 1 = vstate) */
+    int (*begin)(void *ctx, u8 family, u32 *nsym);
+    /* fetch up to `max` cells starting at index `from_idx`; packs n*44 bytes */
+    int (*cells)(void *ctx, u8 family, u32 from_idx, u32 max, u8 *out, u32 *nout);
+    int (*end)(void *ctx, u8 family);
+    /* resolve a reltype hash to its string (1 = found) */
+    int (*relname)(void *ctx, u64 relhash, u8 *out, u16 *outlen);
+    /* fetch a peer vstate row as a row blob (1 = found; layout in seg_graph4.c) */
+    int (*vrow)(void *ctx, u32 node, u8 *out, u32 *outlen);
+    /* guarded LWW apply at the peer (row blob beats its current row);
+     * status: 0 = lost/equal (not applied), 1 = applied */
+    int (*vrow_set)(void *ctx, u32 node, const u8 *row, u32 rowlen, u8 *status);
+    /* peer pulls an edge we hold: 32B canonical symbol + reltype bytes;
+     * peer re-checks ITS remove-watermark; status: 0 = covered (we must
+     * delete), 1 = created, 2 = dup, 3 = failed */
+    int (*edge_pull)(void *ctx, const u8 *sym, const u8 *rt, u16 rl, u8 *status);
+    /* peer deletes an edge it holds (we hold the delete warrant);
+     * status: 0 = not found, 1 = deleted */
+    int (*edge_del)(void *ctx, const u8 *sym, u8 *status);
+} repl_peer_t;
+int  g4_repl_round_wire(graph4_t *local, repl_peer_t *peer, g4_repl_stats_t *st);
 
 typedef struct {
     u32 eid, name_sid, type_sid, adj_ref;
@@ -573,6 +611,24 @@ typedef struct {
 
 /* whole-row apply from a source store (repl LWW winner side; seam §5) */
 int  g4_vstate_apply(graph4_t *g, u32 node, graph4_t *src_g, const g4_entity_t *src_e);
+
+/* raw-strings apply (wire rows): the winner's fields arrive as bytes, no
+ * source store present. Same body as g4_vstate_apply; psi is the winner's. */
+int  g4_vstate_apply_raw(graph4_t *g, u32 node,
+                         const u8 *type, u16 tl,
+                         u64 mtime, u64 obs_mtime,
+                         const u8 *o0, u16 o0l, const u8 *o1, u16 o1l,
+                         u8 ocount, double psi);
+
+/* vstate row blob codec (repl wire + vtable; seam §8):
+ *   [str type][u64 mtime][u64 obs_mtime][u8 obs_count]([str obs])×min(oc,2)
+ *   [u64 psi bits]   — LE throughout; "str" = [u16 len][bytes].
+ * pack returns bytes written (0 = error/cap); cmp compares blob-row ("a")
+ * vs live row ("b") with the EXACT row_cmp order (mtime, obs_mtime,
+ * obs_count, type bytes, obs bytes, psi); apply parses then applies raw. */
+u32  g4_vrow_pack(graph4_t *g, const g4_entity_t *e, u8 *out, u32 cap);
+int  g4_vrow_cmp(graph4_t *g, const u8 *blob, u32 len, const g4_entity_t *e);
+int  g4_vrow_apply(graph4_t *g, u32 node, const u8 *blob, u32 len);
 
 int  g4_read_entity(graph4_t *g, u32 eid, g4_entity_t *out); /* 1 = live */
 u32  g4_entity_count(graph4_t *g);

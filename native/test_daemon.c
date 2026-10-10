@@ -926,6 +926,218 @@ int main(void) {
     }
     PASS();
 
+    TEST(anti_entropy_serve_ops);
+    {
+        /* Oracle store (fresh, out-of-band): its only job is to hand us a
+         * REAL reltype hash through the public API (g4_relhash needs a live
+         * store; the daemon's is owned by the child). */
+        char odir[] = "/tmp/kbd4_oracle_XXXXXX";
+        assert(mkdtemp(odir));
+        char om[600], og[600], ost[600];
+        snprintf(om, sizeof om, "%s/manifest.kb", odir);
+        snprintf(og, sizeof og, "%s/graph.kb", odir);
+        snprintf(ost, sizeof ost, "%s/strings.kb", odir);
+        seg_io_t *mio = seg_io_posix_open(om, 1);
+        seg_io_t *sio[2] = { seg_io_posix_open(og, 1), seg_io_posix_open(ost, 1) };
+        assert(mio && sio[0] && sio[1]);
+        mstore_t *oms = mstore_create(mio, sio, 2, 4);
+        assert(oms);
+        graph4_t *og4 = graph4_open(oms);
+        assert(og4);
+        u64 RH = 0;
+        {
+            assert(mstore_txn_begin(oms));
+            u32 oa = g4_create_entity(og4, (const u8 *)"O1", 2, (const u8 *)"T", 1, 1);
+            u32 ob = g4_create_entity(og4, (const u8 *)"O2", 2, (const u8 *)"T", 1, 1);
+            assert(oa && ob);
+            assert(g4_create_relation(og4, oa, ob, (const u8 *)"probe_rel", 9, 42));
+            u32 ec = g4_edge_count(og4, oa);
+            g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+            assert(es);
+            g4_edges(og4, oa, es, ec);
+            for (u32 k = 0; k < ec; k++)
+                if (es[k].target_eid == ob && es[k].direction == G4_DIR_FORWARD)
+                    RH = g4_relhash(og4, es[k].rel_sid);
+            free(es);
+            assert(RH);
+            assert(mstore_txn_commit(oms));
+        }
+        graph4_close(og4);
+        mstore_close(oms);
+        { char c[700]; snprintf(c, sizeof c, "rm -rf %s", odir); assert(system(c) == 0); }
+
+        /* Daemon store: RE_A01 -[probe_rel]-> RE_B02 (mt 1000), + one obs. */
+        u32 eidA = 0, eidB = 0;
+        pl_reset(&pl);
+        w32(&pl, 2);
+        pl_str(&pl, "RE_A01"); pl_str(&pl, "T_re"); w64(&pl, 5000);
+        pl_str(&pl, "RE_B02"); pl_str(&pl, "T_re"); w64(&pl, 5000);
+        assert(cl_call(fd, 900, OP_CREATE_ENTITIES, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); eidA = r32(&rr); eidB = r32(&rr);
+          assert(eidA && eidB); }
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 1);
+        pl_str(&pl, "RE_A01"); pl_str(&pl, "RE_B02"); pl_str(&pl, "probe_rel"); w64(&pl, 1000);
+        assert(cl_call(fd, 901, OP_CREATE_RELATIONS, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 1);
+        pl_str(&pl, "RE_A01"); pl_str(&pl, "RE_obs0"); w64(&pl, 6000);
+        assert(cl_call(fd, 902, OP_ADD_OBS, &pl, &body) == ST_OK);
+        free(body.b);
+
+        /* RE_RELNAME: known hash resolves, unknown reports not-found. */
+        pl_reset(&pl);
+        w32(&pl, 2); w64(&pl, RH); w64(&pl, RH ^ 0xdeadbeef12345678ull);
+        assert(cl_call(fd, 903, OP_RE_RELNAME, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body);
+          u8 f1 = r8(&rr);
+          u16 l1 = 0; const u8 *s1 = rstr(&rr, &l1);
+          u8 f2 = r8(&rr);
+          assert(f1 == 1 && l1 == 9 && memcmp(s1, "probe_rel", 9) == 0);
+          assert(f2 == 0 && !rr.err); }
+        free(body.b);
+
+        /* RE_BEGIN/CELLS/END: deterministic cells, gen stamped, END closes. */
+        pl_reset(&pl); w8(&pl, 0);
+        assert(cl_call(fd, 904, OP_RE_BEGIN, &pl, &body) == ST_OK);
+        u32 gen1 = 0, nsym1 = 0;
+        { rd_t rr = body_rd(&body); nsym1 = r32(&rr); gen1 = r32(&rr); assert(!rr.err); }
+        free(body.b);
+        assert(nsym1 > 0 && gen1 > 0);
+        u8 cells1[8 * 44];
+        pl_reset(&pl); w8(&pl, 0); w32(&pl, 0); w32(&pl, 8);
+        assert(cl_call(fd, 905, OP_RE_CELLS, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body);
+          u32 gen = r32(&rr), n = r32(&rr);
+          assert(gen == gen1 && n == 8 && body.n == 8 + 8 * 44);
+          memcpy(cells1, rr.p, sizeof cells1); }
+        free(body.b);
+        pl_reset(&pl); w8(&pl, 0); w32(&pl, 0); w32(&pl, 8);
+        assert(cl_call(fd, 906, OP_RE_CELLS, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); (void)r32(&rr); (void)r32(&rr);
+          assert(memcmp(cells1, rr.p, sizeof cells1) == 0); }  /* deterministic */
+        free(body.b);
+        pl_reset(&pl); w8(&pl, 0);
+        assert(cl_call(fd, 907, OP_RE_END, &pl, &body) == ST_OK);
+        free(body.b);
+        pl_reset(&pl); w8(&pl, 0); w32(&pl, 0); w32(&pl, 8);
+        assert(cl_call(fd, 908, OP_RE_CELLS, &pl, &body) == ST_ERR);   /* no begin */
+        free(body.b);
+        /* A replaced snapshot is visible: gen bumps, cells carry the new gen
+         * (this is the clobber guard — a stale reader sees the mismatch). */
+        pl_reset(&pl); w8(&pl, 0);
+        assert(cl_call(fd, 909, OP_RE_BEGIN, &pl, &body) == ST_OK);
+        u32 gen2 = 0;
+        { rd_t rr = body_rd(&body); (void)r32(&rr); gen2 = r32(&rr); }
+        free(body.b);
+        assert(gen2 == gen1 + 1);
+        pl_reset(&pl); w8(&pl, 0);
+        assert(cl_call(fd, 910, OP_RE_BEGIN, &pl, &body) == ST_OK);
+        u32 gen3 = 0;
+        { rd_t rr = body_rd(&body); (void)r32(&rr); gen3 = r32(&rr); }
+        free(body.b);
+        assert(gen3 == gen2 + 1);
+        pl_reset(&pl); w8(&pl, 0); w32(&pl, 0); w32(&pl, 4);
+        assert(cl_call(fd, 911, OP_RE_CELLS, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r32(&rr) == gen3); }
+        free(body.b);
+        pl_reset(&pl); w8(&pl, 0);
+        assert(cl_call(fd, 912, OP_RE_END, &pl, &body) == ST_OK);
+        free(body.b);
+
+        /* RE_VROW: live row packs the blob; dead node reports not-found. */
+        u8 blob0[8192];
+        u32 blob0len = 0;
+        pl_reset(&pl); w32(&pl, 2); w32(&pl, eidA); w32(&pl, 999999);
+        assert(cl_call(fd, 913, OP_RE_VROW, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body);
+          u8 f1 = r8(&rr);
+          u32 bl = r32(&rr);
+          assert(f1 == 1 && bl > 0 && bl <= sizeof blob0);
+          memcpy(blob0, rr.p, bl);
+          blob0len = bl;
+          rr.p += bl;
+          u8 f2 = r8(&rr);
+          assert(f2 == 0 && !rr.err); }
+        free(body.b);
+        {
+            rd_t rr = { blob0, blob0 + blob0len, 0 };
+            u16 tl = 0;
+            const u8 *ty = rstr(&rr, &tl);
+            assert(tl == 4 && memcmp(ty, "T_re", 4) == 0);
+            assert(r64(&rr) == 6000);            /* mtime: add_obs sets both (v3) */
+            assert(r64(&rr) == 6000);            /* obs mtime */
+            u8 oc = r8(&rr);
+            assert(oc == 1);
+            u16 ol = 0;
+            const u8 *ob = rstr(&rr, &ol);
+            assert(ol == 7 && memcmp(ob, "RE_obs0", 7) == 0);
+            assert(!rr.err);
+        }
+
+        /* RE_VROW_SET: newer blob applies; the stale one is refused. */
+        u8 blobN[8192];
+        memcpy(blobN, blob0, blob0len);
+        blobN[2 + 4] = 0x58; blobN[2 + 4 + 1] = 0x1b;   /* mtime := 7000 (LE) */
+        pl_reset(&pl);
+        w32(&pl, 1); w32(&pl, eidA); w32(&pl, blob0len); wbytes(&pl, blobN, blob0len);
+        assert(cl_call(fd, 914, OP_RE_VROW_SET, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 1); }    /* applied */
+        free(body.b);
+        pl_reset(&pl);
+        w32(&pl, 1); w32(&pl, eidA); w32(&pl, blob0len); wbytes(&pl, blob0, blob0len);
+        assert(cl_call(fd, 915, OP_RE_VROW_SET, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 0); }    /* stale: lost */
+        free(body.b);
+        pl_reset(&pl); w32(&pl, 1); w32(&pl, eidA);
+        assert(cl_call(fd, 916, OP_RE_VROW, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body);
+          assert(r8(&rr) == 1);
+          u32 bl = r32(&rr);
+          rd_t br = { rr.p, rr.p + bl, 0 };
+          u16 tl = 0;
+          (void)rstr(&br, &tl);
+          assert(r64(&br) == 7000); }
+        free(body.b);
+
+        /* RE_EDGE_PULL / RE_EDGE_DEL on a NEW direction (B->A): created, dup,
+         * deleted, not-found, and finally the watermark refuses resurrection. */
+        u32 lo = eidA < eidB ? eidA : eidB;
+        u32 hi = eidA < eidB ? eidB : eidA;
+        u8 dlo = (eidB == lo) ? G4_DIR_FORWARD : G4_DIR_BACKWARD;   /* edge B->A */
+        u8 sym[32];
+        {
+            wr_t sb = { NULL, 0, 0, 0 };
+            w32(&sb, lo); w32(&sb, hi); w64(&sb, RH); w8(&sb, dlo); w64(&sb, 777);
+            while (sb.len < 32) w8(&sb, 0);
+            memcpy(sym, sb.buf, 32);
+            free(sb.buf);
+        }
+        pl_reset(&pl); w32(&pl, 1); wbytes(&pl, sym, 32); pl_str(&pl, "probe_rel");
+        assert(cl_call(fd, 917, OP_RE_EDGE_PULL, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 1); }    /* created */
+        free(body.b);
+        pl_reset(&pl); w32(&pl, 1); wbytes(&pl, sym, 32); pl_str(&pl, "probe_rel");
+        assert(cl_call(fd, 918, OP_RE_EDGE_PULL, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 2); }    /* dup */
+        free(body.b);
+        pl_reset(&pl); w32(&pl, 1); wbytes(&pl, sym, 32);
+        assert(cl_call(fd, 919, OP_RE_EDGE_DEL, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 1); }    /* deleted */
+        free(body.b);
+        pl_reset(&pl); w32(&pl, 1); wbytes(&pl, sym, 32);
+        assert(cl_call(fd, 920, OP_RE_EDGE_DEL, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 0); }    /* already gone */
+        free(body.b);
+        pl_reset(&pl); w32(&pl, 1); wbytes(&pl, sym, 32); pl_str(&pl, "probe_rel");
+        assert(cl_call(fd, 921, OP_RE_EDGE_PULL, &pl, &body) == ST_OK);
+        { rd_t rr = body_rd(&body); assert(r8(&rr) == 0); }    /* wm: no resurrection */
+        free(body.b);
+    }
+    PASS();
+
     close(fd);
     stop_daemon(pid);
     free(pl.buf);

@@ -20,6 +20,7 @@
  */
 #include "segstore.h"
 #include "daemon_proto.h"
+#include "riblt.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -68,6 +69,9 @@ static void wstr(wr_t *w, const u8 *s, u16 l) {
         memcpy(w->buf + w->len, s, l); w->len += l;
     }
 }
+static void wbytes(wr_t *w, const u8 *s, u32 n) {
+    if (wgrow(w, n)) { memcpy(w->buf + w->len, s, n); w->len += n; }
+}
 static u64 f64bits(double d) { u64 u; memcpy(&u, &d, 8); return u; }
 static int cmp_u32asc(const void *a, const void *b) {
     u32 x = *(const u32 *)a, y = *(const u32 *)b;
@@ -77,6 +81,19 @@ static int cmp_u32asc(const void *a, const void *b) {
 /* ---------- daemon state ---------- */
 
 typedef struct { u32 *eids; u64 *walks; u32 n, cap; } pend_walk_t;
+
+/* ---- anti-entropy serve state (v1.7, note §8) ----
+ * One encoder snapshot per family. Per-DAEMON, not per-conn: a second BEGIN
+ * replaces it and bumps `gen`; a stream reading under a replaced snapshot
+ * fails cleanly (cells replies carry the gen, the driver checks it) instead
+ * of decoding garbage — overlapping rounds degrade to "retry next round",
+ * never to wrongness. */
+typedef struct {
+    int active;
+    u32 gen;
+    u32 nsym;
+    riblt_enc enc;
+} kbd_repl_fam_t;
 
 typedef struct {
     mstore_t  *ms;
@@ -96,6 +113,7 @@ typedef struct {
     u32        lease_cap;
     u64        lease_next_id;
     int64_t    lease_ttl_ms;
+    kbd_repl_fam_t repl[2];           /* v1.7: anti-entropy serve snapshots */
 } kbd_t;
 
 typedef struct kbd_lease {
@@ -215,6 +233,46 @@ static u64 lease_new(kbd_t *k, u32 from, u32 to, u32 maxd, u32 dir, u64 replay_u
     slot->replay_until = replay_until;
     slot->shard = KBD_SHARD_LOCAL;                   /* v1.6: the shard-id space */
     return id;
+}
+
+/* ---------- anti-entropy serve helpers (v1.7) ---------- */
+
+typedef struct { u8 *v; u32 n, cap; } dcol_t;
+
+static void dcollect(void *ctx, const u8 *s) {
+    dcol_t *x = (dcol_t *)ctx;
+    if (x->n == x->cap) {
+        x->cap = x->cap ? x->cap * 2 : 1024;
+        x->v = (u8 *)realloc(x->v, (size_t)x->cap * RIBLT_WIDTH);
+        if (!x->v) abort();
+    }
+    memcpy(x->v + (size_t)x->n * RIBLT_WIDTH, s, RIBLT_WIDTH);
+    x->n++;
+}
+static int dcol_cmp(const void *a, const void *b) { return memcmp(a, b, RIBLT_WIDTH); }
+static u32 dsym_u32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+static u64 dsym_u64(const u8 *p) {
+    u64 v = 0;
+    for (int k = 7; k >= 0; k--) v = (v << 8) | p[k];
+    return v;
+}
+
+/* does `g`'s FORWARD chain from `from` already hold (to, rt)? (create=0 probe) */
+static int d_edge_present(graph4_t *g, u32 from, u32 to, const u8 *rt, u16 rl) {
+    u32 ec = g4_edge_count(g, from);
+    if (!ec) return 0;
+    g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+    if (!es) return 0;
+    g4_edges(g, from, es, ec);
+    int found = 0;
+    for (u32 k = 0; k < ec && !found; k++) {
+        if (es[k].target_eid != to || es[k].direction != G4_DIR_FORWARD) continue;
+        u16 l = 0;
+        const u8 *b = g4_str(g, es[k].rel_sid, &l);
+        if (b && l == rl && memcmp(b, rt, rl) == 0) found = 1;
+    }
+    free(es);
+    return found;
 }
 
 /* ---------- op handlers ---------- */
@@ -642,6 +700,183 @@ static int handle_op(kbd_t *k, u8 op, rd_t *r, wr_t *w) {
         free(ids);
         return ST_OK;
     }
+    /* ---- v1.7: anti-entropy serve (note §8; step 5b-i). Reads run against
+     * committed state (single-threaded owner, no writer can interleave);
+     * the RE_*_SET/PULL/DEL applies are writes and follow the daemon's one-
+     * request-one-txn discipline. ---- */
+
+    case OP_RE_BEGIN: {
+        u8 fam = r8(r);
+        if (r->err || fam > 1) { err_reply(w, "bad family"); return ST_ERR; }
+        kbd_repl_fam_t *rf = &k->repl[fam];
+        if (rf->active) { riblt_enc_free(&rf->enc); rf->active = 0; }
+        dcol_t set = {0};
+        if (fam == 0) g4_adj_symbols(k->g, dcollect, &set);
+        else g4_vstate_symbols(k->g, dcollect, &set);
+        qsort(set.v, set.n, RIBLT_WIDTH, dcol_cmp);
+        u32 w2 = 0;                       /* dedup (canonical halves emit twice) */
+        for (u32 i = 0; i < set.n; i++) {
+            if (w2 == 0 || memcmp(set.v + (size_t)(w2 - 1) * RIBLT_WIDTH,
+                                  set.v + (size_t)i * RIBLT_WIDTH, RIBLT_WIDTH) != 0)
+                memcpy(set.v + (size_t)w2++ * RIBLT_WIDTH, set.v + (size_t)i * RIBLT_WIDTH, RIBLT_WIDTH);
+        }
+        set.n = w2;
+        if (riblt_enc_init(&rf->enc, "kbrepl", 6, set.v, set.n) != 0) {
+            free(set.v);
+            err_reply(w, "oom");
+            return ST_ERR;
+        }
+        free(set.v);
+        rf->active = 1;
+        rf->nsym = set.n;
+        rf->gen++;
+        w32(w, rf->nsym);
+        w32(w, rf->gen);
+        return ST_OK;
+    }
+    case OP_RE_CELLS: {
+        u8 fam = r8(r);
+        u32 from = r32(r), max = r32(r);
+        if (r->err || fam > 1) { err_reply(w, "bad req"); return ST_ERR; }
+        kbd_repl_fam_t *rf = &k->repl[fam];
+        if (!rf->active) { err_reply(w, "no begin"); return ST_ERR; }
+        if (max > 1024) max = 1024;       /* 1024 x 44B = 44 KiB per frame */
+        w32(w, rf->gen);
+        w32(w, max);
+        for (u32 i = 0; i < max; i++) {
+            const riblt_cell *c = riblt_enc_cell(&rf->enc, from + i);
+            if (!c) { err_reply(w, "oom"); return ST_ERR; }
+            u8 tmp[44];
+            riblt_cell_pack(tmp, c);
+            wbytes(w, tmp, 44);
+        }
+        return ST_OK;
+    }
+    case OP_RE_END: {
+        u8 fam = r8(r);
+        if (r->err || fam > 1) { err_reply(w, "bad req"); return ST_ERR; }
+        kbd_repl_fam_t *rf = &k->repl[fam];
+        if (rf->active) { riblt_enc_free(&rf->enc); rf->active = 0; }
+        return ST_OK;
+    }
+    case OP_RE_RELNAME: {
+        u32 n = r32(r);
+        if (r->err || n > 4096) { err_reply(w, "bad batch"); return ST_ERR; }
+        u32 nt = g4_relation_types(k->g, NULL, 0);
+        u32 *sids = (u32 *)malloc((size_t)(nt ? nt : 1) * 4);
+        if (!sids) { err_reply(w, "oom"); return ST_ERR; }
+        nt = g4_relation_types(k->g, sids, nt);
+        for (u32 i = 0; i < n; i++) {
+            u64 rh = r64(r);
+            if (r->err) { free(sids); err_reply(w, "trunc"); return ST_ERR; }
+            int found = 0;
+            for (u32 j = 0; j < nt && !found; j++) {
+                if (g4_relhash(k->g, sids[j]) != rh) continue;
+                u16 l = 0;
+                const u8 *s = g4_str(k->g, sids[j], &l);
+                if (s) { w8(w, 1); wstr(w, s, l); found = 1; }
+            }
+            if (!found) w8(w, 0);
+        }
+        free(sids);
+        return ST_OK;
+    }
+    case OP_RE_VROW: {
+        u32 n = r32(r);
+        if (r->err || n > 4096) { err_reply(w, "bad batch"); return ST_ERR; }
+        u8 *blob = (u8 *)malloc(G4_REPL_ROW_CAP);
+        if (!blob) { err_reply(w, "oom"); return ST_ERR; }
+        for (u32 i = 0; i < n; i++) {
+            u32 node = r32(r);
+            if (r->err) { free(blob); err_reply(w, "trunc"); return ST_ERR; }
+            g4_entity_t e;
+            u32 bl = 0;
+            if (g4_read_entity(k->g, node, &e)) bl = g4_vrow_pack(k->g, &e, blob, G4_REPL_ROW_CAP);
+            if (!bl) { w8(w, 0); continue; }
+            w8(w, 1);
+            w32(w, bl);
+            wbytes(w, blob, bl);
+        }
+        free(blob);
+        return ST_OK;
+    }
+    case OP_RE_VROW_SET: {
+        u32 n = r32(r);
+        if (r->err || n > 100000) { err_reply(w, "bad batch"); return ST_ERR; }
+        if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
+        if (k->dirty_counters) pw_flush_in_txn(k);
+        for (u32 i = 0; i < n; i++) {
+            u32 node = r32(r), blen = r32(r);
+            if (r->err || blen > 65536 || r->p + blen > r->end) {
+                mstore_txn_abort(k->ms);
+                err_reply(w, "trunc");
+                return ST_ERR;
+            }
+            const u8 *blob = r->p;
+            r->p += blen;
+            g4_entity_t cur;
+            u8 status = 0;
+            if (g4_read_entity(k->g, node, &cur) &&
+                g4_vrow_cmp(k->g, blob, blen, &cur) > 0 &&
+                g4_vrow_apply(k->g, node, blob, blen))
+                status = 1;
+            w8(w, status);
+        }
+        if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
+        return ST_OK;
+    }
+    case OP_RE_EDGE_PULL: {
+        u32 n = r32(r);
+        if (r->err || n > 100000) { err_reply(w, "bad batch"); return ST_ERR; }
+        if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
+        if (k->dirty_counters) pw_flush_in_txn(k);
+        for (u32 i = 0; i < n; i++) {
+            if (r->p + 32 > r->end) { mstore_txn_abort(k->ms); err_reply(w, "trunc"); return ST_ERR; }
+            const u8 *sym = r->p;
+            r->p += 32;
+            u16 rl = 0;
+            const u8 *rt = rstr(r, &rl);
+            if (r->err) { mstore_txn_abort(k->ms); err_reply(w, "trunc"); return ST_ERR; }
+            u32 lo = dsym_u32(sym), hi = dsym_u32(sym + 4);
+            u8 dlo = sym[16];
+            u64 mt = dsym_u64(sym + 17);
+            u32 from = (dlo == G4_DIR_FORWARD) ? lo : hi;
+            u32 to   = (dlo == G4_DIR_FORWARD) ? hi : lo;
+            u64 wm = g4_chain_wm(k->g, lo);
+            if (hi != lo) {
+                u64 w2 = g4_chain_wm(k->g, hi);
+                if (w2 > wm) wm = w2;
+            }
+            u8 status;
+            if (wm >= mt) status = 0;     /* covered: the caller deletes its copy */
+            else {
+                int rr = g4_create_relation(k->g, from, to, rt, rl, mt);
+                if (rr) status = 1;
+                else if (d_edge_present(k->g, from, to, rt, rl)) status = 2;
+                else status = 3;
+            }
+            w8(w, status);
+        }
+        if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
+        return ST_OK;
+    }
+    case OP_RE_EDGE_DEL: {
+        u32 n = r32(r);
+        if (r->err || n > 100000) { err_reply(w, "bad batch"); return ST_ERR; }
+        if (!mstore_txn_begin(k->ms)) { err_reply(w, "txn"); return ST_ERR; }
+        if (k->dirty_counters) pw_flush_in_txn(k);
+        for (u32 i = 0; i < n; i++) {
+            if (r->p + 32 > r->end) { mstore_txn_abort(k->ms); err_reply(w, "trunc"); return ST_ERR; }
+            const u8 *sym = r->p;
+            r->p += 32;
+            u32 lo = dsym_u32(sym), hi = dsym_u32(sym + 4);
+            u8 dlo = sym[16];
+            u64 rh = dsym_u64(sym + 8);
+            w8(w, (u8)(g4_edge_del_hashed(k->g, lo, hi, dlo, rh) ? 1 : 0));
+        }
+        if (!mstore_txn_commit(k->ms)) { err_reply(w, "commit"); return ST_ERR; }
+        return ST_OK;
+    }
     default:
         err_reply(w, "unknown op");
         return ST_ERR;
@@ -849,6 +1084,8 @@ void kbd_close(kbd_t *k) {
     mstore_close(k->ms);
     free(k->pw.eids); free(k->pw.walks);
     free(k->leases);
+    for (int f = 0; f < 2; f++)
+        if (k->repl[f].active) riblt_enc_free(&k->repl[f].enc);
     free(k);
 }
 

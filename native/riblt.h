@@ -85,6 +85,11 @@ typedef struct riblt_dec {
 uint64_t riblt_hash64(uint64_t seed, const uint8_t sym[RIBLT_WIDTH]);
 uint64_t riblt_seed(const void* key, size_t key_len);
 
+/* Wire packing, explicit little-endian (44 bytes):
+ *   [sum 32][count int32 LE][checksum u64 LE]  (the pad field is omitted) */
+void riblt_cell_pack(uint8_t out[44], const riblt_cell* c);
+void riblt_cell_unpack(riblt_cell* c, const uint8_t in[44]);
+
 /* symbols: n * RIBLT_WIDTH bytes, copied; a SET (a duplicate pair cancels
  * under XOR and is silently invisible). Returns 0 or -1 (OOM). */
 int  riblt_enc_init(riblt_enc* e, const void* key, size_t key_len, const uint8_t* symbols, uint32_t n);

@@ -1913,30 +1913,66 @@ int g4_half_del(graph4_t *g, u32 host, u32 peer, u32 rel_sid, u32 dir_stored) {
     return 1;
 }
 
-/* whole-row apply from a source store (LWW winner side): strings translate
- * across stores; visits stay local (relaxed-counter class); type index and
- * trigram postings follow. */
-int g4_vstate_apply(graph4_t *g, u32 node, graph4_t *src_g, const g4_entity_t *se) {
+/* resolve a reltype hash on `from`'s FORWARD chain to its string (the holder
+ * side of a wire fetch — no rmap needed); 1 = found; *outcap in/out. */
+int g4_edge_find_hashed(graph4_t *g, u32 from, u32 to, u64 relhash, u8 *out, u16 *outcap) {
+    u32 ec = g4_edge_count(g, from);
+    if (!ec) return 0;
+    g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+    if (!es) return 0;
+    g4_edges(g, from, es, ec);
+    int found = 0;
+    for (u32 k = 0; k < ec && !found; k++) {
+        if (es[k].target_eid != to || es[k].direction != G4_DIR_FORWARD) continue;
+        if (g4_relhash(g, es[k].rel_sid) != relhash) continue;
+        u16 l = 0;
+        const u8 *s = g4_str(g, es[k].rel_sid, &l);
+        if (s && l <= *outcap) { memcpy(out, s, l); *outcap = l; found = 1; }
+    }
+    free(es);
+    return found;
+}
+
+/* delete the (from,to) edge whose reltype hashes to relhash (a wire delete at
+ * the holder; the reltype resolves from the chain itself); 1 = deleted. */
+int g4_edge_del_hashed(graph4_t *g, u32 lo, u32 hi, u8 dlo, u64 relhash) {
+    u32 from = (dlo == G4_DIR_FORWARD) ? lo : hi;
+    u32 to   = (dlo == G4_DIR_FORWARD) ? hi : lo;
+    u32 ec = g4_edge_count(g, from);
+    if (!ec) return 0;
+    g4_edge_t *es = (g4_edge_t *)malloc((size_t)ec * sizeof *es);
+    if (!es) return 0;
+    g4_edges(g, from, es, ec);
+    int del = 0;
+    for (u32 k = 0; k < ec && !del; k++) {
+        if (es[k].target_eid != to || es[k].direction != G4_DIR_FORWARD) continue;
+        if (g4_relhash(g, es[k].rel_sid) != relhash) continue;
+        u16 l = 0;
+        const u8 *s = g4_str(g, es[k].rel_sid, &l);
+        if (s) del = g4_delete_relation(g, from, to, s, l);
+    }
+    free(es);
+    return del;
+}
+
+/* whole-row apply, raw strings (the wire form; seam §5/§8). Same body as the
+ * store-to-store apply below; the winner's fields arrive as bytes. */
+int g4_vstate_apply_raw(graph4_t *g, u32 node,
+                        const u8 *type, u16 tl,
+                        u64 mtime, u64 obs_mtime,
+                        const u8 *o0, u16 o0l, const u8 *o1, u16 o1l,
+                        u8 ocount, double psi) {
     g4_entity_t e;
     if (!g4_read_entity(g, node, &e)) return 0;
-    u16 tl = 0;
-    const u8 *ts = st4_get(src_g->st, se->type_sid, &tl);
-    if (!ts) return 0;
-    u32 ntype = st4_intern(g->st, ts, tl);
+    u32 ntype = st4_intern(g->st, type, tl);
     if (!ntype) return 0;
     u32 nobs[2] = { 0, 0 };
-    if (se->obs_count >= 1 && se->obs0_sid) {
-        u16 ol = 0;
-        const u8 *ob = st4_get(src_g->st, se->obs0_sid, &ol);
-        if (!ob) { st4_decref(g->st, ntype); return 0; }
-        nobs[0] = st4_intern(g->st, ob, ol);
+    if (ocount >= 1 && o0l) {
+        nobs[0] = st4_intern(g->st, o0, o0l);
         if (!nobs[0]) { st4_decref(g->st, ntype); return 0; }
     }
-    if (se->obs_count >= 2 && se->obs1_sid) {
-        u16 ol = 0;
-        const u8 *ob = st4_get(src_g->st, se->obs1_sid, &ol);
-        if (!ob) { st4_decref(g->st, ntype); if (nobs[0]) st4_decref(g->st, nobs[0]); return 0; }
-        nobs[1] = st4_intern(g->st, ob, ol);
+    if (ocount >= 2 && o1l) {
+        nobs[1] = st4_intern(g->st, o1, o1l);
         if (!nobs[1]) { st4_decref(g->st, ntype); if (nobs[0]) st4_decref(g->st, nobs[0]); return 0; }
     }
     u32set_t old = {0};
@@ -1957,11 +1993,135 @@ int g4_vstate_apply(graph4_t *g, u32 node, graph4_t *src_g, const g4_entity_t *s
     if (e.obs_count >= 2 && e.obs1_sid) st4_decref(g->st, e.obs1_sid);
     g4st32(r + 32, nobs[0]);
     g4st32(r + 36, nobs[1]);
-    r[40] = se->obs_count;
-    g4st64(r + 16, se->mtime);
-    g4st64(r + 24, se->obs_mtime);
-    memcpy(r + 60, &se->psi, 8);
+    r[40] = ocount;
+    g4st64(r + 16, mtime);
+    g4st64(r + 24, obs_mtime);
+    u64 psi_bits; memcpy(&psi_bits, &psi, 8);
+    memcpy(r + 60, &psi_bits, 8);       /* psi is stored native, like every writer */
     tri_apply(g, node, old.v, old.n);
     free(old.v);
     return 1;
+}
+
+/* whole-row apply from a source store (LWW winner side): strings translate
+ * across stores; visits stay local (relaxed-counter class); type index and
+ * trigram postings follow. */
+int g4_vstate_apply(graph4_t *g, u32 node, graph4_t *src_g, const g4_entity_t *se) {
+    u16 tl = 0, l0 = 0, l1 = 0;
+    const u8 *ts = st4_get(src_g->st, se->type_sid, &tl);
+    if (!ts) return 0;
+    const u8 *o0 = (se->obs_count >= 1 && se->obs0_sid) ? st4_get(src_g->st, se->obs0_sid, &l0) : NULL;
+    if (se->obs_count >= 1 && se->obs0_sid && !o0) return 0;
+    const u8 *o1 = (se->obs_count >= 2 && se->obs1_sid) ? st4_get(src_g->st, se->obs1_sid, &l1) : NULL;
+    if (se->obs_count >= 2 && se->obs1_sid && !o1) return 0;
+    return g4_vstate_apply_raw(g, node, ts, tl, se->mtime, se->obs_mtime,
+                               o0, l0, o1, l1, se->obs_count, se->psi);
+}
+
+/* ================= vstate row blob codec (repl wire; seam §8) ============= */
+
+static void blob_put_str(u8 *out, u32 *off, const u8 *s, u16 l) {
+    out[*off] = (u8)l; out[*off + 1] = (u8)(l >> 8); *off += 2;   /* u16 LE */
+    if (l) memcpy(out + *off, s, l);
+    *off += l;
+}
+
+static int blob_get_str(const u8 *b, u32 len, u32 *off, const u8 **s, u16 *l) {
+    if (*off + 2 > len) return 0;
+    u16 n = (u16)(b[*off] | (b[*off + 1] << 8)); *off += 2;
+    if (*off + n > len) return 0;
+    *s = b + *off; *l = n; *off += n;
+    return 1;
+}
+
+u32 g4_vrow_pack(graph4_t *g, const g4_entity_t *e, u8 *out, u32 cap) {
+    u32 off = 0;
+    u16 tl = 0; const u8 *ts = g4_str(g, e->type_sid, &tl);
+    if (!ts) return 0;
+    if (cap < (u32)2 + tl + 8 + 8 + 1 + 8) return 0;
+    blob_put_str(out, &off, ts, tl);
+    g4st64(out + off, e->mtime); off += 8;
+    g4st64(out + off, e->obs_mtime); off += 8;
+    out[off++] = e->obs_count;
+    for (int k = 0; k < 2; k++) {
+        if ((u8)(k + 1) > e->obs_count) break;
+        u32 sid = (k == 0) ? e->obs0_sid : e->obs1_sid;
+        u16 l = 0;
+        const u8 *s = sid ? g4_str(g, sid, &l) : NULL;
+        if (s && cap < off + 2 + l) return 0;
+        blob_put_str(out, &off, s, s ? l : 0);
+    }
+    if (cap < off + 8) return 0;
+    u64 psi_bits; memcpy(&psi_bits, &e->psi, 8);
+    g4st64(out + off, psi_bits); off += 8;
+    return off;
+}
+
+int g4_vrow_cmp(graph4_t *g, const u8 *blob, u32 len, const g4_entity_t *e) {
+    /* parse the blob row ("a") — exact row_cmp order vs live row ("b",
+     * this store's strings). Malformed blob = NULL row: caller skips. */
+    u32 off = 0;
+    const u8 *tb; u16 tbl;
+    if (!blob_get_str(blob, len, &off, &tb, &tbl)) return 0;
+    if (off + 8 + 8 + 1 > len) return 0;
+    u64 mt = g4ld64(blob + off); off += 8;
+    u64 omt = g4ld64(blob + off); off += 8;
+    u8 oc = blob[off++];
+    const u8 *ob[2] = { NULL, NULL }; u16 obl[2] = { 0, 0 };
+    for (int k = 0; k < 2; k++) {
+        if ((u8)(k + 1) > oc) break;
+        if (!blob_get_str(blob, len, &off, &ob[k], &obl[k])) return 0;
+    }
+    if (off + 8 > len) return 0;
+    u64 psi_a; { u64 b8 = g4ld64(blob + off); memcpy(&psi_a, &b8, 8); }
+    if (mt != e->mtime) return mt < e->mtime ? -1 : 1;
+    if (omt != e->obs_mtime) return omt < e->obs_mtime ? -1 : 1;
+    if (oc != e->obs_count) return oc < e->obs_count ? -1 : 1;
+    {
+        u16 ll = 0;
+        const u8 *tlive = g4_str(g, e->type_sid, &ll);
+        if (!tlive) return 0;
+        u16 m = tbl < ll ? tbl : ll;
+        int c = m ? memcmp(tb, tlive, m) : 0;
+        if (c) return c < 0 ? -1 : 1;
+        if (tbl != ll) return tbl < ll ? -1 : 1;
+    }
+    for (int k = 0; k < 2; k++) {
+        u32 sid = (k == 0) ? e->obs0_sid : e->obs1_sid;
+        int pb = sid && (u8)k < e->obs_count;
+        int pa = (u8)(k + 1) <= oc && obl[k] > 0;
+        if (!pa && !pb) continue;
+        u16 ll = 0;
+        const u8 *lb = pb ? g4_str(g, sid, &ll) : NULL;
+        if (pb && !lb) return 0;
+        const u8 *la = pa ? ob[k] : (const u8 *)"";
+        u16 al = pa ? obl[k] : 0;
+        u16 lv = pb ? ll : 0;
+        u16 m = al < lv ? al : lv;
+        int c = m ? memcmp(la, lb, m) : 0;
+        if (c) return c < 0 ? -1 : 1;
+        if (al != lv) return al < lv ? -1 : 1;
+    }
+    u64 psi_b; memcpy(&psi_b, &e->psi, 8);
+    if (psi_a != psi_b) return psi_a < psi_b ? -1 : 1;
+    return 0;
+}
+
+int g4_vrow_apply(graph4_t *g, u32 node, const u8 *blob, u32 len) {
+    u32 off = 0;
+    const u8 *tb; u16 tbl;
+    if (!blob_get_str(blob, len, &off, &tb, &tbl)) return 0;
+    if (off + 8 + 8 + 1 > len) return 0;
+    u64 mt = g4ld64(blob + off); off += 8;
+    u64 omt = g4ld64(blob + off); off += 8;
+    u8 oc = blob[off++];
+    const u8 *ob[2] = { NULL, NULL }; u16 obl[2] = { 0, 0 };
+    for (int k = 0; k < 2; k++) {
+        if ((u8)(k + 1) > oc) break;
+        if (!blob_get_str(blob, len, &off, &ob[k], &obl[k])) return 0;
+    }
+    if (off + 8 > len) return 0;
+    double psi; { u64 b8 = g4ld64(blob + off); memcpy(&psi, &b8, 8); }
+    return g4_vstate_apply_raw(g, node, tb, tbl, mt, omt,
+                               ob[0], obl[0], ob[1], obl[1], oc, psi);
 }

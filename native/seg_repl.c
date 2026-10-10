@@ -1,33 +1,46 @@
 /*
  * seg_repl.c — the pairwise anti-entropy ROUND (docs/shard-seam-design-note.md
- * §8/§5, build step 5a-ii). Given two stores holding the same logical dataset
- * (clones), one round reconciles:
+ * §8/§5, build step 5a-ii; unified wire form 5b-i). One algorithm, two
+ * transports: the round driver owns the LOCAL store and one RIBLT decode per
+ * family; everything it needs from the other side goes through repl_peer_t
+ * (segstore.h). g4_repl_round(a, b) is the same round with an in-process
+ * adapter over `b`; the daemon channel is the wire adapter.
  *
  *   edges  — canonical symbols ([lo][hi][relhash][dlo][mtime]); a symbol the
- *            peer lacks is PULLED (the edge is (re)created there) unless the
- *            peer's chain remove-watermark covers its mtime, in which case
- *            the peer deleted it after that version and the deletion is
- *            PUSHED instead (never resurrected — note §5/§9).
- *   vstate — node rows; whole-row LWW by (mtime, obs_mtime, content bytes,
- *            then psi) applied via g4_vstate_apply (cross-store string
- *            translation). Rows for nodes the peer cannot read are SKIPPED
- *            (entity replication + tombstones are step 5b), as are gen-only
- *            differences (directory reconciliation, 5b).
+ *            peer lacks is PULLED (created there via edge_pull; the peer
+ *            re-checks ITS remove-watermark at apply time and answers
+ *            "covered" instead when it deleted the edge after that version —
+ *            then the driver deletes its own copy: never resurrected). A
+ *            symbol WE lack is created locally (edge_pull's mirror image
+ *            driven from here) unless OUR watermark covers its mtime, in
+ *            which case the deletion is PUSHED to the holder (edge_del).
+ *   vstate — node rows; whole-row LWW by (mtime, obs_mtime, obs_count, type
+ *            bytes, obs bytes, psi) via the row blob codec (g4_vrow_*). The
+ *            winner is applied to the loser; the loser side re-checks the
+ *            order at apply time (vrow_set / the local adapter), so a stale
+ *            push can never clobber a newer row. Rows for nodes one side
+ *            cannot read are SKIPPED (entity replication + tombstones are
+ *            step 5b-ii), as are gen-only differences (directory
+ *            reconciliation, 5b-ii).
  *
- * The round runs inside the caller's txns (one per store); sets are extracted
- * before any apply. Symbols are canonical-both-halves: sets are deduped
- * before encoding.
- *
- * Clone caveat, stated: node ids are compared directly, so both stores must
- * share the clone lineage (node-id spaces coincide). The shard era resolves
- * node ids through the directory first — that translation lands with the
- * channel (5b).
+ * Snapshot model: each side's symbol set is captured once per family (the
+ * driver's just before that family's exchange; the peer's at begin), so the
+ * decode is over two consistent snapshots. Concurrent edits on either side
+ * between snapshot and apply surface as next-round churn — the standard
+ * anti-entropy contract; the no-resurrection invariant is enforced at apply
+ * time by the watermark checks, which run at the store that owns the
+ * watermark, single-threaded with its writes.
  */
 #include "segstore.h"
 #include "riblt.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+#define REPL_CELL_BATCH 256u       /* cells per fetch (256*44B ≈ 11 KiB) */
+#define REPL_ROW_CAP    G4_REPL_ROW_CAP   /* row blob cap (type + 2 obs + overhead) */
+#define REPL_STR_CAP    G4_REPL_STR_CAP   /* reltype string cap */
+#define REPL_INDEX_CAP  (1u << 22) /* cell-index bound (parity with 5a-ii) */
 
 /* ---- symbol sets ---- */
 
@@ -56,7 +69,7 @@ static void rsym_uniq(rsymset_t *s) {
     s->n = w;
 }
 
-/* ---- relhash -> local sid map (deletes recreate the type string) ---- */
+/* ---- relhash -> local sid map (relname fetches at a local store) ---- */
 
 typedef struct { u64 *h; u32 *sid; u32 cap, cnt; } rmap_t;
 
@@ -129,8 +142,12 @@ static u64 sym_u64(const u8 *p) {
     for (int k = 7; k >= 0; k--) v = (v << 8) | p[k];
     return v;
 }
+static int u32cmp(const void *a, const void *b) {
+    u32 x = *(const u32 *)a, y = *(const u32 *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
 
-/* does `from`'s FORWARD chain already hold (to, rt)? (probe after create=0) */
+/* does `g`'s FORWARD chain from `from` already hold (to, rt)? (create=0 probe) */
 static int edge_present(graph4_t *g, u32 from, u32 to, const u8 *rt, u16 rl) {
     u32 ec = g4_edge_count(g, from);
     if (!ec) return 0;
@@ -148,173 +165,316 @@ static int edge_present(graph4_t *g, u32 from, u32 to, const u8 *rt, u16 rl) {
     return found;
 }
 
-/* vstate row order, public fields only (store-independent, deterministic) */
-static int row_cmp(graph4_t *ga, const g4_entity_t *a, graph4_t *gb, const g4_entity_t *b) {
-    if (a->mtime != b->mtime) return a->mtime < b->mtime ? -1 : 1;
-    if (a->obs_mtime != b->obs_mtime) return a->obs_mtime < b->obs_mtime ? -1 : 1;
-    if (a->obs_count != b->obs_count) return a->obs_count < b->obs_count ? -1 : 1;
-    {
-        u16 la = 0, lb = 0;
-        const u8 *ta = g4_str(ga, a->type_sid, &la);
-        const u8 *tb = g4_str(gb, b->type_sid, &lb);
-        u16 m = la < lb ? la : lb;
-        int c = m ? memcmp(ta, tb, m) : 0;
-        if (c) return c < 0 ? -1 : 1;
-        if (la != lb) return la < lb ? -1 : 1;
-    }
-    for (int k = 0; k < 2; k++) {
-        u32 sa = (k == 0) ? a->obs0_sid : a->obs1_sid;
-        u32 sb = (k == 0) ? b->obs0_sid : b->obs1_sid;
-        int pa = sa && (u8)k < a->obs_count;
-        int pb = sb && (u8)k < b->obs_count;
-        if (!pa && !pb) continue;
-        u16 la = 0, lb = 0;
-        const u8 *oa = pa ? g4_str(ga, sa, &la) : (const u8 *)"";
-        const u8 *ob = pb ? g4_str(gb, sb, &lb) : (const u8 *)"";
-        u16 m = la < lb ? la : lb;
-        int c = m ? memcmp(oa, ob, m) : 0;
-        if (c) return c < 0 ? -1 : 1;
-        if (la != lb) return la < lb ? -1 : 1;
-    }
-    if (a->psi != b->psi) return a->psi < b->psi ? -1 : 1;
-    return 0;
+/* ---- in-process peer adapter (backing g4_repl_round(a, b)) ---- */
+
+typedef struct {
+    graph4_t *g;            /* the peer store */
+    riblt_enc enc[2];
+    int active[2];
+    rmap_t *rmap;           /* lazy relhash -> sid over g's edges */
+} lp_t;
+
+static int lp_begin(void *ctx, u8 family, u32 *nsym) {
+    lp_t *lp = (lp_t *)ctx;
+    if (family > 1) return 0;
+    if (lp->active[family]) { riblt_enc_free(&lp->enc[family]); lp->active[family] = 0; }
+    rsymset_t s = {0};
+    if (family == 0) g4_adj_symbols(lp->g, rcollect, &s);
+    else g4_vstate_symbols(lp->g, rcollect, &s);
+    qsort(s.v, s.n, RIBLT_WIDTH, rsym_cmp);
+    rsym_uniq(&s);
+    if (nsym) *nsym = s.n;
+    int r = riblt_enc_init(&lp->enc[family], "kbrepl", 6, s.v, s.n);
+    free(s.v);
+    if (r != 0) return 0;
+    lp->active[family] = 1;
+    return 1;
 }
 
-/* ---- the round ---- */
+static int lp_cells(void *ctx, u8 family, u32 from_idx, u32 max, u8 *out, u32 *nout) {
+    lp_t *lp = (lp_t *)ctx;
+    if (family > 1 || !lp->active[family]) return 0;
+    for (u32 i = 0; i < max; i++) {
+        const riblt_cell *c = riblt_enc_cell(&lp->enc[family], from_idx + i);
+        if (!c) return 0;
+        riblt_cell_pack(out + (size_t)i * 44, c);
+    }
+    *nout = max;
+    return 1;
+}
 
-int g4_repl_round(graph4_t *a, graph4_t *b, g4_repl_stats_t *st) {
+static int lp_end(void *ctx, u8 family) {
+    lp_t *lp = (lp_t *)ctx;
+    if (family > 1) return 0;
+    if (lp->active[family]) { riblt_enc_free(&lp->enc[family]); lp->active[family] = 0; }
+    return 1;
+}
+
+static int lp_relname(void *ctx, u64 relhash, u8 *out, u16 *outlen) {
+    lp_t *lp = (lp_t *)ctx;
+    if (!lp->rmap) lp->rmap = rmap_build(lp->g);
+    u32 sid = rmap_get(lp->rmap, relhash);
+    if (!sid) return 0;
+    u16 l = 0;
+    const u8 *s = g4_str(lp->g, sid, &l);
+    if (!s) return 0;
+    memcpy(out, s, l);
+    *outlen = l;
+    return 1;
+}
+
+static int lp_vrow(void *ctx, u32 node, u8 *out, u32 *outlen) {
+    lp_t *lp = (lp_t *)ctx;
+    g4_entity_t e;
+    if (!g4_read_entity(lp->g, node, &e)) return 0;
+    u32 n = g4_vrow_pack(lp->g, &e, out, REPL_ROW_CAP);
+    if (!n) return 0;
+    *outlen = n;
+    return 1;
+}
+
+static int lp_vrow_set(void *ctx, u32 node, const u8 *row, u32 rowlen, u8 *status) {
+    lp_t *lp = (lp_t *)ctx;
+    g4_entity_t cur;
+    *status = 0;
+    if (!g4_read_entity(lp->g, node, &cur)) return 1;      /* node gone: lost */
+    if (g4_vrow_cmp(lp->g, row, rowlen, &cur) <= 0) return 1;
+    if (g4_vrow_apply(lp->g, node, row, rowlen)) *status = 1;
+    return 1;
+}
+
+static int lp_edge_pull(void *ctx, const u8 *sym, const u8 *rt, u16 rl, u8 *status) {
+    lp_t *lp = (lp_t *)ctx;
+    u32 lo = sym_u32(sym), hi = sym_u32(sym + 4);
+    u8 dlo = sym[16];
+    u64 mt = sym_u64(sym + 17);
+    u32 from = (dlo == G4_DIR_FORWARD) ? lo : hi;
+    u32 to   = (dlo == G4_DIR_FORWARD) ? hi : lo;
+    u64 wm = g4_chain_wm(lp->g, lo);
+    if (hi != lo) {
+        u64 w2 = g4_chain_wm(lp->g, hi);
+        if (w2 > wm) wm = w2;
+    }
+    if (wm >= mt) { *status = 0; return 1; }               /* covered: delete wins */
+    int r = g4_create_relation(lp->g, from, to, rt, rl, mt);
+    if (r) *status = 1;
+    else if (edge_present(lp->g, from, to, rt, rl)) *status = 2;
+    else *status = 3;
+    return 1;
+}
+
+static int lp_edge_del(void *ctx, const u8 *sym, u8 *status) {
+    lp_t *lp = (lp_t *)ctx;
+    u32 lo = sym_u32(sym), hi = sym_u32(sym + 4);
+    u8 dlo = sym[16];
+    u64 rh = sym_u64(sym + 8);
+    *status = (u8)(g4_edge_del_hashed(lp->g, lo, hi, dlo, rh) ? 1 : 0);
+    return 1;
+}
+
+/* ---- the round (driver side) ---- */
+
+int g4_repl_round_wire(graph4_t *local, repl_peer_t *peer, g4_repl_stats_t *st) {
     g4_repl_stats_t stats;
     memset(&stats, 0, sizeof stats);
     int ok = 1;
 
-    /* 1. extract (deduped canonical sets) — before any apply */
-    rsymset_t adjA = {0}, adjB = {0}, vsA = {0}, vsB = {0};
-    g4_adj_symbols(a, rcollect, &adjA);
-    g4_adj_symbols(b, rcollect, &adjB);
-    g4_vstate_symbols(a, rcollect, &vsA);
-    g4_vstate_symbols(b, rcollect, &vsB);
-    qsort(adjA.v, adjA.n, RIBLT_WIDTH, rsym_cmp); rsym_uniq(&adjA);
-    qsort(adjB.v, adjB.n, RIBLT_WIDTH, rsym_cmp); rsym_uniq(&adjB);
-    qsort(vsA.v, vsA.n, RIBLT_WIDTH, rsym_cmp); rsym_uniq(&vsA);
-    qsort(vsB.v, vsB.n, RIBLT_WIDTH, rsym_cmp); rsym_uniq(&vsB);
+    u8 *local_only[2] = { NULL, NULL };
+    u8 *remote_only[2] = { NULL, NULL };
+    u32 nlocal[2] = { 0, 0 }, nremote[2] = { 0, 0 };
 
-    /* 2. reconcile: decoder local = B, remote = A (one decode, both diffs) */
-    rsymset_t *famA[2] = { &adjA, &vsA };
-    rsymset_t *famB[2] = { &adjB, &vsB };
-    u8 *Aonly[2] = { NULL, NULL };
-    u8 *Bonly[2] = { NULL, NULL };
-    u32 nAonly[2] = { 0, 0 }, nBonly[2] = { 0, 0 };
+    /* 1. per family: snapshot LOCAL set, exchange cells, decode both diffs */
     for (int f = 0; f < 2 && ok; f++) {
-        riblt_enc ea, eb;
+        rsymset_t loc = {0};
+        if (f == 0) g4_adj_symbols(local, rcollect, &loc);
+        else g4_vstate_symbols(local, rcollect, &loc);
+        qsort(loc.v, loc.n, RIBLT_WIDTH, rsym_cmp);
+        rsym_uniq(&loc);
+
+        riblt_enc le;
+        if (riblt_enc_init(&le, "kbrepl", 6, loc.v, loc.n) != 0) {
+            free(loc.v); ok = 0; break;
+        }
+        free(loc.v);
+
+        u32 nsym = 0;
+        if (!peer->begin(peer->ctx, (u8)f, &nsym)) { riblt_enc_free(&le); ok = 0; break; }
         riblt_dec d;
-        if (riblt_enc_init(&ea, "kbrepl", 6, famA[f]->v, famA[f]->n) != 0) { ok = 0; break; }
-        if (riblt_enc_init(&eb, "kbrepl", 6, famB[f]->v, famB[f]->n) != 0) {
-            riblt_enc_free(&ea); ok = 0; break;
+        if (riblt_dec_init(&d, &le, "kbrepl", 6) != 0) {
+            riblt_enc_free(&le);
+            peer->end(peer->ctx, (u8)f);
+            ok = 0;
+            break;
         }
-        if (riblt_dec_init(&d, &eb, "kbrepl", 6) != 0) {
-            riblt_enc_free(&ea); riblt_enc_free(&eb); ok = 0; break;
+        u8 *buf = (u8 *)malloc(REPL_CELL_BATCH * 44u);
+        if (!buf) {
+            riblt_dec_free(&d); riblt_enc_free(&le);
+            peer->end(peer->ctx, (u8)f);
+            ok = 0;
+            break;
         }
+        u32 idx = 0;
         int done = 0;
-        for (u32 i = 0; i < (1u << 22) && !done; i++)
-            done = riblt_dec_feed(&d, i, riblt_enc_cell(&ea, i)) == 1;
-        if (!done) ok = 0;
-        else {
-            nAonly[f] = d.remote_only_n;
-            nBonly[f] = d.local_only_n;
-            if (nAonly[f]) {
-                Aonly[f] = (u8 *)malloc((size_t)nAonly[f] * RIBLT_WIDTH);
-                if (!Aonly[f]) abort();
-                memcpy(Aonly[f], d.remote_only, (size_t)nAonly[f] * RIBLT_WIDTH);
+        while (!done && idx < REPL_INDEX_CAP) {
+            u32 n = 0;
+            if (!peer->cells(peer->ctx, (u8)f, idx, REPL_CELL_BATCH, buf, &n) || n == 0) break;
+            for (u32 i = 0; i < n && !done; i++) {
+                riblt_cell c;
+                riblt_cell_unpack(&c, buf + (size_t)i * 44);
+                int r = riblt_dec_feed(&d, idx + i, &c);
+                if (r < 0) { ok = 0; break; }
+                done = r == 1;
             }
-            if (nBonly[f]) {
-                Bonly[f] = (u8 *)malloc((size_t)nBonly[f] * RIBLT_WIDTH);
-                if (!Bonly[f]) abort();
-                memcpy(Bonly[f], d.local_only, (size_t)nBonly[f] * RIBLT_WIDTH);
-            }
+            idx += n;
         }
-        riblt_dec_free(&d); riblt_enc_free(&ea); riblt_enc_free(&eb);
+        free(buf);
+        peer->end(peer->ctx, (u8)f);
+        if (!ok || !done) { ok = 0; riblt_dec_free(&d); riblt_enc_free(&le); break; }
+
+        nlocal[f] = d.local_only_n;
+        nremote[f] = d.remote_only_n;
+        if (nlocal[f]) {
+            local_only[f] = (u8 *)malloc((size_t)nlocal[f] * RIBLT_WIDTH);
+            if (!local_only[f]) abort();
+            memcpy(local_only[f], d.local_only, (size_t)nlocal[f] * RIBLT_WIDTH);
+        }
+        if (nremote[f]) {
+            remote_only[f] = (u8 *)malloc((size_t)nremote[f] * RIBLT_WIDTH);
+            if (!remote_only[f]) abort();
+            memcpy(remote_only[f], d.remote_only, (size_t)nremote[f] * RIBLT_WIDTH);
+        }
+        riblt_dec_free(&d);
+        riblt_enc_free(&le);
     }
     if (!ok) goto cleanup;
 
-    /* 3. apply — edges. side 0: A-only (A has, B not); side 1: B-only. */
+    /* 2. apply — edges. local_only: we hold it, peer pulls (or its wm covers
+     * and WE delete). remote_only: we lack it — our wm covers => push the
+     * delete to the holder; else fetch the reltype and create locally. */
     {
-        rmap_t *mapA = NULL, *mapB = NULL;
-        for (int side = 0; side < 2; side++) {
-            const u8 *list = (side == 0) ? Aonly[0] : Bonly[0];
-            u32 n = (side == 0) ? nAonly[0] : nBonly[0];
-            if (!n) continue;
-            graph4_t *have = (side == 0) ? a : b;   /* holds the edge  */
-            graph4_t *lack = (side == 0) ? b : a;   /* missing it      */
-            rmap_t **hm = (side == 0) ? &mapA : &mapB;
-            if (!*hm) *hm = rmap_build(have);
+        u8 *rtbuf = NULL;
+        for (int list = 0; list < 2; list++) {
+            const u8 *v = (list == 0) ? local_only[0] : remote_only[0];
+            u32 n = (list == 0) ? nlocal[0] : nremote[0];
             for (u32 i = 0; i < n; i++) {
-                const u8 *s = list + (size_t)i * RIBLT_WIDTH;
-                u32 lo = sym_u32(s);
-                u32 hi = sym_u32(s + 4);
+                const u8 *s = v + (size_t)i * RIBLT_WIDTH;
+                u32 lo = sym_u32(s), hi = sym_u32(s + 4);
                 u64 rh = sym_u64(s + 8);
                 u8 dlo = s[16];
                 u64 mt = sym_u64(s + 17);
                 u32 from = (dlo == G4_DIR_FORWARD) ? lo : hi;
                 u32 to   = (dlo == G4_DIR_FORWARD) ? hi : lo;
-                /* deleted there? either endpoint's watermark covers it */
-                u64 wm = g4_chain_wm(lack, lo);
-                if (hi != lo) {
-                    u64 wm2 = g4_chain_wm(lack, hi);
-                    if (wm2 > wm) wm = wm2;
-                }
-                u32 sid = rmap_get(*hm, rh);
-                if (!sid) { stats.edge_skipped++; continue; }
-                u16 rl = 0;
-                const u8 *rb = g4_str(have, sid, &rl);
-                if (!rb) { stats.edge_skipped++; continue; }
-                if (wm >= mt) {
-                    /* the deletion happened there: push it back — never re-add */
-                    if (g4_delete_relation(have, from, to, rb, rl)) {
-                        if (side == 0) stats.edges_deleted_from_a++;
-                        else stats.edges_deleted_from_b++;
-                    } else stats.edge_skipped++;
+                if (list == 0) {
+                    u16 rl = REPL_STR_CAP;
+                    if (!rtbuf) { rtbuf = (u8 *)malloc(REPL_STR_CAP); if (!rtbuf) abort(); }
+                    if (!g4_edge_find_hashed(local, from, to, rh, rtbuf, &rl)) {
+                        stats.edge_skipped++;
+                        continue;
+                    }
+                    u8 status = 3;
+                    if (!peer->edge_pull(peer->ctx, s, rtbuf, rl, &status)) {
+                        stats.edge_skipped++;
+                        continue;
+                    }
+                    if (status == 0) {
+                        /* peer's watermark covers it: the delete wins */
+                        if (g4_delete_relation(local, from, to, rtbuf, rl)) stats.edges_deleted_from_a++;
+                        else stats.edge_skipped++;
+                    } else if (status == 1) stats.edges_pulled_b++;
+                    else if (status == 2) stats.edges_dup++;
+                    else stats.edge_skipped++;
                     continue;
                 }
-                int r = g4_create_relation(lack, from, to, rb, rl, mt);
-                if (r) {
-                    if (side == 0) stats.edges_pulled_b++;
-                    else stats.edges_pulled_a++;
-                } else if (edge_present(lack, from, to, rb, rl)) {
-                    stats.edges_dup++;
-                } else {
-                    stats.edge_skipped++;
+                /* remote_only */
+                u64 wm = g4_chain_wm(local, lo);
+                if (hi != lo) {
+                    u64 w2 = g4_chain_wm(local, hi);
+                    if (w2 > wm) wm = w2;
                 }
+                if (wm >= mt) {
+                    u8 status = 0;
+                    if (peer->edge_del(peer->ctx, s, &status) && status) stats.edges_deleted_from_b++;
+                    else stats.edge_skipped++;
+                    continue;
+                }
+                if (!rtbuf) { rtbuf = (u8 *)malloc(REPL_STR_CAP); if (!rtbuf) abort(); }
+                u16 rl = 0;
+                if (!peer->relname(peer->ctx, rh, rtbuf, &rl)) { stats.edge_skipped++; continue; }
+                int r = g4_create_relation(local, from, to, rtbuf, rl, mt);
+                if (r) stats.edges_pulled_a++;
+                else if (edge_present(local, from, to, rtbuf, rl)) stats.edges_dup++;
+                else stats.edge_skipped++;
             }
         }
-        rmap_free(mapA); rmap_free(mapB);
+        free(rtbuf);
     }
 
-    /* 4. apply — vstate: whole-row LWW for nodes both stores can read */
-    for (int side = 0; side < 2; side++) {
-        const u8 *list = (side == 0) ? Aonly[1] : Bonly[1];
-        u32 n = (side == 0) ? nAonly[1] : nBonly[1];
-        for (u32 i = 0; i < n; i++) {
-            const u8 *s = list + (size_t)i * RIBLT_WIDTH;
-            u32 node = sym_u32(s);
-            g4_entity_t ea, eb;
-            int ha = g4_read_entity(a, node, &ea);
-            int hb = g4_read_entity(b, node, &eb);
-            if (!ha || !hb) { stats.vstate_skipped++; continue; }  /* 5b */
-            int c = row_cmp(a, &ea, b, &eb);
-            if (c == 0) { stats.vstate_skipped++; continue; }      /* gen-only, 5b */
-            graph4_t *wi = (c > 0) ? a : b;
-            graph4_t *lo_ = (c > 0) ? b : a;
-            g4_entity_t *we = (c > 0) ? &ea : &eb;
-            if (g4_vstate_apply(lo_, node, wi, we)) {
-                if (lo_ == b) stats.vstate_applied_b++;
-                else stats.vstate_applied_a++;
-            } else stats.vstate_skipped++;
+    /* 3. apply — vstate. The union of diff nodes; whole-row LWW via the blob
+     * codec; the losing side re-checks the order at apply time. */
+    {
+        u32 nn = nlocal[1] + nremote[1];
+        if (nn) {
+            u32 *nodes = (u32 *)malloc((size_t)nn * 4);
+            u8 *blob = (u8 *)malloc(REPL_ROW_CAP);
+            u8 *pb = (u8 *)malloc(REPL_ROW_CAP);
+            if (!nodes || !blob || !pb) abort();
+            nn = 0;
+            for (int list = 0; list < 2; list++) {
+                const u8 *v = (list == 0) ? local_only[1] : remote_only[1];
+                u32 n = (list == 0) ? nlocal[1] : nremote[1];
+                for (u32 i = 0; i < n; i++) nodes[nn++] = sym_u32(v + (size_t)i * RIBLT_WIDTH);
+            }
+            qsort(nodes, nn, 4, u32cmp);
+            for (u32 i = 0; i < nn; i++) {
+                if (i && nodes[i] == nodes[i - 1]) continue;
+                u32 node = nodes[i];
+                u32 bl = 0;
+                if (!peer->vrow(peer->ctx, node, blob, &bl)) { stats.vstate_skipped++; continue; }
+                g4_entity_t le;
+                if (!g4_read_entity(local, node, &le)) { stats.vstate_skipped++; continue; }  /* 5b-ii */
+                int c = g4_vrow_cmp(local, blob, bl, &le);
+                if (c == 0) { stats.vstate_skipped++; continue; }                             /* 5b-ii */
+                if (c > 0) {
+                    /* peer row wins: apply locally */
+                    if (g4_vrow_apply(local, node, blob, bl)) stats.vstate_applied_a++;
+                    else stats.vstate_skipped++;
+                } else {
+                    u32 pbl = g4_vrow_pack(local, &le, pb, REPL_ROW_CAP);
+                    u8 status = 0;
+                    if (pbl && peer->vrow_set(peer->ctx, node, pb, pbl, &status) && status)
+                        stats.vstate_applied_b++;
+                    else stats.vstate_skipped++;
+                }
+            }
+            free(nodes); free(blob); free(pb);
         }
     }
 
 cleanup:
-    free(adjA.v); free(adjB.v); free(vsA.v); free(vsB.v);
-    free(Aonly[0]); free(Aonly[1]); free(Bonly[0]); free(Bonly[1]);
+    free(local_only[0]); free(local_only[1]);
+    free(remote_only[0]); free(remote_only[1]);
     if (st) *st = stats;
+    return ok;
+}
+
+/* The in-process round: the same algorithm with `b` behind the adapter. */
+int g4_repl_round(graph4_t *a, graph4_t *b, g4_repl_stats_t *st) {
+    lp_t lp;
+    memset(&lp, 0, sizeof lp);
+    lp.g = b;
+    repl_peer_t peer;
+    peer.ctx = &lp;
+    peer.begin = lp_begin;
+    peer.cells = lp_cells;
+    peer.end = lp_end;
+    peer.relname = lp_relname;
+    peer.vrow = lp_vrow;
+    peer.vrow_set = lp_vrow_set;
+    peer.edge_pull = lp_edge_pull;
+    peer.edge_del = lp_edge_del;
+    int ok = g4_repl_round_wire(a, &peer, st);
+    for (int f = 0; f < 2; f++)
+        if (lp.active[f]) riblt_enc_free(&lp.enc[f]);
+    rmap_free(lp.rmap);
     return ok;
 }
