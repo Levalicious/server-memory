@@ -403,6 +403,77 @@ function paginateGraph(graph: KnowledgeGraph, entityCursor: number | string = 0,
   };
 }
 
+/** The slice of a tool's JSON-Schema `inputSchema` that argument validation reads. */
+interface ToolArgSchema {
+  // `| undefined`: the inferred union of all tool schemas pads each one with
+  // the other tools' property names as optional-undefined keys.
+  properties?: Record<string, object | undefined>;
+}
+
+/** One rejected argument, reported in the VALIDATION_FAILED details list. */
+interface ArgViolation {
+  argument: string;
+  code: 'VALIDATION_FAILED';
+  message: string;
+  allowed: unknown[];
+}
+
+/**
+ * Policy R4 (docs/api-error-policy.md) applied to arguments: an argument the
+ * tool does not declare, or a value outside a declared enum, is an error — not
+ * something to drop. Before this check the server ignored both silently, so a
+ * misnamed cursor (open_nodes `cursor` instead of `relationCursor`) re-served
+ * page 1 with the same nextCursor, and an off-enum `direction` ran as some
+ * other direction.
+ *
+ * Validate-first (R2): every offending argument is reported in one error and
+ * the tool does not run.
+ */
+export function validateToolArgs(tool: string, schema: ToolArgSchema, args: Record<string, unknown>): void {
+  const properties = schema.properties ?? {};
+  const declared = Object.keys(properties);
+  const violations: ArgViolation[] = [];
+
+  for (const [key, value] of Object.entries(args)) {
+    const spec = Object.prototype.hasOwnProperty.call(properties, key) ? properties[key] : undefined;
+    if (spec === undefined) {
+      violations.push({ argument: key, code: 'VALIDATION_FAILED', message: unknownArgumentMessage(tool, key, declared), allowed: declared });
+      continue;
+    }
+    const allowedValues = (spec as { enum?: unknown }).enum;
+    if (Array.isArray(allowedValues) && !allowedValues.includes(value)) {
+      violations.push({
+        argument: key,
+        code: 'VALIDATION_FAILED',
+        message: `${JSON.stringify(value)} is not a valid ${key} for ${tool}; expected one of ${allowedValues.map(v => JSON.stringify(v)).join(', ')}.`,
+        allowed: [...allowedValues],
+      });
+    }
+  }
+
+  if (violations.length > 0) {
+    throw new ToolError(
+      'VALIDATION_FAILED',
+      `${violations.length} argument(s) rejected for ${tool}; the tool did not run (details below).`,
+      violations,
+    );
+  }
+}
+
+/**
+ * Cursor parameter names differ between tools (`cursor` on single-list tools,
+ * `entityCursor` / `relationCursor` on graph-shaped ones), which is exactly
+ * the slip that hid open_nodes pages. Name the right key when that happens.
+ */
+function unknownArgumentMessage(tool: string, key: string, declared: string[]): string {
+  const base = `${JSON.stringify(key)} is not a parameter of ${tool}.`;
+  const cursorParams = declared.filter(k => /cursor$/i.test(k));
+  if (/cursor$/i.test(key) && cursorParams.length > 0) {
+    return `${base} Its cursor parameter(s): ${cursorParams.join(', ')} — pass each nextCursor back under the key of the section it came from.`;
+  }
+  return `${base} Declared parameters: ${declared.join(', ')}.`;
+}
+
 // The KnowledgeGraphManager class contains all operations to interact with the knowledge graph
 export class KnowledgeGraphManager {
   private db: Store;
@@ -1521,9 +1592,9 @@ export function createServer(memoryFilePath?: string): Server {
     knowledgeGraphManager.close();
   };
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
+  // The advertised tool list is also the argument contract: dispatch validates
+  // every call against these same inputSchemas (validateToolArgs, policy R4).
+  const toolDefinitions = [
       {
         name: "create_entities",
         description: "Create multiple new entities in the knowledge graph",
@@ -1874,9 +1945,9 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
           required: ["filePath"],
         },
       },
-    ],
-  };
-});
+  ];
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: toolDefinitions }));
 
   /**
    * Dispatch a single tool call. Extracted from the request handler so the
@@ -1889,6 +1960,8 @@ The file MUST be plaintext (.txt, .tex, .md, source code, etc.). For PDFs, use p
    * remains a JSON-RPC protocol error and is reserved for server faults.
    */
   async function dispatch(name: string, args: Record<string, unknown>): Promise<ToolDispatchResult> {
+    const definition = toolDefinitions.find(t => t.name === name);
+    if (definition) validateToolArgs(name, definition.inputSchema, args);
     switch (name) {
       case "create_entities": {
         const result = await knowledgeGraphManager.createEntities(args.entities as Entity[]);

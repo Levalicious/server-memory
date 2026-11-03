@@ -49,6 +49,10 @@ Every mutating success enumerates per-item outcomes
 An item that cannot be satisfied errors (R1) unless the caller's intent is
 provably satisfied — duplicates are "already there", deleting an absent
 thing is "already absent". Those cases succeed **and are reported** (R3).
+This covers arguments too: a key the tool's `inputSchema` does not declare,
+or a value outside a declared `enum`, is `VALIDATION_FAILED` (every offender
+listed, the tool does not run) — never ignored. A misnamed cursor key names
+the cursor parameter(s) the tool actually takes.
 
 **R5 — Pagination integrity.**
 Cursors identify the result set they came from (a fingerprint now; a store
