@@ -1032,7 +1032,10 @@ export class KnowledgeGraphManager {
             filteredRelations.push(r);
           } else {
             if (direction === 'forward') continue;
-            if (direction === 'any' && !filteredEntityNames.has(targetName)) continue;
+            // 'any' = out-edges + in-edges. An in-edge whose source is also
+            // being opened was already emitted as that source's out-edge;
+            // skip it so it appears exactly once. Every other in-edge stays.
+            if (direction === 'any' && filteredEntityNames.has(targetName)) continue;
             const r: Relation = { from: targetName, to: name, relationType };
             if (mtime > 0) r.mtime = mtime;
             filteredRelations.push(r);
